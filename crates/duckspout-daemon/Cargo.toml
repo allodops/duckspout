@@ -7,13 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-# Default OFF at bootstrap, mirroring duckspout-staging (flipped when the
-# engine lands, v0.1).
-default = []
-# Pass-through to the staging engine's embedded DuckDB (ADR-0002).
-duckdb = ["duckspout-staging/duckdb"]
-
 [dependencies]
 clap = { workspace = true }
 config = { workspace = true }

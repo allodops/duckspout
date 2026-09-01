@@ -8,17 +8,32 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Default OFF at bootstrap: the bundled engine compiles DuckDB's vendored
-# C++ — sanctioned (ADR-0002) but >10 min of build for a crate whose engine
-# code lands at v0.1. Flipped into the default set when the engine lands
-# (the v0.1 staging work); until then CI's feature matrix (`cargo hack
-# --each-feature`, nightly) keeps the pin compiling.
-default = []
-duckdb = ["dep:duckdb"]
+# Default ON since the engine landed (issue #31) — the bootstrap default-off
+# deviation is over. The bundled engine compiles DuckDB's vendored C++
+# (ADR-0002, disclosed cost); CI pays it once per profile and the cache holds
+# it. `--no-default-features` still builds (an empty seam) so the nightly
+# feature matrix (`cargo hack --each-feature`) keeps the pin honest.
+default = ["duckdb"]
+duckdb = ["dep:duckdb", "dep:arrow"]
 
 [dependencies]
-duckdb = { workspace = true, optional = true }
+# arrow is the append/scan data plane (compat-matrix row 1: one arrow next to
+# the pinned duckdb). Re-exported so embedders compile against the same pin.
+arrow = { workspace = true, optional = true }
+# appender-arrow is the pinned duckdb crate's own Arrow ingestion surface
+# (Rust-side only; compiles no additional C++ beyond ADR-0002's bundled
+# engine).
+duckdb = { workspace = true, optional = true, features = ["appender-arrow"] }
 duckspout-types = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The tests' real-filesystem Storage impl handles Bytes payloads.
+bytes = { workspace = true }
+# The engine's own tests drive real DuckDB files (it IS the storage here);
+# the raw connection is the checkpoint-scheme control leg (#109 evidence).
+duckdb = { workspace = true, features = ["appender-arrow"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
