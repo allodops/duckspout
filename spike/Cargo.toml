@@ -11,3 +11,10 @@ license = "Apache-2.0"
 [workspace]
 
 [dependencies]
+# Pin set follows compat-matrix.toml row 1 (duckdb 1.10505 wraps the stable
+# C API only, ADR-0002; `bundled` compiles upstream's engine as shipped).
+duckdb = { version = "1.10505", features = ["bundled"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
