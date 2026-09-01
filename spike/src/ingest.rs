@@ -107,6 +107,11 @@ impl IngestCore {
         Ok(BatchTiming { insert, commit })
     }
 
+    /// One-value scalar query (spike convenience).
+    pub fn conn_query_row<T: duckdb::types::FromSql>(&self, sql: &str) -> Result<T> {
+        Ok(self.conn.query_row(sql, [], |r| r.get(0))?)
+    }
+
     pub fn count(&self, table: &str) -> Result<i64> {
         let n: i64 = self
             .conn
