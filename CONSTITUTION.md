@@ -53,7 +53,6 @@ is the same offense as weakening the check."*
 | R-armed-or-ledgered | Every gate is either an armed CI job or a staged ledger row (milestone + tracking issue) in `docs/arming-ledger.toml` — never a skipped-green job, never silently absent (D-1, s§6.5). | Invariants rules: `ledger-integrity` + `constitution-mechanism` pairings, via the armed CI job `invariants` | s§9.6 procedure (below) |
 | R-protected-set | Changes to the protected set (s§9.2: the gates' data **and** executables, plus the decision record) merge only with CODEOWNERS (human) approval (D-9). | CODEOWNERS paths — the s§9.2 block in `/CODEOWNERS`, which owns itself | s§9.6 procedure (below) |
 | R-acpr-session | ACPR (adversarial critic pass review) is **not mechanical** — no CI job, no required check. The supervising session performs it, at its own judgment, on changes to core features (protocol crates, specs, ports, gates); any confirmed finding is addressed or explicitly rebutted before merge (owner ruling 2026-09-01, amending D-10). | Session practice, recorded in AGENTS.md; not machine-enforced by design | s§9.6 procedure (below) |
-| R-absorption | `DUCKSPOUT.md` is the source of truth until absorbed (s§10); the PR deleting it retires this rule. | CODEOWNERS path `/CONSTITUTION.md` — retiring this rule edits this file, so the deletion PR is mechanically human-approved | Retired by the s§10 completion PR |
 
 ## Canary discipline (recorded per s§9.3)
 
@@ -63,6 +62,15 @@ one mechanical flaw per PR, so each gate's catch is demonstrated
 independently. Outcomes are recorded in `docs/seed.md` after closure.
 ACPR is session-level judgment (R-acpr-session), not a gate, and has no
 canary.
+
+## Retired rules
+
+**Absorption rule** (formerly the seed rule guarding `DUCKSPOUT.md` as the
+source of truth until absorbed, docs/seed.md s§10) — retired 2026-09-01 by
+the s§10 completion PR: all 12 sections absorbed (issues #8–#19), the
+completeness audit passed after its blocker fixes (PR #92; §3.2–3.4 live
+verbatim in `specs/formal-core.md` until the modules land), and the
+monolith was deleted.
 
 ## Amendment procedure (docs/seed.md s§9.6)
 
