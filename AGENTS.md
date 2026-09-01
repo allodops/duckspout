@@ -61,6 +61,10 @@ an ADR (candidates, why they lost, revisit trigger) — R-third-party-first.
   (`just ci` summary; each new test and what it would catch) and the
   constitution checklist.
 - Blockers are native blocked-by issue relations, never body text.
+- Trust official documentation of external systems as published; validate
+  empirically only where the docs are vague or insufficient for the exact
+  guarantee you rely on — and say so explicitly in the PR
+  (R-trust-official-docs).
 - ACPR (adversarial critic pass review) is NOT a CI gate: the supervising
   session performs it, at its own judgment, on changes to core features —
   protocol crates, specs, ports, gates. Address or rebut its findings

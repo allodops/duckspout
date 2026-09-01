@@ -94,8 +94,10 @@ store and eliminates an entire class of log/store divergence bugs — there is
 no second copy to reconcile after a crash.
 
 DuckDB's officially documented WAL and checkpointing semantics are trusted
-as published (owner ruling 2026-09-01 — no per-version empirical
-re-certification; consistent with how A2/A3 trust Postgres and S3). The
+as published (R-trust-official-docs — no per-version empirical
+re-certification; consistent with how A2/A3 trust Postgres and S3; the
+vague-docs exception is invoked explicitly when a relied-upon guarantee
+is not pinned by the documentation). The
 engine version stays pinned in `compat-matrix.toml`, and version bumps
 remain deliberate one-PR changes; NoAckedLoss (§3) is only as strong as
 the engine's documented fsync-on-commit. Local NVMe is the assumed substrate — fsync latency is the ack
