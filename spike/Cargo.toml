@@ -15,6 +15,16 @@ license = "Apache-2.0"
 # C API only, ADR-0002; `bundled` compiles upstream's engine as shipped).
 duckdb = { version = "1.10505", features = ["bundled"] }
 anyhow = "1"
+# OTLP accept path (§4.1): tonic/prost 0.14 + opentelemetry-proto 0.32 per
+# compat-matrix.toml row 1 (pre-generated OTLP types, no build-time protoc).
+tonic = "0.14"
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic",
+    "logs",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

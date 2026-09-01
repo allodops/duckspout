@@ -5,14 +5,22 @@
 //! fsync granularity probing) is descoped — DuckDB's documented WAL/checkpoint
 //! behavior is trusted. What remains: the working embed and capacity data.
 //!
+//! Issue #24 adds the OTLP accept path (§4.1): a tonic gRPC LogsService
+//! writing through the ingest core, ack after commit.
+//!
 //! Subcommands:
 //!   bench <db-dir>        commit-latency distribution per batch size
 //!   count <db> <table>    print row count (reopen path)
+//!   serve <db> <addr>     OTLP/gRPC logs endpoint into the hot table
+//!   otlp-bench <db-dir> <batches> <batch-rows>
+//!                         in-process end-to-end throughput ballpark
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use spike::ingest::{IngestCore, LogRow};
+use spike::otlp::{HotWriter, OtlpLogsService};
 
 const TABLE: &str = "hot_w0";
 
@@ -22,8 +30,17 @@ fn main() -> ExitCode {
     let r = match strs.as_slice() {
         ["bench", dir] => bench(Path::new(dir)),
         ["count", db, table] => count(Path::new(db), table),
+        ["serve", db, addr] => serve(Path::new(db), addr),
+        ["otlp-bench", dir, batches, rows] => otlp_bench(
+            Path::new(dir),
+            batches.parse().unwrap(),
+            rows.parse().unwrap(),
+        ),
         _ => {
-            eprintln!("usage: spike bench <db-dir> | count <db> <table>");
+            eprintln!(
+                "usage: spike bench <db-dir> | count <db> <table> | serve <db> <addr> | \
+                 otlp-bench <db-dir> <batches> <batch-rows>"
+            );
             return ExitCode::from(2);
         }
     };
@@ -88,4 +105,69 @@ fn count(db: &Path, table: &str) -> anyhow::Result<()> {
     let core = IngestCore::open(db)?;
     println!("{}", core.count(table)?);
     Ok(())
+}
+
+/// OTLP/gRPC logs endpoint into the hot table (§4.1 accept path, spike-grade).
+fn serve(db: &Path, addr: &str) -> anyhow::Result<()> {
+    let writer = Arc::new(Mutex::new(HotWriter::open(db, TABLE)?));
+    let addr: std::net::SocketAddr = addr.parse()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        eprintln!("spike otlp: listening on {addr}, db {}", db.display());
+        tonic::transport::Server::builder()
+            .add_service(OtlpLogsService::new(writer).into_server())
+            .serve(addr)
+            .await
+    })?;
+    Ok(())
+}
+
+/// End-to-end throughput ballpark: in-process server on an ephemeral port,
+/// a real gRPC client sending `batches` × `batch_rows` log records, ack
+/// awaited per batch (sequential — one in-flight export, the collector's
+/// default posture), then a count check against the table.
+fn otlp_bench(dir: &Path, batches: usize, batch_rows: usize) -> anyhow::Result<()> {
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+
+    std::fs::create_dir_all(dir)?;
+    let db = dir.join("otlp_bench.db");
+    let _ = std::fs::remove_file(&db);
+    let writer = Arc::new(Mutex::new(HotWriter::open(&db, TABLE)?));
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let svc = OtlpLogsService::new(Arc::clone(&writer)).into_server();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let mut client = LogsServiceClient::connect(format!("http://{addr}")).await?;
+        // Warm-up batch (connection setup, first-table costs) — not counted.
+        client.export(spike::otlp::synthetic_request(8)).await?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..batches {
+            let resp = client
+                .export(spike::otlp::synthetic_request(batch_rows))
+                .await?;
+            anyhow::ensure!(
+                resp.into_inner().partial_success.is_none(),
+                "unexpected partial"
+            );
+        }
+        let elapsed = t0.elapsed();
+        let total = batches * batch_rows;
+        let committed = {
+            let w = writer.lock().unwrap();
+            w.count()?
+        };
+        println!(
+            "otlp-bench: {batches} batches x {batch_rows} rows in {elapsed:.2?} \
+             => {:.0} records/s (acked); table rows={committed} (incl. warm-up 8)",
+            total as f64 / elapsed.as_secs_f64()
+        );
+        anyhow::ensure!(committed == (total + 8) as i64, "count mismatch");
+        Ok(())
+    })
 }

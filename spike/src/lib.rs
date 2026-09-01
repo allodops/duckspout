@@ -2,3 +2,4 @@
 //! docs/seed.md s§11 step 7). Throwaway by design; deleted at v0.1.
 
 pub mod ingest;
+pub mod otlp;
