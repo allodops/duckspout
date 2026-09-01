@@ -1,5 +1,10 @@
 # Verification End-to-End (§8)
 
+> Toolchain decision record: **ADR-0011** — TLA+/TLC for the proof
+> tier, the in-house CTK for the testing tier; candidates (P, Coyote,
+> turmoil, madsim) and revisit triggers recorded there.
+
+
 Absorbed from DUCKSPOUT.md §8 per docs/seed.md s§10. Section labels (§8.1
 … §8.7) are preserved so citations elsewhere — the arming ledger's `spec`
 fields, CONSTITUTION.md, the ADRs — keep resolving after the monolith is
