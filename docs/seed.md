@@ -779,7 +779,7 @@ full loop.
    skipped-green lie). `just ci` green locally before push.
 2. **CI green on main** (agent): every armed job passes on the real runner;
    fix forward until true.
-3. **Human session** (~30 min, the one that makes autonomy legitimate):
+3. **~~Human session~~ ⁂⁂ waived** (owner ruling 2026-09-01: no human in the loop; settings were applied via API — see issue #4's closing record) — originally: **Human session** (~30 min, the one that makes autonomy legitimate):
    *read and sign off the seeded protected set* — CONSTITUTION.md,
    CODEOWNERS, invariants.toml, arming ledger, the six-plus workflows, the
    workflows (the choke point guards *changes*; this is the only review the
@@ -787,7 +787,7 @@ full loop.
    ruleset per s§6.6 (two required checks), merge queue, auto-merge, DCO
    app, labels, `ANTHROPIC_API_KEY` secret, `DISPATCH_TOKEN` credential
    (s§9.4). Leave `DISPATCH_ENABLED` unset.
-4. **Canaries** (human-launched, DRAFT PRs, one mechanical flaw each ⁂⁂):
+4. **Canaries** (agent-launched ⁂⁂ — sound with ACPR de-mechanized: the mechanical gates are deterministic and need no blind human author; executed 2026-09-01 as PR #104, forbidden accept→staging edge, `invariants` RED, closed unmerged — issue #5) — DRAFT PRs, one mechanical flaw each:
    e.g. an illegal-edge canary that must go red on `invariants` alone.
    Caught → close unmerged, record in docs/seed.md; missed → fix the gate
    before proceeding. Mechanical gates provably bite (§11) *before* the
