@@ -20,8 +20,8 @@
 //! No I/O anywhere: this crate's dependencies are `serde`, `serde_json`,
 //! thiserror, and bytes — nothing that can open a socket or a file.
 //!
-//! Design home: `docs/design/data-model.md` (lands at absorption; until then
-//! see `DUCKSPOUT.md` §2 and §10.1).
+//! Design home: `docs/design/data-model.md` (absorbed §2; for §10.1 see
+//! `DUCKSPOUT.md` until its absorption completes).
 
 #![forbid(unsafe_code)]
 
