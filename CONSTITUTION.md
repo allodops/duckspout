@@ -43,29 +43,29 @@ is the same offense as weakening the check."*
 
 | # | Statement | Mechanism | Amendment |
 |---|---|---|---|
-| R-third-party-first | Third-party-first is constitutional (D-12): an in-house build where a third-party candidate exists requires an ADR naming the candidates, why they lost, and a revisit trigger. Recorded exceptions at seed: HRW hashing (ADR-0004), the invariant engine (ADR-0007). | CODEOWNERS path `/docs/adr/` — the required ADR is human-gated; ACPR verifies the candidates/revisit sections exist | s§9.6 procedure (below) |
+| R-third-party-first | Third-party-first is constitutional (D-12): an in-house build where a third-party candidate exists requires an ADR naming the candidates, why they lost, and a revisit trigger. Recorded exceptions at seed: HRW hashing (ADR-0004), the invariant engine (ADR-0007). | CODEOWNERS path `/docs/adr/` — the required ADR is human-gated; reviews verify the candidates/revisit sections exist | s§9.6 procedure (below) |
 | R-no-bash | No `*.sh` or `*.bash` file exists anywhere, ever; scripting is Bun `.mjs` under `scripts/` (D-7). | Invariants rule: `banned-file` globs, via the armed CI job `invariants` | s§9.6 procedure (below) |
 | R-determinism | Protocol crates reach time, randomness, network, and processes only through the port traits in `duckspout-types` (D-2): `tokio::net`, `Instant::now`, `SystemTime::now`, `thread_rng`, `std::process` are banned in their sources. | Invariants rule: `banned-source` (D-2 pattern set), via the armed CI job `invariants` | s§9.6 procedure (below) |
 | R-armed-or-ledgered | Every gate is either an armed CI job or a staged ledger row (milestone + tracking issue) in `docs/arming-ledger.toml` — never a skipped-green job, never silently absent (D-1, s§6.5). | Invariants rules: `ledger-integrity` + `constitution-mechanism` pairings, via the armed CI job `invariants` | s§9.6 procedure (below) |
 | R-protected-set | Changes to the protected set (s§9.2: the gates' data **and** executables, plus the decision record) merge only with CODEOWNERS (human) approval (D-9). | CODEOWNERS paths — the s§9.2 block in `/CODEOWNERS`, which owns itself | s§9.6 procedure (below) |
-| R-acpr-union | Every PR passes ACPR as a required check; **any confirmed finding from any lens fails the check** (union); panel majority resolves only contested findings; escalated review is never laxer than base review (D-10). | Armed CI job `acpr` (required check; union rule enforced in `acpr.yml`, brief in `.github/prompts/acpr.md`) | s§9.6 procedure (below) |
+| R-acpr-session | ACPR (adversarial critic pass review) is **not mechanical** — no CI job, no required check. The supervising session performs it, at its own judgment, on changes to core features (protocol crates, specs, ports, gates); any confirmed finding is addressed or explicitly rebutted before merge (owner ruling 2026-09-01, amending D-10). | Session practice, recorded in AGENTS.md; not machine-enforced by design | s§9.6 procedure (below) |
 | R-absorption | `DUCKSPOUT.md` is the source of truth until absorbed (s§10); the PR deleting it retires this rule. | CODEOWNERS path `/CONSTITUTION.md` — retiring this rule edits this file, so the deletion PR is mechanically human-approved | Retired by the s§10 completion PR |
 
-## Honest limitation of ACPR (recorded per s§9.3)
+## Canary discipline (recorded per s§9.3)
 
-ACPR is a **judgment gate** — additional to, never a substitute for, the
-mechanical gates. Its bite is proven, not assumed: seed canaries at s§11
-step 4, then quarterly blind canary DRAFT-PR pairs via
-`canary-reminder.yml` — one ACPR-class flaw, one mechanical flaw, so each
-gate's catch is demonstrated independently. Outcomes are recorded in
-`docs/seed.md` after closure.
+The mechanical gates' bite is proven, not assumed: seed canaries at s§11
+step 4, then quarterly blind canary DRAFT PRs via `canary-reminder.yml` —
+one mechanical flaw per PR, so each gate's catch is demonstrated
+independently. Outcomes are recorded in `docs/seed.md` after closure.
+ACPR is session-level judgment (R-acpr-session), not a gate, and has no
+canary.
 
 ## Amendment procedure (docs/seed.md s§9.6)
 
-- **Protected-set changes** (this file included): a normal PR + ACPR +
-  `ci-ok` + CODEOWNERS human approval. No other path exists — including for
+- **Protected-set changes** (this file included): a normal PR + `ci-ok` +
+  CODEOWNERS human approval. No other path exists — including for
   amendments to this procedure.
-- **Everything else**: fully autonomous — PR + ACPR + `ci-ok` + auto-merge.
+- **Everything else**: fully autonomous — PR + `ci-ok` + auto-merge.
 - Keep Rules may be tightened or loosened only through that review; a diff
   touching a threshold, an allowlist, or a check's scope is read line by
   line, never taken on the change's own explanation (§11). Settled decisions

@@ -27,7 +27,7 @@ the protected set).
 - `just --list` is the discovery surface; every recipe is documented and
   grouped. The chain is always GHA → `just` → `scripts/*.mjs` (or cargo).
 - Run **`just ci` before every PR**. Scope caveat: `just ci` reproduces every
-  mechanical constituent of `ci-ok` bit-for-bit; `acpr` and the DCO status
+  mechanical constituent of `ci-ok` bit-for-bit; the DCO status
   are CI-only (s§5.1).
 - A staged gate invoked directly (e.g. `just conformance`) runs for real and
   exits 78 (`STAGED`) if its inputs don't exist — reported as staged, never
@@ -61,7 +61,10 @@ an ADR (candidates, why they lost, revisit trigger) — R-third-party-first.
   (`just ci` summary; each new test and what it would catch) and the
   constitution checklist.
 - Blockers are native blocked-by issue relations, never body text.
-- ACPR reviews every PR adversarially; address or rebut findings in-thread.
+- ACPR (adversarial critic pass review) is NOT a CI gate: the supervising
+  session performs it, at its own judgment, on changes to core features —
+  protocol crates, specs, ports, gates. Address or rebut its findings
+  in-thread like any review.
 
 ## Never
 

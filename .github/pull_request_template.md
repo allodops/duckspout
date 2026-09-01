@@ -9,11 +9,11 @@
 ## § sections touched
 
 <!-- The DUCKSPOUT.md (§n) and docs/seed.md (s§n) sections this change
-     implements or affects. ACPR verifies the diff against these citations. -->
+     implements or affects. Reviews verify the diff against these citations. -->
 
 ## Verification evidence
 
-- `just ci` summary: <!-- paste the summary line(s); acpr + DCO are CI-only (s§5.1) -->
+- `just ci` summary: <!-- paste the summary line(s); the DCO status is CI-only (s§5.1) -->
 - New tests and what they would catch: <!-- for each new test: the failure it detects. "No new tests" needs a stated reason. -->
 
 ## Constitution checklist
