@@ -62,6 +62,18 @@ string_id! {
     PartitionId
 }
 
+impl PartitionId {
+    /// The canonical partition identity for `(tenant_id, shard)` — the
+    /// partition key shape of §2.2. One rendering, defined once, so accept,
+    /// replication, and drain can never disagree on which partition a
+    /// (tenant, shard) pair names. `event` datasets default to a single
+    /// shard (`shard_count` 1, so shard 0) in v1.
+    #[must_use]
+    pub fn from_tenant_shard(tenant: &TenantId, shard: u32) -> Self {
+        Self(format!("{}.{shard}", tenant.as_str()))
+    }
+}
+
 string_id! {
     /// A node identity. Also used as the *origin* of an `(origin, seq)`
     /// replication range (§4.2.4, §5).

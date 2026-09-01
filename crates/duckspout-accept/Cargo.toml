@@ -8,9 +8,25 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# arrow builds the fixed-schema record batches the decoder emits as IPC
+# streams (compat-matrix row 1 — the same pin staging re-exports).
+arrow = { workspace = true }
+bytes = { workspace = true }
 duckspout-types = { workspace = true }
 opentelemetry-proto = { workspace = true }
+# prost decodes wire payloads for the AcceptAdapter port surface (the same
+# pin tonic/opentelemetry-proto ride, compat-matrix row 1).
+prost = { workspace = true }
+# serde_json renders OTLP attribute trees into the schema's JSON text
+# columns (§4.8's fixed mapping).
+serde_json = { workspace = true }
 tonic = { workspace = true }
+
+[dev-dependencies]
+# The in-process gRPC tests bind an ephemeral loopback listener and stream
+# it into tonic — dev-only; production sockets belong to the daemon.
+tokio = { workspace = true, features = ["net"] }
+tokio-stream = { workspace = true }
 
 [lints]
 workspace = true

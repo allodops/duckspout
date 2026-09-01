@@ -15,7 +15,8 @@
 //!   Appendix B) ([`trace`]);
 //! - every cross-crate port trait (ADR-0008): [`ports::Clock`],
 //!   [`ports::Scheduler`], [`ports::Transport`], [`ports::Storage`],
-//!   [`ports::AcceptAdapter`], [`ports::LakeCommitter`].
+//!   [`ports::AcceptAdapter`], [`ports::StageCommitter`],
+//!   [`ports::LakeCommitter`].
 //!
 //! No I/O anywhere: this crate's dependencies are `serde`, `serde_json`,
 //! thiserror, and bytes — nothing that can open a socket or a file.
@@ -40,8 +41,9 @@ pub use manifest::{OriginSeqRange, PartKind, WindowManifest};
 pub use otlp::{GrpcCode, OtlpErrorClass};
 pub use ports::{
     AcceptAdapter, AcceptError, AttachInfo, BoxFuture, Clock, ColumnSpec, CommitOutcome,
-    DecodedBatch, LakeCommitter, LakeError, Scheduler, SchemaEvolution, Storage, StorageError,
-    StoragePath, Transport, TransportError, WireError, WireRequest,
+    DecodedBatch, LakeCommitter, LakeError, Scheduler, SchemaEvolution, StageCommitter, StageError,
+    StagedCoverage, Storage, StorageError, StoragePath, Transport, TransportError, WireError,
+    WireRequest,
 };
 pub use status::{NodeStatus, OverloadStatus};
 pub use trace::{EnvironmentEvent, TraceEvent, TraceRecord};

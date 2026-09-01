@@ -1,15 +1,15 @@
-//! The accept surface (§4): the adapter-registration seam and the OTLP
-//! adapter, v1's only adapter (§4.1.2).
+//! The accept surface (§4): the adapter-registration seam, the OTLP
+//! adapter (v1's only adapter, §4.1.2), and the ack-sequence service over
+//! the `StageCommitter` port (§4.3).
 //!
-//! The [`AcceptAdapter`] port is defined in `duckspout-types` (ADR-0008) and
-//! re-exported here; this crate owns everything beyond the bare signature —
-//! adapter registration and the concrete adapters. Durability semantics are
+//! The [`AcceptAdapter`] and `StageCommitter` ports are defined in
+//! `duckspout-types` (ADR-0008); this crate owns everything beyond the bare
+//! signatures — adapter registration ([`AdapterRegistry`]), the concrete
+//! OTLP adapter ([`otlp`]), and the gRPC export service ([`server`]) that
+//! acks only after the staging port committed. Durability semantics are
 //! adapter-invariant: no adapter touches the ack path (§4.1.2).
 //!
-//! Ⓢ bootstrap stub — the real OTLP decoder lands at v0.1.
-//!
-//! Design home: `docs/design/ingest.md` (lands at absorption; until then see
-//! `DUCKSPOUT.md` §4).
+//! Design home: `docs/design/ingest.md` (§4.1, §4.3).
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +19,10 @@ use std::sync::Arc;
 pub use duckspout_types::AcceptAdapter;
 
 pub mod otlp;
+pub mod server;
+
+pub use otlp::OtlpGrpcAdapter;
+pub use server::OtlpLogsService;
 
 /// The adapter-registration seam: protocol name → adapter. Non-OTLP adapters
 /// (post-v1, §4.1.2) plug in here without touching the ack path.

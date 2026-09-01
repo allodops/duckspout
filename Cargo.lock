@@ -718,8 +718,14 @@ dependencies = [
 name = "duckspout-accept"
 version = "0.0.1"
 dependencies = [
+ "arrow",
+ "bytes",
  "duckspout-types",
  "opentelemetry-proto",
+ "prost",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -742,6 +748,7 @@ dependencies = [
 name = "duckspout-daemon"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "clap",
  "config",
  "duckspout-accept",
@@ -752,9 +759,13 @@ dependencies = [
  "duckspout-staging",
  "duckspout-types",
  "duckspout-watermark",
+ "opentelemetry-proto",
  "serde",
+ "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

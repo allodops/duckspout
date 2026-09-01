@@ -75,9 +75,23 @@ translation. Non-OTLP adapters (Kafka-protocol accept, native Arrow Flight
 expressible through the same trait without touching the ack path — the trait
 boundary exists precisely so that durability semantics are adapter-invariant.
 
-OTLP `partial_success` is used only for permanently rejected malformed
-items; it is never used to smuggle a partial durability outcome. A batch is
-acked durable in its entirety or it is refused/throttled in its entirety.
+The decode obligation includes OTLP's string-interning fields (issue #110):
+opentelemetry-proto ≥ 0.32 carries `*_strindex` references
+(`KeyValue.key_strindex`, `AnyValue.StringValueStrindex`) whose referent
+string table exists only in the Profiling signal — a logs/traces/metrics
+request has no table to resolve against. The proto's own instruction for
+non-profiling receivers is normative here (R-trust-official-docs): their
+presence is non-fatal — the affected key or value is processed as if
+absent, counted, and disclosed to the client as a warning in the OTLP
+`partial_success` shape with `rejected_*` = 0 (the spec's sanctioned
+fully-accepted-with-warning form). The record itself is never dropped and
+resolution is never invented.
+
+OTLP `partial_success` otherwise carries only permanently rejected
+malformed items; it is never used to smuggle a partial durability outcome
+(a `rejected_* = 0` warning, as above, is not a durability outcome). A
+batch is acked durable in its entirety or it is refused/throttled in its
+entirety.
 
 ## 2. WAL = hot: the durability primitive (§4.2)
 

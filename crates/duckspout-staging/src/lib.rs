@@ -16,13 +16,17 @@
 //!   [`StageTxn::commit`], returning the per-origin seq coverage
 //!   ([`StagedCoverage`]) that `ClientAck` evidence needs (§4.3).
 //! - [`StagingReader`] — the dedicated read path (Arrow out, §7.4).
+//! - [`EngineStager`] — the [`StageCommitter`] port (defined in
+//!   `duckspout-types`, ADR-0008) over the engine: partition assignment
+//!   (§2.2), arrival-time window rolling on the [`Clock`] port (§2.3), and
+//!   the `StageCommit` transaction the accept path acks on (§4.3). The
+//!   accept path reaches staging only through that port; the daemon
+//!   composes the two crates (issue #32).
 //!
 //! What this crate does **not** do yet, by design: the dedup-window table
 //! and the overload ladder are the §4.4–§4.6 work (issue #33) and will ride
-//! the same `StageTxn`; the accept path consumes the engine through the
-//! daemon's composition (issue #32; §10.1 — protocol crates never depend on
-//! each other); replica-side `PeerApply` sharing the applied-watermark
-//! mechanism is the replication work (§5).
+//! the same `StageTxn` through the same port; replica-side `PeerApply`
+//! sharing the applied-watermark mechanism is the replication work (§5).
 //!
 //! Layering (§10.1, ADR-0008): this crate depends on `duckspout-types` only
 //! among workspace crates; the runtime side channels go through the
@@ -35,18 +39,24 @@
 
 #![forbid(unsafe_code)]
 
-pub use duckspout_types::{Storage, StorageError};
+pub use duckspout_types::{
+    Clock, StageCommitter, StageError, StagedCoverage, Storage, StorageError,
+};
 
 pub mod naming;
 
 #[cfg(feature = "duckdb")]
 pub mod engine;
+#[cfg(feature = "duckdb")]
+pub mod stager;
 
 #[cfg(feature = "duckdb")]
 pub use engine::{
-    CHECKPOINT_THRESHOLD_DEFERRED, HOT_DB_FILE, StageTxn, StagedCoverage, StagingConfig,
-    StagingEngine, StagingError, StagingReader, WindowRef,
+    CHECKPOINT_THRESHOLD_DEFERRED, HOT_DB_FILE, StageTxn, StagingConfig, StagingEngine,
+    StagingError, StagingReader, WindowRef,
 };
+#[cfg(feature = "duckdb")]
+pub use stager::EngineStager;
 
 /// The arrow pin the engine's append/scan surfaces speak (compat-matrix
 /// row 1) — re-exported so embedders build batches against the same version.
