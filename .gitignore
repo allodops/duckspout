@@ -17,3 +17,4 @@ node_modules/
 
 # local working copy; canonical copy is docs/seed.md
 /SEED.md
+.claude/

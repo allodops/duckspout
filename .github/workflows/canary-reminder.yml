@@ -4,7 +4,8 @@
 # github.token is fine here: creating an issue needs to trigger no other
 # workflow. The issue is assigned to the repo owner; the canaries themselves
 # are authored OUT-OF-BAND by the owner — blind discipline means no repo
-# automation may know a canary window is open.
+# automation may know a canary window is open. Canaries prove the
+# MECHANICAL gates bite (ACPR is session-level judgment, not a CI gate).
 name: Canary reminder
 
 on:
@@ -31,22 +32,17 @@ jobs:
           cat > "${RUNNER_TEMP}/body.md" <<'EOF'
           Time for the quarterly canary exercise (SEED s§9.3, docs/seed.md).
 
-          Author a **pair of blind canary DRAFT PRs, out-of-band** (never via
-          repo automation, never announced in any brief or issue before the
-          verdicts land):
-
-          1. One carrying **only an ACPR-class flaw** (e.g. a gamed test:
-             tautological assert, testing the mock, threshold tuned to current
-             behavior) — it must go red on `acpr` alone.
-          2. One carrying **only a mechanical flaw** (e.g. an illegal dep
-             edge) — it must go red on `invariants` alone.
+          Author **blind canary DRAFT PRs, out-of-band** (never via repo
+          automation, never announced anywhere before the verdicts land), one
+          mechanical-gate flaw per PR — e.g. an illegal dep edge that must go
+          red on `invariants` alone, a banned API that must go red on the
+          determinism ban, a floor regression once floors are armed.
 
           Blind discipline:
           - DRAFT PRs (auto-merge cannot fire), ordinary titles and branch
             names, no marker of any kind until closed.
-          - The ACPR brief is never told a canary window is open.
           - Each gate's catch is proven independently — one flaw per PR, never
-            both in one.
+            two in one.
 
           Afterwards: close both unmerged and record the outcomes in
           docs/seed.md. If either gate missed its flaw, fix the gate before

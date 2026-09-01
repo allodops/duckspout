@@ -101,7 +101,7 @@ const body = [
   `Task: work issue #${picked.number} — "${picked.title}" — to completion.`,
   `- Read CONSTITUTION.md, the touched crate's design doc, and docs/arming-ledger.toml first (AGENTS.md).`,
   `- Respect the definition-of-done and § citations in the issue body; blockers are native blocked-by relations and are all closed.`,
-  `- Run \`just ci\` before opening the PR (acpr + DCO are CI-only, s§5.1).`,
+  `- Run \`just ci\` before opening the PR (the DCO status is CI-only, s§5.1).`,
   `- Open one PR with a Conventional-Commit title, DCO sign-off, and a verification-evidence section; reference this issue with \`Fixes #${picked.number}\`.`,
 ].join("\n");
 await api("--method", "POST", `repos/${repo}/issues/${picked.number}/comments`, "-f", `body=${body}`);
