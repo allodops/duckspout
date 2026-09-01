@@ -93,11 +93,12 @@ ingest architecture (log → memtable → flush) into a single transactional
 store and eliminates an entire class of log/store divergence bugs — there is
 no second copy to reconcile after a crash.
 
-The engineering caveat is acknowledged: DuckDB's fsync granularity
-(per-commit vs. per-checkpoint) must be verified against the engine source
-and pinned in the compatibility matrix (`compat-matrix.toml`) before each
-supported DuckDB version is certified; NoAckedLoss (§3) is only as strong as
-that fsync. Local NVMe is the assumed substrate — fsync latency is the ack
+DuckDB's officially documented WAL and checkpointing semantics are trusted
+as published (owner ruling 2026-09-01 — no per-version empirical
+re-certification; consistent with how A2/A3 trust Postgres and S3). The
+engine version stays pinned in `compat-matrix.toml`, and version bumps
+remain deliberate one-PR changes; NoAckedLoss (§3) is only as strong as
+the engine's documented fsync-on-commit. Local NVMe is the assumed substrate — fsync latency is the ack
 path's critical path, and network volumes with high fsync cost degrade ack
 p99 directly (`docs/verification.md`'s benchmark hardware disclosure exists
 for this reason). Fsync discipline (directory fsync, torn-write detection,
