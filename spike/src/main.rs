@@ -8,6 +8,9 @@
 //! Issue #24 adds the OTLP accept path (§4.1): a tonic gRPC LogsService
 //! writing through the ingest core, ack after commit.
 //! Issue #25 adds the drain leg (§6.2/§6.4): seal → atomic DuckLake commit.
+//! Issue #28 adds the pinning probes (§7.6): drain commits and read-only
+//! attaches runnable as a REAL second OS process, for the cross-process
+//! catalog-snapshot tests in `tests/pinning.rs`.
 //!
 //! Subcommands:
 //!   bench <db-dir>        commit-latency distribution per batch size
@@ -17,6 +20,12 @@
 //!                         in-process end-to-end throughput ballpark
 //!   drain <dir> <rows>    seal a synthetic hot window, commit it to a local
 //!                         DuckLake with the watermark riding the same txn
+//!   pin-commit <lake-dir> <window-id>
+//!                         one drain-shaped {add files + watermark} commit
+//!                         against the sqlite-catalog lake in <lake-dir>
+//!   pin-attach <lake-dir> <sqlite|file>
+//!                         read-only attach + one observation; prints
+//!                         "rows=N watermark=W" or fails
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -41,11 +50,14 @@ fn main() -> ExitCode {
             rows.parse().unwrap(),
         ),
         ["drain", dir, rows] => drain(Path::new(dir), rows.parse().unwrap()),
+        ["pin-commit", dir, window] => pin_commit(Path::new(dir), window.parse().unwrap()),
+        ["pin-attach", dir, kind] => pin_attach(Path::new(dir), kind),
         _ => {
             eprintln!(
                 "usage: spike bench <db-dir> | count <db> <table> | serve <db> <addr> | \
                  flight <db> <addr> | otlp-bench <db-dir> <batches> <batch-rows> | \
-                 drain <dir> <rows>"
+                 drain <dir> <rows> | pin-commit <lake-dir> <window-id> | \
+                 pin-attach <lake-dir> <sqlite|file>"
             );
             return ExitCode::from(2);
         }
@@ -141,6 +153,32 @@ fn flight(db: &Path, addr: &str) -> anyhow::Result<()> {
             .serve(addr)
             .await
     })?;
+    Ok(())
+}
+
+/// One drain-shaped commit from THIS process against the sqlite-catalog lake
+/// in `dir` — the "drain keeps committing" half of the cross-process pinning
+/// test (issue #28), run as a genuinely separate OS process.
+fn pin_commit(dir: &Path, window: i64) -> anyhow::Result<()> {
+    let lake = spike::pinning::Lake::new(dir, spike::pinning::CatalogKind::Sqlite)?;
+    let writer = spike::pinning::DrainWriter::open(&lake)?;
+    writer.commit_window(window)?;
+    println!("pin-commit: window {window} committed");
+    Ok(())
+}
+
+/// Read-only attach + one observation from THIS process — probes whether a
+/// second OS process can attach the given catalog kind at all (issue #28).
+fn pin_attach(dir: &Path, kind: &str) -> anyhow::Result<()> {
+    let kind = match kind {
+        "sqlite" => spike::pinning::CatalogKind::Sqlite,
+        "file" => spike::pinning::CatalogKind::DuckdbFile,
+        other => anyhow::bail!("unknown catalog kind {other:?}"),
+    };
+    let lake = spike::pinning::Lake::new(dir, kind)?;
+    let reader = spike::pinning::ClientReader::open(&lake)?;
+    let obs = reader.observe()?;
+    println!("pin-attach: rows={} watermark={}", obs.rows, obs.watermark);
     Ok(())
 }
 
