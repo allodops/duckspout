@@ -99,6 +99,16 @@ jobs:
           msrv-toolchain: "1.96"
       - run: just msrv
 
+  pr-title:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: just pr-title-check
+
   workflows:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -113,7 +123,7 @@ jobs:
   # so it runs even when a need fails; the step then fails unless every need
   # succeeded — a cancelled or skipped need is a failure, never a pass.
   ci-ok:
-    needs: [fmt, clippy, test, deny, docs, invariants, msrv, workflows]
+    needs: [fmt, clippy, test, deny, docs, invariants, msrv, workflows, pr-title]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

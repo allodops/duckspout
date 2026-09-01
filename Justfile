@@ -64,6 +64,11 @@ msrv:
 [group('quality')]
 workflows:
     bun scripts/workflows-lint.mjs
+# Validate the squash subject / PR title format (scripts/pr-type-label.mjs rule)
+[group('quality')]
+pr-title-check:
+    bun scripts/pr-title-check.mjs
+
 
 # --- test ---
 

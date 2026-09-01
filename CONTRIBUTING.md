@@ -43,3 +43,16 @@ load-bearing.
   CODEOWNERS (human) approval.
 - Settled decisions live in `docs/adr/` and docs/seed.md s§1: propose
   amendments through the s§9.6 procedure, don't re-litigate them in PRs.
+
+## PR titles and labels
+
+Every PR title MUST carry a Conventional-Commit header
+`type(scope)!?: subject` with a recognized type — titles are squash-merge
+subjects and release-plz input, enforced by the required `pr-title` check
+(`just pr-title-check`, rule in `scripts/pr-type-label.mjs`). The scope is
+optional; when present it must be from the vocabulary (crate short names
+plus spike, specs, scripts, deploy, ci, deps, release) and must not
+restate the type. Labels are automation, not chores: `pr-label` applies
+the type label from the title (Dependabot self-labels and is skipped);
+`issue-label` applies `area/*` labels from cited crates/paths. Both heal
+via backfill runs and share the one mapping module.

@@ -1,0 +1,61 @@
+# issue-label.yml — applies `area/*` labels to issues from the crate names
+# and file paths their bodies cite (scripts/issue-label.mjs). The
+# issue-side counterpart to pr-label.yml: issues carry no CC title, so
+# area is inferred from citations. Automation, NOT a gate; it only ADDS
+# area labels and never touches the hand-applied scheme (epic,
+# gate-arming, absorption, spike, revisit, ready, blocked).
+#
+# SECURITY: `issues` is not a fork-controlled trigger — it fires on this
+# repository's own issues and runs the in-repo script from the default
+# branch. Least-privilege permissions.
+name: issue-label
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: issue-label-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - run: bun scripts/issue-label.mjs --self-test
+      - run: bun scripts/issue-label.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_LABEL_MODE: event
+
+  backfill:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - run: bun scripts/issue-label.mjs --self-test
+      - run: bun scripts/issue-label.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_LABEL_MODE: backfill
