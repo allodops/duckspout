@@ -234,3 +234,13 @@ workflow_job = ""
 milestone = "v0.4"
 issue = 70
 spec = "§8.7"
+
+[[gate]]
+id = "pr-title"
+status = "armed"
+cadence = "pr"
+recipe = "pr-title-check"
+workflow_job = "ci.yml:pr-title"
+milestone = ""
+issue = 0
+spec = "CONTRIBUTING.md PR-title rule; release-plz feeds on squash subjects (D-13)"

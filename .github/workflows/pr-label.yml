@@ -1,0 +1,74 @@
+# pr-label.yml — applies the Conventional-Commit type label to every PR,
+# derived from the PR title (the title IS the squash subject under this
+# repo's squash-only + PR_TITLE settings). Automation, NOT a gate — the
+# `pr-title` job in ci.yml owns rejection; this only decorates.
+#
+# Two paths, ONE mapping (scripts/pr-type-label.mjs; the gate imports the
+# same module, so they cannot drift):
+#   label    — event-driven, labels the one PR in the payload.
+#   backfill — cron + manual, walks every OPEN PR and heals missing labels
+#              (idempotent; catches queued/failed event runs).
+#
+# Bot-authored PRs are SKIPPED in both paths: Dependabot self-labels via
+# dependabot.yml, and a foreign label edit blocks its auto-rebase.
+#
+# SECURITY: plain `pull_request` (zizmor: no dangerous triggers). Same-repo
+# PRs get a write-capable token, which is every PR this loop authors; a
+# fork-authored PR's event run is read-only and no-ops on the API call —
+# the cron backfill (default-branch token) heals those. Never executes
+# head code beyond checking out the base... note: plain pull_request
+# checks out the MERGE ref by default; this workflow runs only the
+# in-repo scripts, which the pr-title gate already validates.
+name: pr-label
+
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+  schedule:
+    - cron: "23 */6 * * *" # off-:00 to dodge the cron stampede
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pr-label-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - run: bun scripts/pr-type-label.mjs --self-test
+      - run: bun scripts/pr-label.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_LABEL_MODE: event
+
+  backfill:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - run: bun scripts/pr-type-label.mjs --self-test
+      - run: bun scripts/pr-label.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_LABEL_MODE: backfill
