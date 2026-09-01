@@ -24,7 +24,7 @@ written down, so the register carries both halves of the rule it states.
 
 | Deferred | Design-of-record | Trigger |
 |---|---|---|
-| Warm retention, SLRU, `residency` attribute, rung-0 eviction | The two-class doctrine and cache-transparency theorem (§2.4); Demote/Evict/DropWindow class mechanics (§6.9); the parked SLRU ratio and rung-0 low-water constants (§9.6.3, docs/operations.md); the residency/pin seam (§10.3, docs/architecture.md); the deciding experiment is defined in §12.5 (milestone v0.4) | The v0.4 experiment shows a measured win over querier-local caching |
+| Warm retention, SLRU, `residency` attribute, rung-0 eviction | The two-class doctrine and cache-transparency theorem (§2.4); Demote/Evict/DropWindow class mechanics (§6.9); the parked SLRU ratio and rung-0 low-water constants (§9.6.3, docs/operations.md); the residency/pin seam (§10.3, docs/architecture.md); the deciding experiment (defined below, absorbed from §12.5) | The v0.4 experiment shows a measured win over querier-local caching |
 | Pin (DDL residency `pin`, refuse-new/degrade-grown, fixed cap) | The residency/pin seam (§10.3); the `residency` attribute is listed-but-uncounted in the dataset ledger (§9.6.2); the pattern it must beat is the documented temp-table materialize-and-refresh join (§7.7) | Measured demand the documented temp-table join pattern cannot serve |
 | Hot LATEST projection (async-maintained, evict-last under drain stall) | The `<dataset>_latest` argmax view and the two freshness modes it must not blur (§7.7); the projection's own shape is the parenthetical here — async-maintained, evict-last under drain stall | Argmax view + client patterns measurably insufficient for dimension serving |
 | Seq-versioned snapshot/revalidation endpoint; keyed diffs behind it | The materialize-and-refresh cadence it would replace (§7.7); versioning rides the per-(partition, origin) seq vocabulary that already orders the changelog (§5) | Revalidation traffic dominates full refresh |
@@ -72,3 +72,25 @@ the operator's half); any transform DSL (permanent, Keep Rule 7).
 The cut list is audited before v1.0 ships (issue #74: cut-list audit +
 deferred register current) — each absence must still have its compensating
 story, and each register entry a live design-of-record and trigger.
+
+## Absorbed §12 milestone narratives (audit blockers B-1..B-3)
+
+Normative fragments that lived only in §12's prose, homed here so the
+milestone contracts survive the monolith's deletion (each also reflected in
+its GitHub milestone description and tracking issue):
+
+**The warm-retention experiment (§12.5, design-of-record for the
+warm-retention register entry above):** "The warm-retention experiment is
+defined and run — N ephemeral queriers, shared working set, RF=2, durable
+acks, versus querier-local caching — and its result is the gate for the
+parked cache class."
+
+**The SCD-2 SQL spike (§12.4):** "The SCD-2 SQL spike (LEAD-over-key
+validity composed with generation COALESCE) runs before the docs promise
+AS-OF-by-SQL."
+
+**Changelog version scoping (§12.3–§12.4):** changelogs land at v0.2 as
+declaration + drain, GA-gated on v0.3's snapshot rollover; snapshot
+rollover under the drain scheduler, the `<dataset>_latest` views,
+`dimension_as_of`, and `duckspout_freshness()` land at v0.3. Versions are
+contracts about which invariants are armed; this scoping is normative.

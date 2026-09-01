@@ -739,7 +739,7 @@ directly.
 | §1 | `README.md` | Pillars table, doorway test, honest-gap section |
 | §2 | `docs/design/data-model.md` | |
 | §3 prose | `specs/README.md` | Module map, philosophy, action vocabulary |
-| §3 formal content | `specs/*.tla` Ⓜ(v0.1) | Until then §3 text stays verbatim in specs/README |
+| §3 formal content | `specs/*.tla` Ⓜ(v0.1) | Until then §3.2–3.4 live verbatim in `specs/formal-core.md` (interim home, deleted when the modules land) |
 | §4 | `docs/design/ingest.md` | Admission constants also → operations appendix |
 | §5 | `docs/design/replication.md` | |
 | §6 | `docs/design/drain.md` | |
