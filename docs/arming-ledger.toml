@@ -11,7 +11,7 @@
 
 # Flipped to false by SEED s§11 step 5's ledger-filling PR (protected-set,
 # human-clicked); until then the issue > 0 sub-check is dormant.
-bootstrap = true
+bootstrap = false
 
 # --- armed, cadence = "pr" (the `just ci` sequence, in order) ---
 
