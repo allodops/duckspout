@@ -1,62 +1,58 @@
-//! Watermark ledger logic (§6.8, §7) over the row types owned by
-//! `duckspout-types` ([`WatermarkRow`],
-//! [`duckspout_types::AppliedWatermarkRow`]).
+//! Watermark ledger logic (§2.4, §6.8, §7.3) over the row types owned by
+//! `duckspout-types` ([`duckspout_types::WatermarkRow`],
+//! [`duckspout_types::AppliedWatermarkRow`], [`duckspout_types::WindowManifest`]).
 //!
-//! Watermarks are the only registry state that matters (§6.8):
-//! `complete_through` advances only via a window's own drain (riding
-//! `LakeCommit` atomically, §6.4) or the `DeclareLoss` ceremony (§5.8), and
-//! is authoritative-but-reconstructible from manifest contiguity plus live
-//! hot coverage (§6.8).
+//! Watermarks are the only registry state that matters (§6.8). This crate is
+//! the lake-neutral bookkeeping **above** the `LakeCommitter` port
+//! (ADR-0010: the lake stores the watermark; this crate computes what the
+//! lake stores): per-`(dataset, partition)` `complete_through` tracking, the
+//! advance computation `commit_files` carries (§6.4 — `WatermarkAdvance`
+//! rides `LakeCommit` atomically), and reconstruction of the authoritative
+//! state from the lake's manifest record (§6.8's
+//! authoritative-but-reconstructible). Pure logic: no I/O, no clock, no
+//! doubles needed to test it (D-2 is satisfied by construction).
 //!
-//! Ⓢ bootstrap stub — advance/reconstruction logic lands at v0.1. This crate
-//! is pure ledger logic; persistence is the committer's transaction, never
-//! this crate's I/O.
+//! # The advance rule
+//!
+//! One rule serves the live path ([`WatermarkLedger::record_commit`] /
+//! [`WatermarkLedger::record_loss`]) and recovery
+//! ([`WatermarkLedger::reconstruct`]) — the formal `NewWatermark` definition
+//! (specs/formal-core.md §3.3), projected onto the frozen manifest fields:
+//! the watermark stands at the highest window of the dense committed prefix
+//! after which every origin's committed seq coverage is gap-free from seq 1,
+//! every hole excused only by a loss-ledger row (§5.8 — the one sanctioned
+//! weakening). `complete_through` is the running maximum of
+//! `event_time_max_ms` over the advanced windows — monotone by construction,
+//! and honest about lateness: a post-watermark straggler is outside every
+//! `complete` read's contract (§6.3).
+//!
+//! # Conventions (normative for every producer of these inputs)
+//!
+//! - **Window ids are dense per partition and 0-based**: a partition's first
+//!   sealed window is `WindowId(0)` (§2.3 — contiguity must be decidable).
+//! - **Per-`(partition, origin)` seqs are 1-based**: gap refusal admits
+//!   exactly `applied_seq + 1` and `applied_seq = 0` means nothing applied
+//!   (§4.2.4).
+//! - **`complete_through_ms` is inclusive**: the §7.5 cold branch takes
+//!   at-or-below, so a row *at* the watermark instant is lake-covered
+//!   ([`WatermarkLedger::covers`]).
 //!
 //! Layering (§10.1, ADR-0008): depends on `duckspout-types` only among
-//! workspace crates.
+//! workspace crates. Persistence is the committer's transaction, never this
+//! crate's I/O.
 //!
-//! Design home: `docs/design/drain.md` (lands at absorption; until then see
-//! `DUCKSPOUT.md` §6.8).
+//! Design home: `docs/design/drain.md` (§6.4, §6.8), `docs/design/query.md`
+//! (§7.3), `docs/design/data-model.md` (§2.4), ADR-0010.
 
 #![forbid(unsafe_code)]
 
-use duckspout_types::{PartitionId, WatermarkRow};
+mod coverage;
+mod ledger;
+mod loss;
+mod reconstruct;
+#[cfg(test)]
+mod testutil;
 
-/// An in-memory view of committed watermark state. Ⓢ v0.1: the advance rule
-/// (window contiguity), `DeclareLoss` annotations, and reconstruction land
-/// with the drain.
-#[derive(Debug, Default)]
-pub struct WatermarkLedger {
-    rows: Vec<WatermarkRow>,
-}
-
-impl WatermarkLedger {
-    /// An empty ledger.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Loads the last committed rows, as read back through
-    /// `LakeCommitter::read_watermarks` (§6.4).
-    #[must_use]
-    pub fn from_rows(rows: Vec<WatermarkRow>) -> Self {
-        Self { rows }
-    }
-
-    /// The committed `complete_through` for a partition, if any (§7: a range
-    /// at or below it is lake-served and never touches hot).
-    #[must_use]
-    pub fn complete_through_ms(&self, partition: &PartitionId) -> Option<i64> {
-        self.rows
-            .iter()
-            .find(|row| &row.partition == partition)
-            .map(|row| row.complete_through_ms)
-    }
-
-    /// The rows in this view.
-    #[must_use]
-    pub fn rows(&self) -> &[WatermarkRow] {
-        &self.rows
-    }
-}
+pub use ledger::{AdvanceError, WatermarkLedger, WindowRecord};
+pub use loss::{DeclareLossRequest, LossLedgerRow, LostRange};
+pub use reconstruct::{CoverageHole, ReconstructError, Reconstruction, Stall, StallReason};

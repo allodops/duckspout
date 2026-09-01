@@ -758,6 +758,10 @@ name = "duckspout-watermark"
 version = "0.0.1"
 dependencies = [
  "duckspout-types",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
