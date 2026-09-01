@@ -134,12 +134,19 @@ everything below it is one backend crate. The contract has six operations:
 **First implementation: DuckLake** (`duckspout-lake-ducklake`). The
 committer embeds a DuckDB instance used purely as a metadata-commit
 executor — rows never transit it. `commit_files` executes
-`CALL ducklake_add_data_files(...)` for the sealed parts and inserts the
-watermark sidecar row into DuckSpout's registry table **in the same Postgres
-transaction** as DuckLake's own catalog writes. One transaction, one
-atomicity domain: the sidecar and the file registration commit or abort
-together, which is the whole mechanism behind `WatermarkHonesty` on this
-backend.
+`CALL ducklake_add_data_files(...)` for the sealed parts and writes the
+watermark **as a lake table riding the same DuckLake snapshot commit**
+(ADR-0010; the extension exposes no way to piggyback a plain catalog-DB
+write onto its metadata transaction — measured, spike #25). One snapshot,
+one atomicity domain: the watermark and the file registration commit or
+abort together — proven commit/abort/crash-mid-commit by the spike — which
+is the whole mechanism behind `WatermarkHonesty` on this backend, and what
+makes bind-time pinning engine-given (§7.5; spike #28). The
+`SingleDrainCommit` fence lives above the lake surface (DuckLake has no
+UNIQUE constraints and will double-register a file — spike #25): the
+candidate mechanism is DuckLake's snapshot-commit conflict on the
+watermark row, to be implemented and proven with a racing-drains test
+(ADR-0010, issue #36).
 
 **Second implementation: Iceberg, by contract.** The Iceberg committer maps
 `commit_files` to a REST-catalog append commit and carries the watermark

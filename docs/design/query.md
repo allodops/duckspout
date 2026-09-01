@@ -114,7 +114,7 @@ backend-scoping paragraph below covers Iceberg):
 |---|---|---|---|
 | `duckspout.nodes` | node id, incarnation, endpoints, failure domain, status enum | Heartbeat | soft state, reconstructible |
 | `duckspout.claims` | (partition → holder) coverage: owner claims and replica claims with `replicated_through` | ClaimAdvertise, piggybacked on PeerApply/Heartbeat | soft state, advisory |
-| `duckspout.watermarks` | per-partition `complete_through`, per-dataset `dimension_as_of`, loss-ledger annotations | **LakeCommit only** | transactional, authoritative |
+| `duckspout.watermarks` | per-partition `complete_through`, per-dataset `dimension_as_of`, loss-ledger annotations | **LakeCommit only** | transactional, authoritative — with the DuckLake backend, realized as a **lake table under the same snapshot** as the file registrations (ADR-0010), so a pinned snapshot yields a consistent {file set, watermark} pair by construction; binds read it through the lake attach, never through the raw `__ducklake_metadata_*` passthrough (not snapshot-pinned — spike #28, #118) |
 
 The placement is a deliberate collapse: watermarks advance **in the same
 catalog transaction as LakeCommit** (`docs/design/drain.md`). There is no
