@@ -16,8 +16,10 @@ use crate::ids::{DatasetId, NodeId, PartitionId};
 pub struct WatermarkRow {
     /// The partition this watermark covers.
     pub partition: PartitionId,
-    /// The instant (Unix milliseconds, exclusive upper bound) through which
-    /// this partition's data is complete in the lake. Never lies
+    /// The instant (Unix milliseconds, **inclusive**) through which this
+    /// partition's data is complete in the lake: the §7.5 cold branch takes
+    /// at-or-below, and `duckspout_absent` proves
+    /// `range_end ≤ complete_through` (§7.6). Never lies
     /// (`WatermarkHonesty`, §3).
     pub complete_through_ms: i64,
 }
