@@ -1,9 +1,11 @@
 //! The seeded scheduler: the [`Scheduler`] port's deterministic double.
 //!
-//! A single-threaded executor whose interleavings are a pure function of its
-//! seed: each polling round removes tasks in an order drawn from a `SplitMix64`
-//! stream, so the same seed replays the same schedule bit-for-bit — the
-//! reproduction handle every CTK failure ships with (§8.3).
+//! A single-threaded executor whose interleavings are decided by a
+//! [`ScheduleStrategy`] (ADR-0011's exploration seam): each polling round
+//! removes tasks in the order the strategy picks, so with the v0.1
+//! [`SeededRandom`] strategy the same seed
+//! replays the same schedule bit-for-bit — the reproduction handle every
+//! CTK failure ships with (§8.3).
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +15,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use duckspout_types::{BoxFuture, Clock, Scheduler};
 
 use crate::clock::VirtualClock;
+use crate::strategy::{ScheduleStrategy, SeededRandom};
 
 /// A deterministic, virtual-time executor implementing the [`Scheduler`]
 /// port.
@@ -29,19 +32,27 @@ pub struct SeededScheduler {
 }
 
 struct Inner {
-    rng_state: u64,
+    strategy: Box<dyn ScheduleStrategy>,
     tasks: Vec<BoxFuture<'static, ()>>,
     deadlines: BTreeSet<u64>,
 }
 
 impl SeededScheduler {
-    /// A scheduler driven by `seed`, advancing `clock`.
+    /// A scheduler driven by `seed` (the v0.1 seeded-random strategy),
+    /// advancing `clock`.
     #[must_use]
     pub fn new(seed: u64, clock: Arc<VirtualClock>) -> Self {
+        Self::with_strategy(Box::new(SeededRandom::new(seed)), clock)
+    }
+
+    /// A scheduler exploring interleavings with `strategy` (ADR-0011's
+    /// seam; #124 adds a PCT-style prioritized strategy here).
+    #[must_use]
+    pub fn with_strategy(strategy: Box<dyn ScheduleStrategy>, clock: Arc<VirtualClock>) -> Self {
         Self {
             clock,
             inner: Mutex::new(Inner {
-                rng_state: seed,
+                strategy,
                 tasks: Vec::new(),
                 deadlines: BTreeSet::new(),
             }),
@@ -52,17 +63,6 @@ impl SeededScheduler {
     #[must_use]
     pub fn clock(&self) -> &Arc<VirtualClock> {
         &self.clock
-    }
-
-    fn next_random(&self) -> u64 {
-        let mut inner = self.inner.lock().expect("scheduler lock");
-        // SplitMix64 (public domain), inlined: `thread_rng` is banned (D-2)
-        // and a seeded stream is the whole point.
-        inner.rng_state = inner.rng_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = inner.rng_state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
     }
 
     /// Runs until every task completes, or until the remainder is stuck
@@ -85,11 +85,11 @@ impl SeededScheduler {
             let mut progressed = false;
             let mut still_pending = Vec::new();
             while !round.is_empty() {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "index is reduced modulo the (small) round length"
-                )]
-                let index = (self.next_random() % round.len() as u64) as usize;
+                let index = {
+                    let mut inner = self.inner.lock().expect("scheduler lock");
+                    inner.strategy.next_index(round.len())
+                };
+                assert!(index < round.len(), "strategy broke its index contract");
                 let mut task = round.swap_remove(index);
                 let mut context = Context::from_waker(&waker);
                 match task.as_mut().poll(&mut context) {
@@ -201,8 +201,18 @@ mod tests {
         }
     }
 
-    fn record_order(seed: u64) -> Vec<u32> {
-        let scheduler = SeededScheduler::new(seed, Arc::new(VirtualClock::new()));
+    /// Always polls index 0 — with `swap_remove`, two rounds of this leave
+    /// the tasks completing in spawn order (0,7,6,…,1 polled first round,
+    /// then 0,1,2,…,7), which no seeded-random schedule is pinned to.
+    struct PickFirst;
+
+    impl ScheduleStrategy for PickFirst {
+        fn next_index(&mut self, _pending: usize) -> usize {
+            0
+        }
+    }
+
+    fn record_order_with(scheduler: &SeededScheduler) -> Vec<u32> {
         let order = Arc::new(Mutex::new(Vec::new()));
         for label in 0..8_u32 {
             let order = Arc::clone(&order);
@@ -212,7 +222,14 @@ mod tests {
             }));
         }
         assert_eq!(scheduler.run_until_idle(), 0);
-        order.lock().expect("order lock").clone()
+        let order = order.lock().expect("order lock").clone();
+        assert_eq!(order.len(), 8, "every task must complete");
+        order
+    }
+
+    fn record_order(seed: u64) -> Vec<u32> {
+        let scheduler = SeededScheduler::new(seed, Arc::new(VirtualClock::new()));
+        record_order_with(&scheduler)
     }
 
     #[test]
@@ -220,7 +237,17 @@ mod tests {
         let first = record_order(42);
         let second = record_order(42);
         assert_eq!(first, second);
-        assert_eq!(first.len(), 8, "every task must complete");
+    }
+
+    #[test]
+    fn custom_strategy_steers_the_schedule() {
+        let scheduler =
+            SeededScheduler::with_strategy(Box::new(PickFirst), Arc::new(VirtualClock::new()));
+        assert_eq!(
+            record_order_with(&scheduler),
+            (0..8).collect::<Vec<u32>>(),
+            "the executor must poll exactly where the strategy points"
+        );
     }
 
     #[test]

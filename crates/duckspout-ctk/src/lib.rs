@@ -7,7 +7,10 @@
 //!
 //! - [`VirtualClock`] — time advances only when told to;
 //! - [`SeededScheduler`] — a single-threaded executor whose interleavings
-//!   are a pure function of its seed;
+//!   are decided by a pluggable [`ScheduleStrategy`] (ADR-0011's
+//!   exploration seam); the v0.1 strategy, [`SeededRandom`], makes the
+//!   schedule a pure function of its seed, and #124 adds a PCT-style
+//!   prioritized strategy alongside it;
 //! - [`InMemNetwork`] / [`InMemTransport`] — in-memory peer messaging with
 //!   fault-injection points;
 //! - [`InMemStorage`] — an in-memory store modeling the fsync discipline
@@ -35,10 +38,12 @@ pub mod clock;
 pub mod ledger;
 pub mod scheduler;
 pub mod storage;
+pub mod strategy;
 pub mod transport;
 
 pub use clock::VirtualClock;
 pub use ledger::{FaultCount, InjectorLedger};
 pub use scheduler::SeededScheduler;
 pub use storage::InMemStorage;
+pub use strategy::{ScheduleStrategy, SeededRandom};
 pub use transport::{InMemNetwork, InMemTransport};
