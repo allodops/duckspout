@@ -6,3 +6,4 @@ pub mod flight;
 pub mod ingest;
 pub mod otlp;
 pub mod pinning;
+pub mod union_query;

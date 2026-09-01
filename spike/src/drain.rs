@@ -109,6 +109,19 @@ impl DrainCore {
         Ok(Self { conn })
     }
 
+    /// The underlying connection (hot db + attached lake) — the union spike
+    /// (#27) runs its one-statement hot∪cold query on it.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// A second connection onto the SAME database instance (hot + lake),
+    /// with its own transaction scope — the #27 pinning experiment reads
+    /// through this while `self.conn` commits a drain.
+    pub fn reader(&self) -> Result<Connection> {
+        Ok(self.conn.try_clone()?)
+    }
+
     /// §6.2 SealPart: ONE sorted COPY of a closed window to a Parquet file.
     pub fn seal_part(&self, table: &str, out: &Path) -> Result<SealStats> {
         let rows: i64 = self
