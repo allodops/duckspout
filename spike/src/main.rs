@@ -31,6 +31,7 @@ fn main() -> ExitCode {
         ["bench", dir] => bench(Path::new(dir)),
         ["count", db, table] => count(Path::new(db), table),
         ["serve", db, addr] => serve(Path::new(db), addr),
+        ["flight", db, addr] => flight(Path::new(db), addr),
         ["otlp-bench", dir, batches, rows] => otlp_bench(
             Path::new(dir),
             batches.parse().unwrap(),
@@ -39,7 +40,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: spike bench <db-dir> | count <db> <table> | serve <db> <addr> | \
-                 otlp-bench <db-dir> <batches> <batch-rows>"
+                 flight <db> <addr> | otlp-bench <db-dir> <batches> <batch-rows>"
             );
             return ExitCode::from(2);
         }
@@ -116,6 +117,22 @@ fn serve(db: &Path, addr: &str) -> anyhow::Result<()> {
         eprintln!("spike otlp: listening on {addr}, db {}", db.display());
         tonic::transport::Server::builder()
             .add_service(OtlpLogsService::new(writer).into_server())
+            .serve(addr)
+            .await
+    })?;
+    Ok(())
+}
+
+/// Arrow Flight endpoint over the hot table (§7.4 serve leg, issue #26):
+/// ticket = SQL, result streamed back as Arrow record batches.
+fn flight(db: &Path, addr: &str) -> anyhow::Result<()> {
+    let core = Arc::new(Mutex::new(IngestCore::open(db)?));
+    let addr: std::net::SocketAddr = addr.parse()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        eprintln!("spike flight: listening on {addr}, db {}", db.display());
+        tonic::transport::Server::builder()
+            .add_service(spike::flight::HotFlightService::new(core).into_server())
             .serve(addr)
             .await
     })?;
