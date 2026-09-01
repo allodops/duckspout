@@ -45,6 +45,10 @@ proptest = "1"
 proptest-state-machine = "0.8"
 loom = "0.7"
 crc32fast = "1"
+# dev-only: unique on-disk fixtures for the staging engine's real-DuckDB
+# tests (issue #31); the de-facto standard, no in-house candidate
+# (R-third-party-first).
+tempfile = "3"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -53,7 +57,7 @@ toml = "1"
 # --- internal crates (lockstep 0.0.1, SEED D-13) ---
 duckspout-types = { path = "crates/duckspout-types", version = "0.0.1" }
 duckspout-accept = { path = "crates/duckspout-accept", version = "0.0.1" }
-duckspout-staging = { path = "crates/duckspout-staging", version = "0.0.1", default-features = false }
+duckspout-staging = { path = "crates/duckspout-staging", version = "0.0.1" }
 duckspout-replication = { path = "crates/duckspout-replication", version = "0.0.1" }
 duckspout-drain = { path = "crates/duckspout-drain", version = "0.0.1" }
 duckspout-watermark = { path = "crates/duckspout-watermark", version = "0.0.1" }

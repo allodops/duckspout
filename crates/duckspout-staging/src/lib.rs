@@ -2,62 +2,53 @@
 //!
 //! There is no separate WAL crate, deliberately: `DuckDB` persistent tables
 //! with fsync-on-commit *are* the durability primitive. One store, not two —
-//! `StageCommit` is one `DuckDB` transaction (rows + dedup-window entry +
-//! applied-watermark row, §4.2.4, §4.3), and crash replay is the engine's
-//! own. Fsync discipline — directory fsync, torn-write detection, group
-//! commit off the reactor — lives behind the [`Storage`] port and its CTK
-//! fault injectors (ADR-0003).
+//! `StageCommit` is one `DuckDB` transaction and crash replay is the
+//! engine's own. The concrete engine lives in [`engine`] (the `duckdb`
+//! cargo feature, in the default set since the engine landed — issue #31):
+//!
+//! - [`StagingEngine`] — open/create the persistent hot database, one
+//!   micro-window table per (dataset, partition, window) (§2.3), a write
+//!   connection serialized behind a mutex, dedicated read connections that
+//!   never contend with it (#114), and checkpointing kept off the ack path
+//!   (#109).
+//! - [`StageTxn`] — one transactional batch append: rows + system columns
+//!   (`origin`, `seq`) + the applied-watermark rows (§4.2.4), fsynced at
+//!   [`StageTxn::commit`], returning the per-origin seq coverage
+//!   ([`StagedCoverage`]) that `ClientAck` evidence needs (§4.3).
+//! - [`StagingReader`] — the dedicated read path (Arrow out, §7.4).
+//!
+//! What this crate does **not** do yet, by design: the dedup-window table
+//! and the overload ladder are the §4.4–§4.6 work (issue #33) and will ride
+//! the same `StageTxn`; the accept path consumes the engine through the
+//! daemon's composition (issue #32; §10.1 — protocol crates never depend on
+//! each other); replica-side `PeerApply` sharing the applied-watermark
+//! mechanism is the replication work (§5).
 //!
 //! Layering (§10.1, ADR-0008): this crate depends on `duckspout-types` only
-//! among workspace crates; it consumes the runtime exclusively through the
-//! types-defined ports (D-2 — no direct network, wall-clock, randomness,
-//! or process-spawning APIs; the invariants engine enforces the ban).
+//! among workspace crates; the runtime side channels go through the
+//! types-defined ports (D-2). The [`Storage`] port's exact boundary here —
+//! `DuckDB` is the content-durability primitive, the port owns
+//! directory-entry durability — is documented in [`engine`].
 //!
-//! Ⓢ bootstrap stub — the engine lands at v0.1. The `duckdb` cargo feature
-//! (the bundled engine, ADR-0002) is **off by default at bootstrap** —
-//! compiling the vendored C++ costs >10 minutes with no engine code to use
-//! it yet — and joins the default set when the engine lands.
-//!
-//! Design home: `docs/design/ingest.md` (lands at absorption; until then see
-//! `DUCKSPOUT.md` §4.2 and ADR-0003).
+//! Design home: `docs/design/ingest.md` (§4.2–§4.3) and
+//! `docs/design/data-model.md` (§2.3).
 
 #![forbid(unsafe_code)]
 
-use duckspout_types::{Storage, StorageError};
+pub use duckspout_types::{Storage, StorageError};
 
-/// The embedded hot-store connection type (ADR-0002: bundled DuckDB C++ is
-/// upstream's code, not first-party C++).
+pub mod naming;
+
 #[cfg(feature = "duckdb")]
-pub type HotConnection = duckdb::Connection;
+pub mod engine;
 
-/// The staging engine over a [`Storage`] port. Ⓢ v0.1: `StageCommit`,
-/// micro-window tables (§2.3), the dedup window (§4.4.1), and the
-/// applied-watermark rows (§4.2.4) land together with the engine.
-pub struct StagingEngine<S: Storage> {
-    storage: S,
-}
+#[cfg(feature = "duckdb")]
+pub use engine::{
+    CHECKPOINT_THRESHOLD_DEFERRED, HOT_DB_FILE, StageTxn, StagedCoverage, StagingConfig,
+    StagingEngine, StagingError, StagingReader, WindowRef,
+};
 
-impl<S: Storage> StagingEngine<S> {
-    /// Wraps a storage port. No I/O happens until the engine lands (v0.1).
-    pub fn new(storage: S) -> Self {
-        Self { storage }
-    }
-
-    /// The storage port this engine commits through.
-    pub fn storage(&self) -> &S {
-        &self.storage
-    }
-
-    /// `StageCommit` (§4.3): one transaction — rows + dedup-window entry +
-    /// applied-watermark row — fsync on commit. Ⓢ v0.1.
-    ///
-    /// # Errors
-    ///
-    /// Always [`StorageError::Backend`] with a not-implemented notice until
-    /// the engine lands.
-    pub fn stage_commit_stub(&self) -> Result<(), StorageError> {
-        Err(StorageError::Backend(
-            "StageCommit lands at v0.1 (§4.3, ADR-0003)".to_owned(),
-        ))
-    }
-}
+/// The arrow pin the engine's append/scan surfaces speak (compat-matrix
+/// row 1) — re-exported so embedders build batches against the same version.
+#[cfg(feature = "duckdb")]
+pub use arrow;
