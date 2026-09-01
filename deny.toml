@@ -1,0 +1,38 @@
+# cargo-deny configuration (SEED s§3.4): advisories, license allowlist,
+# duplicate-version warnings, crates.io-only sources.
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec vulnerabilities are errors by default; keep the rest loud.
+unmaintained = "workspace"
+yanked = "deny"
+
+[licenses]
+# Allowlist per SEED s§3.4. Additions beyond the seed list are recorded here
+# with the dependency that needs them; extend honestly, never wholesale.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # Needed by the actual tree beyond the seed list (SEED s§3.4):
+    # tiny-keccak (const-random ← ahash ← arrow 58).
+    "CC0-1.0",
+    # webpki-roots (ureq, build-dep of libduckdb-sys `bundled`).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

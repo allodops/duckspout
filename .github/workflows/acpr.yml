@@ -1,0 +1,155 @@
+# acpr.yml — Adversarial Critic Pass Review, the required judgment gate
+# (SEED s§6.2, s§9.3; D-10).
+#
+# Single-reviewer at bootstrap. TODO(panel, SEED s§9.3): when protocol crates
+# gain real code, PRs touching protocol crates or specs/ get a 3-lens panel
+# (correctness / spec-conformance / test-integrity) — three reviewer
+# invocations with distinct lenses; the red→green flip audit (verdict history,
+# SEED s§9.3) lands with it. The UNION VERDICT RULE holds now and then:
+# any confirmed finding from any lens → exit nonzero → `acpr` red. Panel
+# majority resolves only *contested* findings (lenses disagreeing about the
+# same claim); escalated review is never laxer than base review.
+#
+# Fail-closed by design: with no ANTHROPIC_API_KEY secret this check is red.
+# At bootstrap the secret does not exist yet; the ruleset requires `acpr`
+# only after the human session adds the secret (SEED s§11 step 3).
+#
+# NEVER pass `github_token` to the action — default-token pushes skip CI
+# (SEED s§9.3).
+name: ACPR
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acpr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  acpr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      statuses: write # verdict cache: commit status on the reviewed PR head (SEED s§6.2)
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the reviewer diffs against the base branch
+
+      # merge_group short-circuit (SEED s§6.2): a nondeterministic gate must
+      # not stochastically eject queued PRs. If the queued entry's PR head SHA
+      # already carries a green acpr verdict (commit status `acpr/verdict`),
+      # pass without re-reviewing; otherwise fall through to a full review of
+      # the queued tree.
+      - name: Check cached verdict (merge_group only)
+        id: cache
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          hit=false
+          # head_ref shape: refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>
+          if [[ "$HEAD_REF" =~ /pr-([0-9]+)- ]]; then
+            pr="${BASH_REMATCH[1]}"
+            pr_head=$(gh api "repos/${REPO}/pulls/${pr}" --jq .head.sha)
+            state=$(gh api "repos/${REPO}/commits/${pr_head}/status" \
+              --jq '[.statuses[] | select(.context == "acpr/verdict")][0].state' || echo "")
+            if [ "$state" = "success" ]; then
+              hit=true
+              echo "::notice::acpr verdict for PR #${pr} head ${pr_head} already green; short-circuiting (SEED s§6.2)"
+            fi
+          fi
+          echo "hit=$hit" >> "$GITHUB_OUTPUT"
+
+      # The brief is loaded from the DEFAULT branch, never the PR head: the
+      # brief is CODEOWNERS-protected, but ACPR runs before approval, so a PR
+      # must not be able to rewrite the instructions of its own reviewer.
+      - name: Load reviewer brief from the default branch
+        if: steps.cache.outputs.hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # No ?ref= parameter: the contents API serves the default branch.
+          gh api "repos/${REPO}/contents/.github/prompts/acpr.md" \
+            --jq .content | base64 -d > "${RUNNER_TEMP}/acpr-brief.md"
+          test -s "${RUNNER_TEMP}/acpr-brief.md"
+
+      - name: Adversarial review
+        id: review
+        if: steps.cache.outputs.hit != 'true'
+        uses: anthropics/claude-code-action@833fb0f8c9f6686b33d963a8bae0a94f4936ab2a # v1.0.211
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the ACPR reviewer for this repository. Your brief is the
+            file `${{ runner.temp }}/acpr-brief.md` (loaded from the trusted
+            default branch, outside the checkout). Read it first and follow it
+            exactly. Then review this pull request's diff against the base
+            branch. Report your verdict in the required structured output:
+            verdict "fail" with the list of confirmed findings if you confirm
+            any finding; verdict "pass" with an empty list only if you tried
+            to refute the change and could not.
+          claude_args: |
+            --max-turns 50
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
+            --json-schema '{"type":"object","required":["verdict","confirmed_findings"],"properties":{"verdict":{"type":"string","enum":["pass","fail"]},"confirmed_findings":{"type":"array","items":{"type":"string"}},"summary":{"type":"string"}}}'
+
+      # Union verdict enforcement (D-10): any confirmed finding → red.
+      # Mechanism: the action validates the reviewer's verdict against the
+      # JSON schema above and exposes it as `structured_output`; this step
+      # fails unless verdict == "pass" AND confirmed_findings is empty.
+      # Honest limitation: the verdict is the reviewer's own structured
+      # report — the action has no independent finding detector. ACPR is a
+      # judgment gate, additional to the mechanical gates, and its bite is
+      # proven by the canary discipline (SEED s§9.3, canary-reminder.yml).
+      - name: Enforce union verdict
+        if: always()
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.hit }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          RESULT: ${{ steps.review.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          if [ "$CACHE_HIT" = "true" ]; then
+            echo "cached green verdict accepted (merge_group short-circuit)"
+            exit 0
+          fi
+          if [ "$REVIEW_OUTCOME" != "success" ]; then
+            echo "::error::review execution did not succeed (outcome: ${REVIEW_OUTCOME}) — failing closed"
+            exit 1
+          fi
+          if [ -z "$RESULT" ]; then
+            echo "::error::no structured verdict produced — failing closed"
+            exit 1
+          fi
+          echo "$RESULT" | jq .
+          echo "$RESULT" | jq -e '.verdict == "pass" and ((.confirmed_findings | length) == 0)' > /dev/null \
+            || { echo "::error::ACPR confirmed findings — union verdict: red"; exit 1; }
+          echo "ACPR verdict: pass"
+
+      # Cache the green verdict on the PR head SHA so merge_group runs can
+      # short-circuit (SEED s§6.2). Only success is ever recorded — the cache
+      # is consulted for green only.
+      - name: Record green verdict
+        if: github.event_name == 'pull_request' && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/statuses/${SHA}" \
+            -f state=success \
+            -f context=acpr/verdict \
+            -f description="ACPR reviewed this head: no confirmed findings"

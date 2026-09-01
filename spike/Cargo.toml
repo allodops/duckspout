@@ -1,0 +1,13 @@
+# Own package, deliberately OUTSIDE the workspace (D-11): the root Cargo.toml
+# excludes spike/, and the empty [workspace] table below is the second lock —
+# cargo invoked in here never walks up into the workspace.
+[package]
+name = "spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]

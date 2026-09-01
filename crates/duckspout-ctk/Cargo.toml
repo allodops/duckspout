@@ -1,0 +1,15 @@
+[package]
+name = "duckspout-ctk"
+description = "DuckSpout consistency toolkit: deterministic doubles for the four runtime ports, with armed-vs-fired fault accounting."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+duckspout-types = { workspace = true }
+
+[lints]
+workspace = true

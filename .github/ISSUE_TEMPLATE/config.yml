@@ -1,0 +1,3 @@
+# Blank issues stay enabled: loop agents file via the API and mirror the form
+# field structure in the body (SEED s§9.5).
+blank_issues_enabled: true

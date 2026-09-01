@@ -1,0 +1,191 @@
+[[setting]]
+name = "node.data_dir"
+type = "path"
+default = "(required)"
+since = "0.0.1"
+
+[[setting]]
+name = "node.otlp_listen"
+type = "port"
+default = "4317"
+since = "0.0.1"
+
+[[setting]]
+name = "node.flight_listen"
+type = "port"
+default = "8815"
+since = "0.0.1"
+
+[[setting]]
+name = "node.peer_listen"
+type = "port"
+default = "7946"
+since = "0.0.1"
+
+[[setting]]
+name = "node.advertise_addr"
+type = "string"
+default = "first non-loopback interface, with the listen ports"
+since = "0.0.1"
+
+[[setting]]
+name = "node.failure_domain"
+type = "string"
+default = "zone label / config"
+since = "0.0.1"
+
+[[setting]]
+name = "cluster.rf"
+type = "u16"
+default = "2"
+since = "0.0.1"
+
+[[setting]]
+name = "cluster.zone_aware"
+type = "enum(auto|on|off)"
+default = "auto"
+since = "0.0.1"
+
+[[setting]]
+name = "cluster.seed_peers"
+type = "list<string>"
+default = "[]"
+since = "0.0.1"
+
+[[setting]]
+name = "catalog.dsn"
+type = "string"
+default = "(required)"
+since = "0.0.1"
+
+[[setting]]
+name = "catalog.password_file"
+type = "path"
+default = "(required)"
+since = "0.0.1"
+
+[[setting]]
+name = "tls.mode"
+type = "enum(mutual|server_only|disabled)"
+default = "(required, no default)"
+since = "0.0.1"
+
+[[setting]]
+name = "tls.cert"
+type = "path"
+default = "(required, no default)"
+since = "0.0.1"
+
+[[setting]]
+name = "tls.key"
+type = "path"
+default = "(required, no default)"
+since = "0.0.1"
+
+[[setting]]
+name = "tls.ca"
+type = "path"
+default = "(required, no default)"
+since = "0.0.1"
+
+[[setting]]
+name = "lake.committer"
+type = "string"
+default = "ducklake"
+since = "0.0.1"
+
+[[setting]]
+name = "lake.uri"
+type = "string"
+default = "(required)"
+since = "0.0.1"
+
+[[setting]]
+name = "hot.window"
+type = "duration"
+default = "60s"
+since = "0.0.1"
+
+[[setting]]
+name = "hot.max_bytes"
+type = "bytes"
+default = "75% of volume at startup"
+since = "0.0.1"
+
+[[setting]]
+name = "drain.max_age"
+type = "duration"
+default = "30m"
+since = "0.0.1"
+
+[[setting]]
+name = "drain.part_target_bytes"
+type = "bytes"
+default = "402653184"
+since = "0.0.1"
+
+[[setting]]
+name = "drain.allowed_lateness"
+type = "duration"
+default = "15m"
+since = "0.0.1"
+
+[[setting]]
+name = "replication.receipt_timeout"
+type = "duration"
+default = "5s"
+since = "0.0.1"
+
+[[setting]]
+name = "admission.max_inflight_bytes"
+type = "bytes"
+default = "10% of the memory budget (cgroup limit, else system RAM)"
+since = "0.0.1"
+
+[[setting]]
+name = "max_payload_bytes"
+type = "bytes"
+default = "4194304"
+since = "0.0.1"
+
+[[setting]]
+name = "dedup.window_ttl"
+type = "duration"
+default = "24h"
+since = "0.0.1"
+
+[[setting]]
+name = "dedup.window_max_entries"
+type = "u64"
+default = "100000"
+since = "0.0.1"
+
+[[setting]]
+name = "dedup.log_identity"
+type = "bool"
+default = "off"
+since = "0.0.1"
+
+[[setting]]
+name = "max_auto_columns"
+type = "u32"
+default = "1024"
+since = "0.0.1"
+
+[[setting]]
+name = "query.max_hot_bytes_per_query"
+type = "bytes"
+default = "2 GiB/node, fill-scaled"
+since = "0.0.1"
+
+[[setting]]
+name = "query.hot_scan_deadline"
+type = "duration"
+default = "30s"
+since = "0.0.1"
+
+[[setting]]
+name = "query.max_concurrent_hot_scans"
+type = "u32"
+default = "8"
+since = "0.0.1"

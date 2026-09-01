@@ -1,0 +1,3 @@
+# MSRV mirror only — API bans live in invariants.toml (SEED D-7).
+# Authoritative copy: root Cargo.toml `rust-version` (SEED Appendix A).
+msrv = "1.96"

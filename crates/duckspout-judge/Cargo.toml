@@ -1,0 +1,14 @@
+[package]
+name = "duckspout-judge"
+description = "CTK verdict binary: reads fleet journals, checks the invariants, exits Pass=0 / Violation=2 / NoVerdict=3 (§8.4)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+
+[lints]
+workspace = true

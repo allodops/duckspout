@@ -1,0 +1,42 @@
+# Task form (SEED s§9.5). Blockers are recorded as NATIVE blocked-by issue
+# relations, never as body text — the dispatcher reads the issue-dependencies
+# API, not prose. Agents filing via API mirror this field structure in the
+# body.
+name: Task
+description: A unit of loop work with citations, a definition of done, and its gate impact.
+labels: []
+body:
+  - type: textarea
+    id: citations
+    attributes:
+      label: "§ citations"
+      description: >-
+        The DUCKSPOUT.md (§n) and docs/seed.md (s§n) sections this task
+        implements or affects. Every normative claim in the task needs one.
+      placeholder: "§4.3, §5.1, s§6.1"
+    validations:
+      required: true
+  - type: textarea
+    id: definition-of-done
+    attributes:
+      label: Definition of done
+      description: >-
+        Checkable completion criteria: what exists, what passes, what is
+        provably true when this task is done.
+    validations:
+      required: true
+  - type: textarea
+    id: gates-affected
+    attributes:
+      label: Gates affected
+      description: >-
+        Which gates (armed CI jobs or docs/arming-ledger.toml rows) this task
+        touches, arms, or depends on. "None" is a valid answer — say it
+        explicitly.
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: >-
+        **Blockers**: do not list blockers here — record them as native
+        blocked-by relations on this issue (SEED s§9.4/s§9.5).

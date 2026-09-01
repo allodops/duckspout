@@ -1,0 +1,35 @@
+[package]
+name = "duckspout-daemon"
+description = "The DuckSpout node daemon: thin composition of the protocol crates — wiring, signals, cadence; no logic of its own."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Default OFF at bootstrap, mirroring duckspout-staging (flipped when the
+# engine lands, v0.1).
+default = []
+# Pass-through to the staging engine's embedded DuckDB (ADR-0002).
+duckdb = ["duckspout-staging/duckdb"]
+
+[dependencies]
+clap = { workspace = true }
+config = { workspace = true }
+duckspout-accept = { workspace = true }
+duckspout-drain = { workspace = true }
+duckspout-lake-contract = { workspace = true }
+duckspout-lake-ducklake = { workspace = true }
+duckspout-replication = { workspace = true }
+duckspout-staging = { workspace = true }
+duckspout-types = { workspace = true }
+duckspout-watermark = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

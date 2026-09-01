@@ -1,0 +1,22 @@
+# The protected set (docs/seed.md s§9.2): the gates' data AND executables,
+# plus the decision record. CODEOWNERS owns itself, or the choke point is
+# deletable by one green PR. One pattern per line.
+/CODEOWNERS               @tsouza
+/CONSTITUTION.md          @tsouza
+/invariants.toml          @tsouza
+/docs/arming-ledger.toml  @tsouza
+/docs/adr/                @tsouza
+/docs/seed.md             @tsouza
+/floors/                  @tsouza
+/specs/                   @tsouza
+/.github/                 @tsouza
+/Justfile                 @tsouza
+/scripts/                 @tsouza
+/deny.toml                @tsouza
+/rust-toolchain.toml      @tsouza
+/clippy.toml              @tsouza
+/.rustfmt.toml            @tsouza
+/compat-matrix.toml       @tsouza
+/.bun-version             @tsouza
+/package.json             @tsouza
+/bun.lock                 @tsouza

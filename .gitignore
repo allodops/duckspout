@@ -1,0 +1,19 @@
+# Rust build output
+target/
+
+# TLC scratch + counterexample litter (SEED s§2 notes)
+states/
+*_TTrace_*.tla
+
+# TLA+ tooling jars, fetched by `just tla-install` (scripts/tla.mjs)
+specs/.tools/
+
+# Bun
+node_modules/
+
+# local working dirs (never committed)
+.reviews/
+.sections/
+
+# local working copy; canonical copy is docs/seed.md
+/SEED.md

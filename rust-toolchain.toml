@@ -1,0 +1,4 @@
+# One exact stable toolchain (SEED D-14). Declared MSRV = N-2 lives in the
+# root Cargo.toml (`rust-version = "1.96"`); bump freely pre-1.0.
+[toolchain]
+channel = "1.98.0"

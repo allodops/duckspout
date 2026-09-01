@@ -1,0 +1,482 @@
+# Rule data for scripts/check-invariants.mjs (SEED s§7, D-7, ADR-0007).
+# Rules are DATA: the engine knows five rule kinds — forbidden-edge,
+# banned-file, banned-source, golden-manifest, pairing — and hardcodes no
+# specific edge, glob, or pattern.
+#
+# --- forbidden edges (82; finite and hand-enumerated per s§7 — nothing
+# --- generates them at check time). One [[forbidden-edge]] table each:
+#   1. every protocol×protocol pair, both directions (20) — ADR-0008
+#   2. every protocol crate → each concrete impl/bin crate (35) — §10.1
+#   3. every protocol crate except drain → duckspout-lake-contract (4) — s§4
+#   4. duckspout-types → every other workspace crate (13) — §10.1
+#   5. every non-bin crate → anyhow (10) — s§3.3
+# The seed listing's item 4 "every crate → spike" is encoded below as a
+# banned-source rule over crates/**/Cargo.toml instead of pseudo-edges:
+# spike is workspace-excluded (D-11), so it can never appear in `cargo
+# metadata` as a dependency edge — the only way a crate could reach it is a
+# path dependency, which the manifest-text ban catches directly.
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-staging"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-replication"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-drain"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-watermark"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-accept"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-replication"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-drain"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-watermark"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-accept"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-staging"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-drain"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-watermark"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-accept"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-staging"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-replication"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-watermark"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-accept"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-staging"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-replication"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-drain"
+reason = "ADR-0008: all shared ports live in duckspout-types; no protocol×protocol crate edges"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-lake-ducklake"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-ctk"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-daemon"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-ctl"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-fleet"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-judge"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-loadgen"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-lake-ducklake"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-ctk"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-daemon"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-ctl"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-fleet"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-judge"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-loadgen"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-lake-ducklake"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-ctk"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-daemon"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-ctl"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-fleet"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-judge"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-loadgen"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-lake-ducklake"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-ctk"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-daemon"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-ctl"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-fleet"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-judge"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "duckspout-loadgen"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-lake-ducklake"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-ctk"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-daemon"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-ctl"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-fleet"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-judge"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-loadgen"
+reason = "§10.1: protocol crates depend on duckspout-types only, never on concrete impls or bins"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "duckspout-lake-contract"
+reason = "s§4: duckspout-drain is the sole lake-contract consumer among protocol crates"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "duckspout-lake-contract"
+reason = "s§4: duckspout-drain is the sole lake-contract consumer among protocol crates"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "duckspout-lake-contract"
+reason = "s§4: duckspout-drain is the sole lake-contract consumer among protocol crates"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "duckspout-lake-contract"
+reason = "s§4: duckspout-drain is the sole lake-contract consumer among protocol crates"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-accept"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-staging"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-replication"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-drain"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-watermark"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-lake-contract"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-lake-ducklake"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-ctk"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-daemon"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-ctl"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-fleet"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-judge"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "duckspout-loadgen"
+reason = "§10.1: duckspout-types is the dependency root; it depends on no workspace crate"
+
+[[forbidden-edge]]
+from = "duckspout-types"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-accept"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-staging"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-replication"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-drain"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-watermark"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-lake-contract"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-lake-ducklake"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-ctk"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+[[forbidden-edge]]
+from = "duckspout-daemon"
+to = "anyhow"
+reason = "s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only; thiserror in libraries"
+
+# --- banned files ---
+
+[[banned-file]]
+glob = "**/*.sh"
+reason = "no bash, ever; Bun mjs under scripts/ (CONSTITUTION, D-7) — applies repo-wide, spike/ included"
+
+[[banned-file]]
+glob = "**/*.bash"
+reason = "same"
+
+# --- banned source patterns ---
+
+[[banned-source]]
+scope = "crates/duckspout-{accept,staging,replication,drain,watermark}/src/**"
+patterns = ["tokio::net", "Instant::now", "SystemTime::now", "thread_rng", "std::process"]
+reason = "D-2: determinism through ports; protocol crates spawn nothing"
+
+# Encodes the s§7 "every crate → spike" forbidden edges (see header): spike is
+# not a cargo dependency target, so ban the word at the manifest level.
+[[banned-source]]
+scope = "crates/**/Cargo.toml"
+patterns = ["spike"]
+reason = "D-11: spike/ is quarantined; no workspace crate may reference it"
+
+# --- golden manifests ---
+
+[[golden-manifest]]
+generate = "cargo run -q -p duckspout-daemon -- --dump-config-manifest"
+golden = "floors/config-surface.toml"
+reason = "§9.6.4 config-surface ratchet: 32 settings; additions are loud diffs"
+
+# --- pairing rules (each kind is implemented in the engine; s§7) ---
+
+[[pairing]]
+kind = "constitution-mechanism"   # every CONSTITUTION.md rule ID has a non-empty
+                                  # Mechanism cell (armed CI job / invariants rule /
+                                  # CODEOWNERS path / staged ledger row — s§8.2)
+
+[[pairing]]
+kind = "trace-mapping"            # every trace-enum variant ↔ a docs/trace-mapping.md row
+
+[[pairing]]
+kind = "ledger-integrity"         # the s§6.5 ledger invariants (armed⇒job+recipe exist;
+                                  # staged⇒milestone, +issue>0 when bootstrap=false [CI-only])
+
+[[pairing]]
+kind = "tool-pins"                # every version mirror ↔ its authoritative copy (Appendix A)
+
+[[pairing]]
+kind = "edge-audit-domain"        # every workspace crate appears in the forbidden-edge
+                                  # domain — a new crate cannot silently join unaudited
+
+[[pairing]]
+kind = "workspace-inheritance"    # every member inherits every [workspace.package] field

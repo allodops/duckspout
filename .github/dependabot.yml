@@ -1,0 +1,18 @@
+# Dependabot maintains the SHA pins (SEED s§6) and the cargo tree.
+# The 7-day cooldown lets fresh upstream releases soak before a bump PR —
+# same-day releases are the supply-chain-attack window (zizmor
+# dependabot-cooldown).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

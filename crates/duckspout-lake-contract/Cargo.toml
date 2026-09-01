@@ -1,0 +1,15 @@
+[package]
+name = "duckspout-lake-contract"
+description = "The LakeCommitter contract's home: re-exports the port and owns the conformance suite backends self-certify with."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duckspout-types = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,48 @@
+# dispatch.yml — the autonomous-loop picker (SEED s§6.4, s§9.4; D-17).
+#
+# The picker only assigns and comments (via scripts/dispatch.mjs); it launches
+# no agent itself — claude.yml is the single runner of agent work. The
+# dispatch comment is posted with DISPATCH_TOKEN (fine-scoped App/PAT), never
+# the workflow's GITHUB_TOKEN: GITHUB_TOKEN-created events trigger no
+# workflows, and github-actions[bot] would fail claude.yml's actor gate.
+name: Dispatch
+
+on:
+  schedule:
+    - cron: "0 * * * *" # hourly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The picker is serialized and never killed mid-assignment (D-17).
+concurrency:
+  group: dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      # DISPATCH_ENABLED ships unset; the human flips it at SEED s§11 step 3.
+      # The loop is mechanically off until then.
+      - name: Gate on DISPATCH_ENABLED
+        if: vars.DISPATCH_ENABLED != 'true'
+        run: echo "::notice::DISPATCH_ENABLED is not 'true' — dispatcher is off (SEED s§9.4); exiting green."
+
+      - name: Run the picker
+        if: vars.DISPATCH_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          bun install --frozen-lockfile
+          bun scripts/dispatch.mjs

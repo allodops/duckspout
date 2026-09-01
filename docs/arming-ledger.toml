@@ -1,0 +1,236 @@
+# Machine-readable gate ledger (SEED s§6.5) — the one source for "what is
+# armed". Parsed by scripts/lib/proc.mjs (`just ci` runs armed cadence="pr"
+# rows in this file's order) and by scripts/check-invariants.mjs (the
+# ledger-integrity pairing rule).
+#
+# Row schema: id (unique), status ("armed"|"staged"), cadence ("pr"|"nightly"),
+# recipe (Justfile recipe), workflow_job (required when armed), milestone
+# (required when staged), issue (tracking issue; must be > 0 once
+# bootstrap = false — enforced CI-only, s§6.5), spec (citation; §n =
+# DUCKSPOUT.md, s§n = docs/seed.md).
+
+# Flipped to false by SEED s§11 step 5's ledger-filling PR (protected-set,
+# human-clicked); until then the issue > 0 sub-check is dormant.
+bootstrap = true
+
+# --- armed, cadence = "pr" (the `just ci` sequence, in order) ---
+
+[[gate]]
+id = "fmt"
+status = "armed"
+cadence = "pr"
+recipe = "fmt-check"
+workflow_job = "ci.yml:fmt"
+milestone = ""
+issue = 0
+spec = "s§6.1"
+
+[[gate]]
+id = "clippy"
+status = "armed"
+cadence = "pr"
+recipe = "clippy"
+workflow_job = "ci.yml:clippy"
+milestone = ""
+issue = 0
+spec = "s§6.1"
+
+[[gate]]
+id = "test"
+status = "armed"
+cadence = "pr"
+recipe = "test-all"
+workflow_job = "ci.yml:test"
+milestone = ""
+issue = 0
+spec = "§8"
+
+[[gate]]
+id = "deny"
+status = "armed"
+cadence = "pr"
+recipe = "deny"
+workflow_job = "ci.yml:deny"
+milestone = ""
+issue = 0
+spec = "s§3.4"
+
+# Second step of the ci.yml deny job (s§6.1: `just deny` + `just machete`,
+# two steps); its own row so the `just ci` sequence covers it.
+[[gate]]
+id = "machete"
+status = "armed"
+cadence = "pr"
+recipe = "machete"
+workflow_job = "ci.yml:deny"
+milestone = ""
+issue = 0
+spec = "s§3.4"
+
+[[gate]]
+id = "docs"
+status = "armed"
+cadence = "pr"
+recipe = "doc"
+workflow_job = "ci.yml:docs"
+milestone = ""
+issue = 0
+spec = "s§6.1"
+
+[[gate]]
+id = "invariants"
+status = "armed"
+cadence = "pr"
+recipe = "invariants"
+workflow_job = "ci.yml:invariants"
+milestone = ""
+issue = 0
+spec = "s§7"
+
+[[gate]]
+id = "msrv"
+status = "armed"
+cadence = "pr"
+recipe = "msrv"
+workflow_job = "ci.yml:msrv"
+milestone = ""
+issue = 0
+spec = "s§3.4 (D-14)"
+
+[[gate]]
+id = "workflows"
+status = "armed"
+cadence = "pr"
+recipe = "workflows"
+workflow_job = "ci.yml:workflows"
+milestone = ""
+issue = 0
+spec = "s§6.1"
+
+# --- armed, cadence = "nightly" (nightly.yml only, never `just ci`) ---
+
+[[gate]]
+id = "hack-features"
+status = "armed"
+cadence = "nightly"
+recipe = "hack-features"
+workflow_job = "nightly.yml:hack-features"
+milestone = ""
+issue = 0
+spec = "s§3.4"
+
+# --- staged, cadence = "pr" (future ci.yml jobs; s§6.1 lower table) ---
+
+[[gate]]
+id = "tla-mc-core"
+status = "staged"
+cadence = "pr"
+recipe = "tla-mc"
+workflow_job = ""
+milestone = "v0.1"
+issue = 43
+spec = "§8.1"
+
+[[gate]]
+id = "tla-mc-replication"
+status = "staged"
+cadence = "pr"
+recipe = "tla-mc"
+workflow_job = ""
+milestone = "v0.2"
+issue = 57
+spec = "§8.1"
+
+[[gate]]
+id = "conformance"
+status = "staged"
+cadence = "pr"
+recipe = "conformance"
+workflow_job = ""
+milestone = "v0.1"
+issue = 44
+spec = "§8.2"
+
+[[gate]]
+id = "coverage-floor"
+status = "staged"
+cadence = "pr"
+recipe = "coverage"
+workflow_job = ""
+milestone = "v0.1"
+issue = 45
+spec = "§8"
+
+[[gate]]
+id = "instr-gate"
+status = "staged"
+cadence = "pr"
+recipe = "instr-gate"
+workflow_job = ""
+milestone = "v0.1"
+issue = 46
+spec = "§8 (ADR-0005)"
+
+[[gate]]
+id = "smoke"
+status = "staged"
+cadence = "pr"
+recipe = "smoke"
+workflow_job = ""
+milestone = "v0.1"
+issue = 47
+spec = "§8.6"
+
+# --- staged, cadence = "nightly" (future nightly.yml jobs; s§6.3) ---
+
+[[gate]]
+id = "tla-sim"
+status = "staged"
+cadence = "nightly"
+recipe = "tla-sim"
+workflow_job = ""
+milestone = "v0.1"
+issue = 48
+spec = "§8.1"
+
+[[gate]]
+id = "mutation-floor"
+status = "staged"
+cadence = "nightly"
+recipe = "mutants"
+workflow_job = ""
+milestone = "v0.1"
+issue = 49
+spec = "§8 (ADR-0009)"
+
+[[gate]]
+id = "ctk-distributed"
+status = "staged"
+cadence = "nightly"
+recipe = "ctk-distributed"
+workflow_job = ""
+milestone = "v0.2"
+issue = 58
+spec = "§8.4"
+
+# Promotion of the distributed CTK run to a release gate (§12.4); same job,
+# second stage — multi-stage gates get one row per stage (s§6.5).
+[[gate]]
+id = "ctk-release-gate"
+status = "staged"
+cadence = "nightly"
+recipe = "ctk-distributed"
+workflow_job = ""
+milestone = "v0.3"
+issue = 60
+spec = "§12.4"
+
+[[gate]]
+id = "bench-card"
+status = "staged"
+cadence = "nightly"
+recipe = "bench-card"
+workflow_job = ""
+milestone = "v0.4"
+issue = 70
+spec = "§8.7"

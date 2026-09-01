@@ -1,0 +1,16 @@
+[package]
+name = "duckspout-accept"
+description = "DuckSpout accept surface: adapter registration seam and the OTLP adapter (first implementation)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duckspout-types = { workspace = true }
+opentelemetry-proto = { workspace = true }
+tonic = { workspace = true }
+
+[lints]
+workspace = true

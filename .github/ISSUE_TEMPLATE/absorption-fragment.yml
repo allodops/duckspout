@@ -1,0 +1,32 @@
+# Absorption-fragment form (SEED s§9.5, s§10): DUCKSPOUT.md content that has
+# no home in the absorption map becomes one of these — nothing is silently
+# dropped.
+name: Absorption fragment
+description: DUCKSPOUT.md content the absorption map (docs/seed.md s§10) does not home.
+labels: []
+body:
+  - type: input
+    id: source
+    attributes:
+      label: Source location
+      description: The DUCKSPOUT.md section and paragraph the fragment comes from.
+      placeholder: "§9.4, paragraph 3"
+    validations:
+      required: true
+  - type: textarea
+    id: fragment
+    attributes:
+      label: Fragment
+      description: The unhomed content, quoted verbatim.
+    validations:
+      required: true
+  - type: textarea
+    id: disposition
+    attributes:
+      label: Proposed disposition
+      description: >-
+        Where this content should live (an existing destination, a new doc, a
+        code comment, an ADR) — or why it should be retired, stated
+        explicitly.
+    validations:
+      required: true

@@ -1,0 +1,54 @@
+# claude.yml — the @claude mention handler, the SINGLE runner of agent work
+# (SEED s§6.4, s§9.4; D-15/D-17).
+#
+# Actor-gated: on a public repo an ungated mention handler lets any passerby
+# spend the API key and direct an agent. The gate admits (a) actors with
+# write-tier author_association, and (b) the DISPATCH_TOKEN identity — the
+# fine-scoped App/PAT the dispatcher posts with (SEED s§9.4): its login is
+# recorded in the DISPATCH_ACTOR repo variable at s§11 step 3, because an App
+# bot's author_association is not MEMBER/OWNER/COLLABORATOR yet its dispatch
+# comments are the loop's task framing and must trigger runs.
+name: Claude
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  claude:
+    if: >-
+      contains(github.event.comment.body, '@claude') &&
+      (
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) ||
+        github.event.comment.user.login == vars.DISPATCH_ACTOR
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@833fb0f8c9f6686b33d963a8bae0a94f4936ab2a # v1.0.211
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # DISPATCH_ACTOR is an App bot identity; without this the action's
+          # own bot filter would drop the dispatcher's comments.
+          allowed_bots: ${{ vars.DISPATCH_ACTOR }}
+          claude_args: |
+            --max-turns 100

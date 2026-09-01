@@ -1,0 +1,58 @@
+# canary-reminder.yml — the recurrence mechanism the canary discipline needs
+# (SEED s§6.4, s§9.3).
+#
+# github.token is fine here: creating an issue needs to trigger no other
+# workflow. The issue is assigned to the repo owner; the canaries themselves
+# are authored OUT-OF-BAND by the owner — blind discipline means no repo
+# automation may know a canary window is open.
+name: Canary reminder
+
+on:
+  schedule:
+    - cron: "0 9 1 1,4,7,10 *" # quarterly: 09:00 UTC, 1st of Jan/Apr/Jul/Oct
+
+permissions:
+  contents: read
+
+jobs:
+  open-reminder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open the quarterly canary issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: tsouza
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/body.md" <<'EOF'
+          Time for the quarterly canary exercise (SEED s§9.3, docs/seed.md).
+
+          Author a **pair of blind canary DRAFT PRs, out-of-band** (never via
+          repo automation, never announced in any brief or issue before the
+          verdicts land):
+
+          1. One carrying **only an ACPR-class flaw** (e.g. a gamed test:
+             tautological assert, testing the mock, threshold tuned to current
+             behavior) — it must go red on `acpr` alone.
+          2. One carrying **only a mechanical flaw** (e.g. an illegal dep
+             edge) — it must go red on `invariants` alone.
+
+          Blind discipline:
+          - DRAFT PRs (auto-merge cannot fire), ordinary titles and branch
+            names, no marker of any kind until closed.
+          - The ACPR brief is never told a canary window is open.
+          - Each gate's catch is proven independently — one flaw per PR, never
+            both in one.
+
+          Afterwards: close both unmerged and record the outcomes in
+          docs/seed.md. If either gate missed its flaw, fix the gate before
+          any further loop work merges.
+          EOF
+          gh api "repos/${REPO}/issues" \
+            -f title="Quarterly canary exercise" \
+            -F body=@"${RUNNER_TEMP}/body.md" \
+            -f "assignees[]=${OWNER}"

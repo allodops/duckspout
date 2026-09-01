@@ -1,0 +1,14 @@
+[package]
+name = "duckspout-lake-ducklake"
+description = "The first LakeCommitter backend: DuckLake over a Postgres catalog. The only crate that knows DuckLake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duckspout-types = { workspace = true }
+
+[lints]
+workspace = true

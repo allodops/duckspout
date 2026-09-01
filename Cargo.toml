@@ -1,0 +1,78 @@
+# DuckSpout virtual workspace root (SEED s§3.1).
+# No root package; every member lives under crates/, spike/ is quarantined.
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# A nested package that is neither member nor excluded breaks `cargo` invoked
+# inside it, so the exclude is mandatory, not optional (SEED D-11).
+exclude = ["spike"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/allodops/duckspout"
+
+# Single source of version truth (SEED s§3.1): members depend with
+# `workspace = true` only; a direct version string in a member manifest is an
+# invariants violation.
+[workspace.dependencies]
+# --- the dependency triangle (SEED s§3.2; compat-matrix.toml row 1; moves atomically) ---
+duckdb = { version = "1.10505", features = ["bundled"] }
+arrow = "58"
+arrow-flight = "58"
+parquet = "58"
+tonic = "0.14"
+prost = "0.14"
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic",
+    "trace",
+    "logs",
+    "metrics",
+] }
+# --- remaining stack picks (SEED s§3.3) ---
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+metrics = "0.24"
+object_store = "0.14"
+config = "0.15"
+thiserror = "2"
+anyhow = "1"
+proptest = "1"
+proptest-state-machine = "0.8"
+loom = "0.7"
+crc32fast = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+# --- internal crates (lockstep 0.0.1, SEED D-13) ---
+duckspout-types = { path = "crates/duckspout-types", version = "0.0.1" }
+duckspout-accept = { path = "crates/duckspout-accept", version = "0.0.1" }
+duckspout-staging = { path = "crates/duckspout-staging", version = "0.0.1", default-features = false }
+duckspout-replication = { path = "crates/duckspout-replication", version = "0.0.1" }
+duckspout-drain = { path = "crates/duckspout-drain", version = "0.0.1" }
+duckspout-watermark = { path = "crates/duckspout-watermark", version = "0.0.1" }
+duckspout-lake-contract = { path = "crates/duckspout-lake-contract", version = "0.0.1" }
+duckspout-lake-ducklake = { path = "crates/duckspout-lake-ducklake", version = "0.0.1" }
+duckspout-ctk = { path = "crates/duckspout-ctk", version = "0.0.1" }
+duckspout-daemon = { path = "crates/duckspout-daemon", version = "0.0.1" }
+duckspout-ctl = { path = "crates/duckspout-ctl", version = "0.0.1" }
+duckspout-fleet = { path = "crates/duckspout-fleet", version = "0.0.1" }
+duckspout-judge = { path = "crates/duckspout-judge", version = "0.0.1" }
+duckspout-loadgen = { path = "crates/duckspout-loadgen", version = "0.0.1" }
+
+[workspace.lints.rust]
+# FFI-adjacent modules may `allow` with a `# SAFETY:` justification; the
+# invariant engine flags undocumented allows (SEED s§3.1).
+unsafe_code = "deny"
+# Ratchet to deny later — arming-ledger row (SEED s§3.1).
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

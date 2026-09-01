@@ -1,0 +1,24 @@
+[package]
+name = "duckspout-staging"
+description = "DuckSpout staging engine: WAL = hot over embedded DuckDB, behind the storage port."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Default OFF at bootstrap: the bundled engine compiles DuckDB's vendored
+# C++ — sanctioned (ADR-0002) but >10 min of build for a crate whose engine
+# code lands at v0.1. Flipped into the default set when the engine lands
+# (the v0.1 staging work); until then CI's feature matrix (`cargo hack
+# --each-feature`, nightly) keeps the pin compiling.
+default = []
+duckdb = ["dep:duckdb"]
+
+[dependencies]
+duckdb = { workspace = true, optional = true }
+duckspout-types = { workspace = true }
+
+[lints]
+workspace = true

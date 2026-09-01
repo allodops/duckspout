@@ -1,0 +1,6 @@
+{
+  "name": "duckspout-scripts",
+  "private": true,
+  "description": "Bun scripts for the DuckSpout task frontend (SEED s§5); Bun built-ins only, no dependencies",
+  "devDependencies": {}
+}

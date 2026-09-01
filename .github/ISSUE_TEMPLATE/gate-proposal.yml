@@ -1,0 +1,46 @@
+# Gate-proposal form (SEED s§9.5): every change to docs/arming-ledger.toml —
+# arming, staging, re-scoping, or retiring a gate — starts here. The ledger
+# is protected-set data; the eventual PR is human-approved (D-9).
+name: Gate proposal
+description: Propose arming, staging, re-scoping, or retiring a gate (docs/arming-ledger.toml change).
+labels: []
+body:
+  - type: input
+    id: gate-id
+    attributes:
+      label: Ledger row id
+      description: The `id` of the gate row this proposal creates or changes.
+      placeholder: "tla-mc-core"
+    validations:
+      required: true
+  - type: dropdown
+    id: change
+    attributes:
+      label: Proposed change
+      options:
+        - Arm a staged gate
+        - Stage a new gate
+        - Re-scope an existing gate
+        - Retire a gate
+    validations:
+      required: true
+  - type: textarea
+    id: citations
+    attributes:
+      label: "§ citations"
+      description: >-
+        The DUCKSPOUT.md / docs/seed.md sections that define this gate and its
+        cadence.
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: >-
+        For arming: the job block, its ci-ok `needs:` entry (pr cadence), and
+        the ledger row flip. For staging: milestone + recipe + spec citation.
+        Any weakening of an existing gate must say so in exactly those words —
+        narrowing a check is the named offense (§11).
+    validations:
+      required: true

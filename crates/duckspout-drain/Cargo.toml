@@ -1,0 +1,16 @@
+[package]
+name = "duckspout-drain"
+description = "DuckSpout drain choreography: SealPart, PutPart, LakeCommit — over the LakeCommitter contract only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duckspout-lake-contract = { workspace = true }
+duckspout-types = { workspace = true }
+object_store = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+# §10.1 compatibility matrix. The invariant engine cross-checks each row
+# against the workspace manifest (SEED s§3.2, D-7).
+
+# Row 1 — the DuckDB pin set. These five dependencies MOVE ATOMICALLY: they
+# upgrade together in one PR or not at all (SEED s§3.2). `duckdb` wraps the
+# stable C API only (§10.2, ADR-0002) and embeds DuckDB 1.5.x; arrow 58 is
+# what duckdb 1.10505 pins; tonic/prost 0.14 is what arrow-flight 58 and
+# opentelemetry-proto 0.32 pin; opentelemetry-proto ships pre-generated OTLP
+# types (no proto vendoring, no build-time protoc).
+[[row]]
+id = 1
+duckdb = "1.10505"
+arrow = "58"
+arrow-flight = "58"
+parquet = "58"
+tonic = "0.14"
+prost = "0.14"
+opentelemetry-proto = "0.32"

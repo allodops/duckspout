@@ -1,0 +1,78 @@
+# Composite setup action — the AUTHORITATIVE copy of every CI tool pin
+# (SEED Appendix A). The invariant engine's `tool-pins` pairing rule diffs
+# every mirror against this file; edit pins here first, mirrors second.
+#
+# Staged-gate tools (cargo-llvm-cov, cargo-mutants, iai-callgrind-runner,
+# release-plz CLI) are NOT installed at bootstrap — their gates are staged
+# rows in docs/arming-ledger.toml; each arming PR adds its tool pin here
+# (SEED s§6.1/s§6.5). Installing them now would tax every armed job for
+# gates that cannot run yet.
+name: Setup
+description: >-
+  Bun + Rust toolchain(s) + cache + just/cargo tools + workflow linters.
+  One setup surface for every CI job (SEED s§6, Appendix A).
+
+inputs:
+  msrv-toolchain:
+    description: >-
+      Extra Rust toolchain to install alongside the rust-toolchain.toml pin
+      (the msrv job passes "1.96"; everyone else omits it).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Bun (pinned by .bun-version)
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      with:
+        bun-version-file: .bun-version
+
+    # MSRV toolchain first (when requested) so the rust-toolchain.toml pin
+    # below ends up as the default toolchain; `just msrv` invokes it
+    # explicitly as `cargo +1.96 …` (SEED Appendix A: MSRV mirrors are
+    # root Cargo.toml rust-version, clippy.toml, the msrv recipe).
+    - name: Install MSRV toolchain
+      if: inputs.msrv-toolchain != ''
+      uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      with:
+        toolchain: ${{ inputs.msrv-toolchain }}
+        cache: false # Swatinem/rust-cache below is the one cache (Appendix A)
+
+    - name: Install Rust toolchain (from rust-toolchain.toml)
+      uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      with:
+        cache: false # Swatinem/rust-cache below is the one cache (Appendix A)
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+    - name: Install just + cargo tools + zizmor (exact pins)
+      uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+      with:
+        tool: just@1.58.0,cargo-nextest@0.9.143,cargo-deny@0.20.2,cargo-machete@0.9.2,cargo-hack@0.6.45,zizmor@1.30.0
+
+    # actionlint is not in taiki-e/install-action's tool list, so it is a
+    # pinned download: exact version + SHA-256 verified before install. It
+    # lands in $CARGO_HOME/bin (already on PATH — same destination
+    # install-action uses) so no GITHUB_PATH write is needed.
+    - name: Install actionlint (pinned download, checksum-verified)
+      shell: bash
+      run: |
+        set -euo pipefail
+        version="1.7.12"
+        sha256="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        curl -fsSL -o "${RUNNER_TEMP}/actionlint.tar.gz" \
+          "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+        echo "${sha256}  ${RUNNER_TEMP}/actionlint.tar.gz" | sha256sum --check --strict
+        bindir="${CARGO_HOME:-$HOME/.cargo}/bin"
+        mkdir -p "$bindir"
+        tar -xzf "${RUNNER_TEMP}/actionlint.tar.gz" -C "$bindir" actionlint
+
+    # Temurin 21 is required by `just tla-install` (scripts/tla.mjs, SEED
+    # s§5.3); Appendix A homes the JDK pin here.
+    - name: Install Temurin JDK 21
+      uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+      with:
+        distribution: temurin
+        java-version: "21"

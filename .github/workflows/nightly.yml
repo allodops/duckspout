@@ -1,0 +1,28 @@
+# nightly.yml — armed nightly gates (SEED s§6.3).
+#
+# Armed at bootstrap: hack-features only (arming ledger, cadence = "nightly").
+# Staged nightly jobs are NOT present here — each is a staged ledger row in
+# docs/arming-ledger.toml and arms by protected-set PR at its milestone:
+#   tla-sim (v0.1) · mutation-floor (v0.1, ADR-0009: a red run auto-files a
+#   `blocked` issue) · ctk-distributed (v0.2) / ctk-release-gate (v0.3) ·
+#   bench-card (v0.4, docs/bench/methodology.md must exist first).
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hack-features:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: just hack-features

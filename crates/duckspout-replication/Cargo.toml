@@ -1,0 +1,18 @@
+[package]
+name = "duckspout-replication"
+description = "DuckSpout replication: HRW placement (implemented), ring protocol and fencing (v0.2 stubs)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+duckspout-types = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

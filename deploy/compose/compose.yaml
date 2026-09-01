@@ -1,0 +1,53 @@
+# Dev + conformance backends (docs/seed.md s§2, s§6.1): the real MinIO +
+# Postgres the trace-conformance gate runs against when it arms (ledger row
+# `conformance`, v0.1) — absent endpoint = red, never skip (§8.2).
+#
+# Image digests pinned (Appendix A); Dependabot does not manage these — bumps
+# are deliberate PRs updating tag AND digest together.
+#
+# Digest provenance (resolved live 2026-08-31 from registry-1.docker.io):
+#   minio/minio:RELEASE.2025-09-07T16-13-09Z — the latest published MinIO
+#   community release at pin time.
+#   postgres:18.6 — current stable of the 18 line.
+name: duckspout-backends
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: duckspout
+      # Dev/CI-only credential for a loopback-bound container; never a
+      # production value (secrets are file paths, §9.5).
+      MINIO_ROOT_PASSWORD: duckspout-dev
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  postgres:
+    image: postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    environment:
+      POSTGRES_USER: duckspout
+      # Dev/CI-only credential; see minio note above.
+      POSTGRES_PASSWORD: duckspout-dev
+      POSTGRES_DB: duckspout_catalog
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U duckspout -d duckspout_catalog"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  minio-data:
+  postgres-data:
