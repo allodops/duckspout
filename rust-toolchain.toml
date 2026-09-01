@@ -2,3 +2,4 @@
 # root Cargo.toml (`rust-version = "1.96"`); bump freely pre-1.0.
 [toolchain]
 channel = "1.98.0"
+components = ["rustfmt", "clippy"]
