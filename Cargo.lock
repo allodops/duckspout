@@ -639,6 +639,7 @@ dependencies = [
 name = "duckspout-accept"
 version = "0.0.1"
 dependencies = [
+ "duckspout-staging",
  "duckspout-types",
  "opentelemetry-proto",
  "tonic",

@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+duckspout-staging = { workspace = true }
 duckspout-types = { workspace = true }
 opentelemetry-proto = { workspace = true }
 tonic = { workspace = true }
