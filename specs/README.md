@@ -4,7 +4,7 @@
 > philosophy, module map, liveness/findings doctrine, broken variants and
 > witnesses, trace conformance — absorbed per docs/seed.md s§10. The **formal
 > content** (§3.2 state space, §3.3 action set, §3.4 invariants, and the
-> modules themselves) **stays in `DUCKSPOUT.md` until the `.tla` files land
+> modules themselves) **lives verbatim in [`formal-core.md`](formal-core.md) until the `.tla` files land
 > at v0.1/v0.2** per the arming ledger: every `.tla`/`.cfg` path here is
 > reserved-absent (Ⓜ), tracked by ledger rows `tla-mc-core` (v0.1) and
 > `tla-mc-replication` (v0.2). Section citations (`§n`) refer to
@@ -108,8 +108,9 @@ a model whose invariant restates its own guard checks nothing.
 ## The state space, actions, and invariants (§3.2–§3.4)
 
 Formal content — the `CONSTANTS`/`VARIABLES` declarations, the action
-definitions, and the invariant formulas — **remains in `DUCKSPOUT.md`
-§3.2–§3.4 until the modules land at v0.1** (ledger rows `tla-mc-core`,
+definitions, and the invariant formulas — **lives verbatim in
+[`specs/formal-core.md`](formal-core.md)
+until the modules land at v0.1** (ledger rows `tla-mc-core`,
 `tla-mc-replication`). Do not paraphrase it here; when the `.tla` files
 land, they become the authoritative formal statement and this README maps
 to them.
