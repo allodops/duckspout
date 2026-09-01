@@ -26,6 +26,9 @@
 //!   pin-attach <lake-dir> <sqlite|file>
 //!                         read-only attach + one observation; prints
 //!                         "rows=N watermark=W" or fails
+//!   union <dir> <rows>    drain half of a synthetic hot window, then run
+//!                         the §7.5 hot∪cold union with complete_through
+//!                         visible and print the tiling audit
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -52,12 +55,13 @@ fn main() -> ExitCode {
         ["drain", dir, rows] => drain(Path::new(dir), rows.parse().unwrap()),
         ["pin-commit", dir, window] => pin_commit(Path::new(dir), window.parse().unwrap()),
         ["pin-attach", dir, kind] => pin_attach(Path::new(dir), kind),
+        ["union", dir, rows] => union(Path::new(dir), rows.parse().unwrap()),
         _ => {
             eprintln!(
                 "usage: spike bench <db-dir> | count <db> <table> | serve <db> <addr> | \
                  flight <db> <addr> | otlp-bench <db-dir> <batches> <batch-rows> | \
                  drain <dir> <rows> | pin-commit <lake-dir> <window-id> | \
-                 pin-attach <lake-dir> <sqlite|file>"
+                 pin-attach <lake-dir> <sqlite|file> | union <dir> <rows>"
             );
             return ExitCode::from(2);
         }
@@ -272,5 +276,50 @@ fn drain(dir: &Path, rows: usize) -> anyhow::Result<()> {
         core.read_watermark(&req.partition, 0)?,
         core.registered_files()?
     );
+    Ok(())
+}
+
+/// The §12.1 finale, hand-runnable (issue #27): two hot windows, the older
+/// drained through the #25 path, then ONE pinned §7.5 union with
+/// `complete_through` visible; prints the tiling audit and latency.
+fn union(dir: &Path, rows: usize) -> anyhow::Result<()> {
+    use spike::union_query::{audit, pinned_union_sql, read_complete_through};
+
+    std::fs::create_dir_all(dir)?;
+    let hot = dir.join("hot.db");
+    let lake = dir.join("lake");
+    let _ = std::fs::remove_file(&hot);
+    let _ = std::fs::remove_dir_all(&lake);
+    let total = rows as i64;
+    let split = total / 2;
+    {
+        let mut core = IngestCore::open(&hot)?;
+        core.create_window("hot_w0")?;
+        core.create_window("hot_w1")?;
+        let w0: Vec<LogRow> = (0..split).map(LogRow::synthetic).collect();
+        let w1: Vec<LogRow> = (split..total).map(LogRow::synthetic).collect();
+        core.insert_batch("hot_w0", &w0)?;
+        core.insert_batch("hot_w1", &w1)?;
+    }
+    let core = spike::drain::DrainCore::open(&hot, &lake)?;
+    let part = lake.join("data").join("w0-part0.parquet");
+    std::fs::create_dir_all(part.parent().unwrap())?;
+    let seal = core.seal_part("hot_w0", &part)?;
+    core.lake_commit(&spike::drain::CommitRequest {
+        partition: "tenant-a/logs/p0".to_string(),
+        window_id: 0,
+        part,
+        complete_through_micros: LogRow::synthetic(split - 1).ts_micros,
+        rows: seal.rows,
+    })?;
+    let sql = pinned_union_sql("(SELECT * FROM hot_w0 UNION ALL SELECT * FROM hot_w1)");
+    let t0 = std::time::Instant::now();
+    let a = audit(core.conn(), &sql)?;
+    println!(
+        "union: ingested={total} complete_through_micros={:?} audit={a:?} in {:.1?}",
+        read_complete_through(core.conn())?,
+        t0.elapsed()
+    );
+    anyhow::ensure!(a.total == total && a.distinct_rows == total, "tiling broke");
     Ok(())
 }
