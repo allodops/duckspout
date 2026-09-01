@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use duckdb::{Connection, params};
 
 /// One synthetic log row, shaped like the §4.2.3 staging table: the two
@@ -110,6 +112,16 @@ impl IngestCore {
     /// One-value scalar query (spike convenience).
     pub fn conn_query_row<T: duckdb::types::FromSql>(&self, sql: &str) -> Result<T> {
         Ok(self.conn.query_row(sql, [], |r| r.get(0))?)
+    }
+
+    /// Run `sql` and return duckdb's native Arrow output — the result schema
+    /// plus the record batches exactly as the engine produced them. This is
+    /// the §7.4 serve seam: `spike::flight` feeds these to arrow-flight's
+    /// IPC encoder untouched (both sides pin arrow 58, compat-matrix row 1).
+    pub fn query_arrow(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        let mut stmt = self.conn.prepare(sql).context("prepare")?;
+        let batches: Vec<RecordBatch> = stmt.query_arrow([]).context("query_arrow")?.collect();
+        Ok((stmt.schema(), batches))
     }
 
     pub fn count(&self, table: &str) -> Result<i64> {

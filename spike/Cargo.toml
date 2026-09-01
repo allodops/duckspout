@@ -25,6 +25,12 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 serde_json = "1"
+# Flight serve leg (§7.4): arrow/arrow-flight 58 per compat-matrix.toml row 1
+# — arrow 58 is what duckdb 1.10505 pins, so the engine's Arrow output and
+# Flight's encoder share one type universe (the interop seam under test).
+arrow = "58"
+arrow-flight = "58"
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
