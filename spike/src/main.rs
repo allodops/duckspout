@@ -7,6 +7,7 @@
 //!
 //! Issue #24 adds the OTLP accept path (§4.1): a tonic gRPC LogsService
 //! writing through the ingest core, ack after commit.
+//! Issue #25 adds the drain leg (§6.2/§6.4): seal → atomic DuckLake commit.
 //!
 //! Subcommands:
 //!   bench <db-dir>        commit-latency distribution per batch size
@@ -14,6 +15,8 @@
 //!   serve <db> <addr>     OTLP/gRPC logs endpoint into the hot table
 //!   otlp-bench <db-dir> <batches> <batch-rows>
 //!                         in-process end-to-end throughput ballpark
+//!   drain <dir> <rows>    seal a synthetic hot window, commit it to a local
+//!                         DuckLake with the watermark riding the same txn
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -37,10 +40,12 @@ fn main() -> ExitCode {
             batches.parse().unwrap(),
             rows.parse().unwrap(),
         ),
+        ["drain", dir, rows] => drain(Path::new(dir), rows.parse().unwrap()),
         _ => {
             eprintln!(
                 "usage: spike bench <db-dir> | count <db> <table> | serve <db> <addr> | \
-                 flight <db> <addr> | otlp-bench <db-dir> <batches> <batch-rows>"
+                 flight <db> <addr> | otlp-bench <db-dir> <batches> <batch-rows> | \
+                 drain <dir> <rows>"
             );
             return ExitCode::from(2);
         }
@@ -187,4 +192,47 @@ fn otlp_bench(dir: &Path, batches: usize, batch_rows: usize) -> anyhow::Result<(
         anyhow::ensure!(committed == (total + 8) as i64, "count mismatch");
         Ok(())
     })
+}
+
+/// Drain-leg latency ballpark (issue #25): synthetic hot window of `rows`,
+/// one sorted seal COPY, one atomic {add files + watermark} DuckLake commit.
+fn drain(dir: &Path, rows: usize) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let hot = dir.join("hot.db");
+    let lake = dir.join("lake");
+    let _ = std::fs::remove_file(&hot);
+    let _ = std::fs::remove_dir_all(&lake);
+    {
+        let mut core = IngestCore::open(&hot)?;
+        core.create_window(TABLE)?;
+        let batch: Vec<LogRow> = (0..rows as i64).map(LogRow::synthetic).collect();
+        core.insert_batch(TABLE, &batch)?;
+    } // close hot before the drain opens it
+    let core = spike::drain::DrainCore::open(&hot, &lake)?;
+    let part = lake.join("data").join("w0-part0.parquet");
+    std::fs::create_dir_all(part.parent().unwrap())?;
+    let seal = core.seal_part(TABLE, &part)?;
+    let req = spike::drain::CommitRequest {
+        partition: "tenant-a/logs/p0".to_string(),
+        window_id: 0,
+        part: part.clone(),
+        complete_through_micros: 1_756_600_000_000_000 + rows as i64,
+        rows: rows as i64,
+    };
+    let commit = core.lake_commit(&req)?;
+    println!(
+        "drain: rows={} seal_copy={:.1?} part={}B commit_writes={:.1?} commit_txn={:.1?}",
+        seal.rows,
+        seal.copy,
+        std::fs::metadata(&part)?.len(),
+        commit.writes,
+        commit.commit
+    );
+    println!(
+        "lake rows={} watermark={:?} files={:?}",
+        core.lake_row_count()?,
+        core.read_watermark(&req.partition, 0)?,
+        core.registered_files()?
+    );
+    Ok(())
 }
