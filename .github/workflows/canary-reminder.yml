@@ -32,7 +32,8 @@ jobs:
           cat > "${RUNNER_TEMP}/body.md" <<'EOF'
           Time for the quarterly canary exercise (SEED s§9.3, docs/seed.md).
 
-          Author **blind canary DRAFT PRs, out-of-band** (never via repo
+          Author **canary DRAFT PRs** (agent-authored is fine — the mechanical
+          gates are deterministic; owner ruling 2026-09-01) (never via repo
           automation, never announced anywhere before the verdicts land), one
           mechanical-gate flaw per PR — e.g. an illegal dep edge that must go
           red on `invariants` alone, a banned API that must go red on the
