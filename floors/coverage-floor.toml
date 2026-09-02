@@ -1,0 +1,22 @@
+# Coverage floor (§8.6, ledger row `coverage-floor`, armed by issue #45).
+# Recomputed by CI on every PR (`just coverage` → scripts/floors.mjs
+# coverage) via `cargo-llvm-cov nextest --workspace`; a PR's own coverage
+# claim is never the input to this gate (§8.6's CI-recomputes-never-trusts
+# posture). Raising `floor` is an ordinary commit; lowering it needs a
+# reviewed, named decision in the commit message — never "adjusted
+# threshold" (§8.6, §11's anti-gaming stance).
+#
+# `metric` names the key of cargo-llvm-cov's `--json` totals object to read
+# (`lines`, `regions`, `functions`, or `branches`); `lines` is this repo's
+# choice — the standard, most widely understood coverage denominator, and
+# the one operators reading a coverage number expect by default.
+
+metric = "lines"
+
+# Measured 89.65% workspace-wide line coverage (cargo-llvm-cov 0.8.7,
+# `cargo llvm-cov nextest --workspace --json --summary-only`, 182 tests) on
+# 2026-09-02 against commit fb5fd6e. floor = measured minus a ~2.5pp margin
+# — enough to absorb ordinary test-count/line-count churn between PRs
+# without the gate flapping on noise, not so much that it stops ratcheting
+# real regressions.
+floor = 87.0

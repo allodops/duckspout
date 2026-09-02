@@ -3,11 +3,12 @@
 # Every job body after setup is `just <recipe>`: the chain is
 # GHA → just → scripts (SEED s§5). No `paths:` filters, ever (ADR-0006).
 #
-# Staged gates (conformance, coverage-floor, instr-gate, smoke) are
-# deliberately NOT jobs here — a permanently-red or skipped-green job would
-# poison the loop. Each lives as a staged row in docs/arming-ledger.toml with
-# a milestone and tracking issue; arming one = add its job block + its ci-ok
-# `needs:` entry + flip its ledger row, in one protected-set PR (SEED s§6.1).
+# Staged gates (instr-gate, smoke) are deliberately NOT jobs here — a
+# permanently-red or skipped-green job would poison the loop. Each lives as
+# a staged row in docs/arming-ledger.toml with a milestone and tracking
+# issue; arming one = add its job block + its ci-ok `needs:` entry + flip
+# its ledger row, in one protected-set PR (SEED s§6.1). conformance was
+# armed by the #44 arming PR; coverage-floor by the #45 arming PR.
 name: CI
 
 on:
@@ -219,12 +220,44 @@ jobs:
           DUCKSPOUT_CONFORMANCE_POSTGRES_DSN: "postgres:dbname=duckspout_catalog host=127.0.0.1 port=5432 user=duckspout password=duckspout-dev"
         run: just conformance
 
+  # §8.6's coverage floor (ledger row `coverage-floor`, armed by issue #45):
+  # `cargo-llvm-cov` recomputes line coverage over the whole workspace and
+  # `just coverage` (scripts/floors.mjs) compares it against the checked-in
+  # floor in floors/coverage-floor.toml — never a cached or PR-claimed
+  # number (§8.6's CI-recomputes-never-trusts posture).
+  coverage-floor:
+    runs-on: ubuntu-latest
+    # A cold coverage-instrumented full-workspace build compiles under
+    # different rustc flags than the `test` job's own cache entry, so it
+    # cannot ride that cache; budgeted like tla-mc's own heaviest-gate
+    # allowance rather than the other jobs' 45 minutes.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: just coverage
+
   # Fan-in: the single required mechanical check (SEED s§6.1). `if: always()`
   # so it runs even when a need fails; the step then fails unless every need
   # succeeded — a cancelled or skipped need is a failure, never a pass.
   ci-ok:
     needs:
-      [fmt, clippy, test, deny, docs, invariants, msrv, workflows, pr-title, tla-mc, conformance]
+      [
+        fmt,
+        clippy,
+        test,
+        deny,
+        docs,
+        invariants,
+        msrv,
+        workflows,
+        pr-title,
+        tla-mc,
+        conformance,
+        coverage-floor,
+      ]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

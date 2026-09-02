@@ -2,11 +2,12 @@
 # (SEED Appendix A). The invariant engine's `tool-pins` pairing rule diffs
 # every mirror against this file; edit pins here first, mirrors second.
 #
-# Staged-gate tools (cargo-llvm-cov, cargo-mutants, iai-callgrind-runner,
-# release-plz CLI) are NOT installed at bootstrap — their gates are staged
-# rows in docs/arming-ledger.toml; each arming PR adds its tool pin here
-# (SEED s§6.1/s§6.5). Installing them now would tax every armed job for
-# gates that cannot run yet.
+# Staged-gate tools (cargo-mutants, iai-callgrind-runner, release-plz CLI)
+# are NOT installed at bootstrap — their gates are staged rows in
+# docs/arming-ledger.toml; each arming PR adds its tool pin here (SEED
+# s§6.1/s§6.5). Installing them now would tax every armed job for gates
+# that cannot run yet. cargo-llvm-cov was armed by the #45 arming PR
+# (ledger row `coverage-floor`).
 name: Setup
 description: >-
   Bun + Rust toolchain(s) + cache + just/cargo tools + workflow linters.
@@ -50,7 +51,7 @@ runs:
     - name: Install just + cargo tools + zizmor (exact pins)
       uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
       with:
-        tool: just@1.58.0,cargo-nextest@0.9.143,cargo-deny@0.20.2,cargo-machete@0.9.2,cargo-hack@0.6.45,zizmor@1.26.1
+        tool: just@1.58.0,cargo-nextest@0.9.143,cargo-deny@0.20.2,cargo-machete@0.9.2,cargo-hack@0.6.45,zizmor@1.26.1,cargo-llvm-cov@0.8.7
 
     # actionlint is not in taiki-e/install-action's tool list, so it is a
     # pinned download: exact version + SHA-256 verified before install. It

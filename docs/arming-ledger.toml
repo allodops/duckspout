@@ -121,6 +121,19 @@ milestone = ""
 issue = 0
 spec = "§8.2"
 
+# Armed by the #45 arming PR (v0.1): cargo-llvm-cov recomputes workspace
+# line coverage on every PR and scripts/floors.mjs compares it against the
+# checked-in floor in floors/coverage-floor.toml (§8.6).
+[[gate]]
+id = "coverage-floor"
+status = "armed"
+cadence = "pr"
+recipe = "coverage"
+workflow_job = "ci.yml:coverage-floor"
+milestone = ""
+issue = 0
+spec = "§8"
+
 # --- armed, cadence = "nightly" (nightly.yml only, never `just ci`) ---
 
 [[gate]]
@@ -159,16 +172,6 @@ workflow_job = ""
 milestone = "v0.2"
 issue = 57
 spec = "§8.1"
-
-[[gate]]
-id = "coverage-floor"
-status = "staged"
-cadence = "pr"
-recipe = "coverage"
-workflow_job = ""
-milestone = "v0.1"
-issue = 45
-spec = "§8"
 
 [[gate]]
 id = "instr-gate"
