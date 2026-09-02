@@ -66,8 +66,9 @@ duckspout-ctk = { workspace = true }
 opentelemetry-proto = { workspace = true }
 tempfile = { workspace = true }
 # The full-daemon smoke test (`tests/e2e_boot.rs`) reads the drained lake
-# back with its own raw connection (Flight serving, issue #39/PR #151, is
-# not yet merged — this is the honest substitute query surface until then).
+# back with its own raw connection — the ground-truth proof that data
+# survived past drain (Flight, wired in `wiring.rs`, only ever sees the hot
+# tier; `tests/e2e_boot.rs`'s module docs).
 duckdb = { workspace = true, features = ["appender-arrow"] }
 
 [lints]

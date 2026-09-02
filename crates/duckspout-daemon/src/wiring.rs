@@ -17,6 +17,14 @@
 //!   `DuckLakeCommitter`.
 //! - The [`crate::status`] endpoint: `NodeId`, the overload rung, watermark
 //!   per partition, `drain_stalled` (§9.3, R-9).
+//! - **Arrow Flight serving** over the hot store (issue #39, PR #151,
+//!   wired here as the #151→#154 follow-up): [`crate::serving::HotFlightService`]
+//!   built over the same `StagingEngine` the stager writes through, guarded
+//!   per §7.8 with [`crate::serving::ServingConfig`] read from `query.*`
+//!   (`hot.max_bytes` supplies the fill-scale denominator already computed
+//!   for the stager). Bound on `node.flight_listen`, served alongside the
+//!   OTLP and status listeners, and folded into the same SIGTERM
+//!   choreography below.
 //! - SIGTERM: readiness flips false, in-flight gRPC work finishes
 //!   (`tonic`'s own graceful shutdown), the drain loop finishes its current
 //!   tick, then the process exits (§9.1.2's shallow drain — v0.1 has no
@@ -25,11 +33,6 @@
 //!
 //! # What is explicitly deferred, and why
 //!
-//! - **Arrow Flight serving** (issue #39, PR #151): still an open,
-//!   unmerged PR as of this branch — there is no `FlightService` type on
-//!   `main` to wire. `node.flight_listen` is read from config (the setting
-//!   exists, §9.6.1) but nothing binds it yet; wiring the listener is a
-//!   follow-up once #151 lands, not invented here.
 //! - **The CTK trace sink** (issue #42, PR #152 — merged after this branch
 //!   was cut, then rebased in): every trace-capable port
 //!   (`OtlpLogsService`, `EngineStager`, `DrainCoordinator`) now carries an
@@ -58,6 +61,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use arrow_flight::flight_service_server::FlightServiceServer;
 use duckspout_accept::OtlpLogsService;
 use duckspout_accept::otlp::OTLP_LOGS_DATASET;
 use duckspout_accept::server::AdmissionConfig as OtlpAdmissionConfig;
@@ -73,8 +77,9 @@ use duckspout_types::{
 use duckspout_watermark::{SharedLedger, WatermarkLedger};
 use tokio::net::TcpListener;
 
-use crate::config::DaemonConfig;
+use crate::config::{self, DaemonConfig};
 use crate::constants::DRAIN_TICK_INTERVAL_MS;
+use crate::serving::{HotFlightService, ServingConfig};
 use crate::status::{self, StatusSnapshot};
 use crate::system::{self, FsStorage, SystemClock};
 
@@ -94,7 +99,8 @@ pub enum BootError {
     /// prepared.
     #[error("preparing node storage: {0}")]
     Storage(#[from] std::io::Error),
-    /// The staging engine failed to open (§4.2).
+    /// The staging engine failed to open (§4.2), or the Flight service's
+    /// pre-created read-connection pool (§7.4, #114) failed to clone.
     #[error("opening the staging engine: {0}")]
     Staging(#[from] duckspout_staging::StagingError),
     /// The lake committer failed to open or bootstrap (§6.4).
@@ -106,7 +112,7 @@ pub enum BootError {
     /// A §9.6.1 duration setting did not parse.
     #[error("configuration: {0}")]
     Config(#[from] system::DurationParseError),
-    /// The OTLP or observation listener could not bind.
+    /// The OTLP, observation, or Flight listener could not bind.
     #[error("binding {what} listener on {addr}: {source}")]
     Bind {
         /// Which listener failed to bind.
@@ -298,14 +304,17 @@ pub struct Daemon {
     otlp_addr: SocketAddr,
     status_listener: TcpListener,
     status_addr: SocketAddr,
+    flight_listener: TcpListener,
+    flight_addr: SocketAddr,
+    flight_service: FlightServiceServer<HotFlightService<FsStorage>>,
     admission: OtlpAdmissionConfig,
 }
 
 impl Daemon {
-    /// Composes every port from `config` (§9.6) and binds the OTLP and
-    /// observation listeners. Blocking work (opening the staging engine and
-    /// the lake committer) runs on the calling task — call this during
-    /// startup, off any request path.
+    /// Composes every port from `config` (§9.6) and binds the OTLP,
+    /// observation, and Flight listeners. Blocking work (opening the
+    /// staging engine and the lake committer) runs on the calling task —
+    /// call this during startup, off any request path.
     ///
     /// `status_port` is not a §9.6.1 setting (module docs of
     /// [`crate::constants::OBSERVATION_LISTEN_PORT_DEFAULT`]); pass `0` to
@@ -366,6 +375,26 @@ impl Daemon {
             },
         );
 
+        // --- Flight serving over the hot store (§7.4, §7.8) ---
+        let serving_config = ServingConfig {
+            max_hot_bytes_per_query: config
+                .query
+                .max_hot_bytes_per_query
+                .unwrap_or_else(config::defaults::max_hot_bytes_per_query),
+            hot_scan_deadline_ms: system::duration_nanos_saturating(system::parse_duration(
+                &config.query.hot_scan_deadline,
+            )?) / 1_000_000,
+            max_concurrent_hot_scans: usize::try_from(config.query.max_concurrent_hot_scans)
+                .unwrap_or(usize::MAX),
+            hot_max_bytes,
+        };
+        let flight_service = HotFlightService::new(
+            Arc::clone(&engine),
+            Arc::new(clock) as Arc<dyn Clock>,
+            serving_config,
+        )?
+        .into_server();
+
         let core = Arc::new(DaemonCore {
             node_id,
             stager: Arc::clone(&stager),
@@ -380,6 +409,8 @@ impl Daemon {
         // --- Listeners ---
         let (otlp_listener, otlp_addr) = bind_listener("otlp", config.node.otlp_listen).await?;
         let (status_listener, status_addr) = bind_listener("status", status_port).await?;
+        let (flight_listener, flight_addr) =
+            bind_listener("flight", config.node.flight_listen).await?;
 
         let admission = OtlpAdmissionConfig {
             max_payload_bytes: usize::try_from(config.max_payload_bytes).unwrap_or(usize::MAX),
@@ -395,6 +426,9 @@ impl Daemon {
             otlp_addr,
             status_listener,
             status_addr,
+            flight_listener,
+            flight_addr,
+            flight_service,
             admission,
         })
     }
@@ -412,6 +446,13 @@ impl Daemon {
         self.status_addr
     }
 
+    /// The bound Arrow Flight listener's address (§7.4) — its port, when
+    /// `node.flight_listen = 0`, is only known after [`Daemon::boot`].
+    #[must_use]
+    pub fn flight_addr(&self) -> SocketAddr {
+        self.flight_addr
+    }
+
     /// A cheap handle onto the running daemon's state, independent of the
     /// listener sockets — the test seam (module docs).
     #[must_use]
@@ -419,11 +460,11 @@ impl Daemon {
         DaemonHandle(Arc::clone(&self.core))
     }
 
-    /// Runs the daemon: the OTLP listener, the observation listener, and
-    /// the background drain loop, all until `shutdown` resolves — then
-    /// readiness flips false, in-flight gRPC work finishes, the drain loop
-    /// finishes its current tick, and this returns (§9.1.2's SIGTERM
-    /// choreography, shallow — module docs).
+    /// Runs the daemon: the OTLP listener, the observation listener, the
+    /// Flight listener, and the background drain loop, all until `shutdown`
+    /// resolves — then readiness flips false, in-flight gRPC work finishes,
+    /// the drain loop finishes its current tick, and this returns (§9.1.2's
+    /// SIGTERM choreography, shallow — module docs).
     pub async fn serve(self, shutdown: impl Future<Output = ()> + Send + 'static) {
         self.core.ready.store(true, Ordering::Relaxed);
 
@@ -432,6 +473,7 @@ impl Daemon {
 
         let (otlp_shutdown_tx, otlp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (status_shutdown_tx, status_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (flight_shutdown_tx, flight_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (drain_shutdown_tx, mut drain_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let otlp_task = tokio::spawn(
@@ -441,6 +483,17 @@ impl Daemon {
                     tokio_stream::wrappers::TcpListenerStream::new(self.otlp_listener),
                     async {
                         let _ = otlp_shutdown_rx.await;
+                    },
+                ),
+        );
+
+        let flight_task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(self.flight_service)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(self.flight_listener),
+                    async {
+                        let _ = flight_shutdown_rx.await;
                     },
                 ),
         );
@@ -480,9 +533,11 @@ impl Daemon {
 
         let _ = otlp_shutdown_tx.send(());
         let _ = status_shutdown_tx.send(());
+        let _ = flight_shutdown_tx.send(());
         let _ = drain_shutdown_tx.send(());
         let _ = otlp_task.await;
         let _ = status_task.await;
+        let _ = flight_task.await;
         let _ = drain_task.await;
         tracing::info!("shutdown complete");
     }
