@@ -49,8 +49,8 @@ use std::sync::{Arc, Mutex};
 use arrow::ipc::reader::StreamReader;
 use duckspout_types::{
     BoxFuture, Clock, DatasetId, DecodedBatch, NodeStatus, OverloadStatus, PartitionId,
-    StageCommitter, StageError, StageOutcome, StagedCoverage, Storage, TenantId, WindowId,
-    throttle_retry_delay_ms,
+    StageCommitter, StageError, StageOutcome, StagedCoverage, Storage, TenantId, TraceEvent,
+    TraceSink, WindowId, throttle_retry_delay_ms,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -98,6 +98,11 @@ pub struct EngineStager<S: Storage, C: Clock> {
     /// window below the documented retry horizon. The operator surface
     /// (daemon) reads and warns on this; the ladder never does.
     dedup_cap_evictions: AtomicU64,
+    /// The §3.7 capture seam: `Accept`, `StageCommit`, and `DedupCheck`
+    /// journal here (docs/trace-mapping.md's attributions). `None` — the
+    /// production default until the `conformance` row arms — journals
+    /// nothing.
+    trace: Option<Arc<dyn TraceSink>>,
 }
 
 impl<S: Storage, C: Clock> EngineStager<S, C> {
@@ -112,7 +117,17 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
             config,
             open_windows: Mutex::new(HashMap::new()),
             dedup_cap_evictions: AtomicU64::new(0),
+            trace: None,
         }
+    }
+
+    /// Journals this stager's §3.3 events (`Accept`, `StageCommit`,
+    /// `DedupCheck`) through `sink` (§3.7; the trace-conformance harness's
+    /// capture side).
+    #[must_use]
+    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
+        self.trace = Some(sink);
+        self
     }
 
     /// The wrapped engine (the daemon reaches readers and the drain seam
@@ -182,6 +197,18 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
             return Ok(StageOutcome::Committed(Vec::new()));
         }
 
+        // §3.3 Accept: decoded and ADMITTED into volatile memory — the
+        // admission gate (`admit`, §4.5's rung check) passed and the batch
+        // is nonempty. Journaled here rather than in `duckspout-accept`
+        // because the model's Accept bundles the rung guard, which #146
+        // placed on this side of the port (docs/trace-mapping.md carries
+        // the same attribution); a throttled or refused request journals
+        // Throttle/Refuse INSTEAD of Accept, exactly as §3.3's ladder
+        // actions resolve an unsent request.
+        if let Some(trace) = &self.trace {
+            trace.record(TraceEvent::Accept);
+        }
+
         let dedup_key = dedup_key(batch);
         let window = self
             .current_window(&batch.dataset, &partition)
@@ -203,6 +230,12 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
             // did; commit releases it. Nothing was appended (R-2: never
             // replay blindly, never re-stage).
             txn.commit().map_err(|e| backend(&e))?;
+            // §3.7: the duplicate's resolution IS DedupCheck — both model
+            // branches (replay / in-flight) journal the same name, and no
+            // StageCommit or second ClientAck may follow it.
+            if let Some(trace) = &self.trace {
+                trace.record(TraceEvent::DedupCheck);
+            }
             return Ok(outcome);
         }
 
@@ -231,6 +264,12 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
             )
             .map_err(|e| backend(&e))?;
         let coverage = txn.commit().map_err(|e| backend(&e))?;
+        // §3.7: journal only on a SUCCESSFUL fsynced commit — a failed
+        // transaction staged nothing and journals nothing (the model has
+        // no failed-StageCommit action).
+        if let Some(trace) = &self.trace {
+            trace.record(TraceEvent::StageCommit);
+        }
         if cap_evicted > 0 {
             self.dedup_cap_evictions
                 .fetch_add(cap_evicted, Ordering::Relaxed);

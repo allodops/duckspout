@@ -29,6 +29,12 @@ tracing-subscriber = { workspace = true }
 # (§10.1), so the accept→port→engine end-to-end test lives here: a real
 # gRPC client against the real WAL=hot engine.
 bytes = { workspace = true }
+# The trace-capture harness (§8.2, issue #42) journals through the CTK's
+# NdjsonTraceWriter — the daemon is composition, so the edge is legal.
+duckspout-ctk = { workspace = true }
+# The drain coordinator PUTs sealed parts through an object_store; the
+# capture test roots a LocalFileSystem at the test lake's data path.
+object_store = { workspace = true }
 opentelemetry-proto = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net"] }

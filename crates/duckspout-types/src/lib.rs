@@ -48,5 +48,5 @@ pub use ports::{
     TransportError, WatermarkBookkeeping, WireError, WireRequest,
 };
 pub use status::{NodeStatus, OverloadStatus, throttle_retry_delay_ms};
-pub use trace::{EnvironmentEvent, TraceEvent, TraceRecord};
+pub use trace::{EnvironmentEvent, TraceEvent, TraceRecord, TraceSink};
 pub use watermark::{AppliedWatermarkRow, DimensionWatermarkRow, WatermarkRow};

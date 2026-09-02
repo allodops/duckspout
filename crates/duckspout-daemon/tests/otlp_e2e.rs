@@ -7,100 +7,22 @@
 //! see each other (§10.1, dev-deps included), and the daemon is the one
 //! crate whose job is exactly this composition.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
 
-use bytes::Bytes;
+use std::sync::Arc;
+
+use common::{FsStorage, SettableClock};
 use duckspout_accept::OtlpLogsService;
 use duckspout_accept::server::AdmissionConfig;
 use duckspout_staging::arrow::array::AsArray as _;
 use duckspout_staging::{EngineStager, StagerConfig, StagingConfig, StagingEngine};
-use duckspout_types::{
-    BoxFuture, Clock, DatasetId, NodeId, PartitionId, Storage, StorageError, StoragePath, TenantId,
-    WindowId,
-};
+use duckspout_types::{DatasetId, NodeId, PartitionId, TenantId, WindowId};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
 };
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as PbValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
-
-/// A real-filesystem Storage rooted at the hot dir — the engine's one port
-/// duty here (directory fsync) really happens.
-struct FsStorage {
-    root: PathBuf,
-}
-
-impl FsStorage {
-    fn resolve(&self, path: &StoragePath) -> PathBuf {
-        if path.as_str().is_empty() {
-            self.root.clone()
-        } else {
-            self.root.join(path.as_str())
-        }
-    }
-
-    fn ready<T: Send + 'static>(
-        result: Result<T, StorageError>,
-    ) -> BoxFuture<'static, Result<T, StorageError>> {
-        Box::pin(async move { result })
-    }
-}
-
-impl Storage for FsStorage {
-    fn put(&self, path: StoragePath, data: Bytes) -> BoxFuture<'_, Result<(), StorageError>> {
-        Self::ready(
-            std::fs::write(self.resolve(&path), &data)
-                .map_err(|e| StorageError::Backend(e.to_string())),
-        )
-    }
-
-    fn get(&self, path: StoragePath) -> BoxFuture<'_, Result<Bytes, StorageError>> {
-        Self::ready(
-            std::fs::read(self.resolve(&path))
-                .map(Bytes::from)
-                .map_err(|e| StorageError::Backend(e.to_string())),
-        )
-    }
-
-    fn delete(&self, path: StoragePath) -> BoxFuture<'_, Result<(), StorageError>> {
-        Self::ready(
-            std::fs::remove_file(self.resolve(&path))
-                .map_err(|e| StorageError::Backend(e.to_string())),
-        )
-    }
-
-    fn fsync_file(&self, path: StoragePath) -> BoxFuture<'_, Result<(), StorageError>> {
-        Self::ready(
-            std::fs::File::open(self.resolve(&path))
-                .and_then(|f| f.sync_all())
-                .map_err(|_| StorageError::FsyncFailed(path.clone())),
-        )
-    }
-
-    fn fsync_dir(&self, dir: StoragePath) -> BoxFuture<'_, Result<(), StorageError>> {
-        Self::ready(
-            std::fs::File::open(self.resolve(&dir))
-                .and_then(|f| f.sync_all())
-                .map_err(|_| StorageError::FsyncFailed(dir.clone())),
-        )
-    }
-}
-
-/// A fixed test clock (the window never rolls inside one test run).
-struct FixedClock(AtomicU64);
-
-impl Clock for FixedClock {
-    fn monotonic_nanos(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
-    }
-
-    fn wall_unix_ms(&self) -> i64 {
-        0
-    }
-}
 
 fn synthetic_request(n: u64) -> ExportLogsServiceRequest {
     let str_attr = |k: &str, v: &str| KeyValue {
@@ -162,7 +84,7 @@ async fn otlp_export_acked_then_rows_durably_present() {
     );
     let stager = Arc::new(EngineStager::new(
         Arc::clone(&engine),
-        FixedClock(AtomicU64::new(0)),
+        SettableClock::new(),
         StagerConfig {
             window_nanos: 60_000_000_000,
             dedup_ttl_ms: 24 * 60 * 60 * 1000,

@@ -153,6 +153,24 @@ impl TraceRecord {
     }
 }
 
+/// The §3.7 capture seam: a tracepoint hands each journaled event to a
+/// sink; the sink owns node identity, the dense per-node sequence, and the
+/// one-flushed-NDJSON-line-per-event discipline (D-6).
+///
+/// The trait lives HERE because the emitters are protocol crates, which
+/// depend on `duckspout-types` only (ADR-0008); the concrete NDJSON writer
+/// is I/O and lives with the harness (`duckspout-ctk`), keeping this crate
+/// I/O-free by charter. Tracepoints hold `Option<Arc<dyn TraceSink>>` —
+/// `None` journals nothing, which is the production default until the
+/// `conformance` ledger row arms (issue #44).
+pub trait TraceSink: Send + Sync {
+    /// Journals one event. Implementations must write and flush one NDJSON
+    /// line before returning (§3.7) — or fail loud: a tracepoint that
+    /// silently drops events certifies runs that never happened as
+    /// recorded (R-3).
+    fn record(&self, event: TraceEvent);
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
