@@ -60,13 +60,19 @@ Consequences accepted with it:
   `AT (VERSION => v)`), not by writing DuckLake's internal catalog schema
   directly — R-third-party-first applied to the interface; the internal
   schema stays free to move under DuckLake releases.
-- The **SingleDrainCommit fence moves above the port**: the candidate
-  mechanism is DuckLake's own snapshot-commit conflict (two racing drains
-  writing the same watermark row cannot both commit); #36 must implement
-  and *prove* the fence with a racing-drains test before v0.1's
-  `conformance` gate arms. If snapshot conflict proves insufficient, the
-  fallback is a catalog-DB advisory mechanism — a fence MUST exist and
-  MUST be tested; its absence is a NoAckedLoss-adjacent hazard.
+- The **SingleDrainCommit fence moves above the port** — implemented and
+  proven (PR #147, `tests/racing.rs` + the contract suite's
+  `racing_drains`): DuckLake's snapshot-commit conflict on the fence row
+  delivers exactly-one-winner, **but only together with
+  `ducklake_max_retry_count = 0`** — DuckLake's default conflict retry
+  silently rebases and replays the losing transaction after the winner,
+  which is precisely the blind retry §6.5 forbids. The pin is set at
+  connection open and is load-bearing; a DuckLake release changing that
+  setting's name or semantics breaks the fence and must be caught at
+  version certification. The loser classifies `Aborted` on local
+  catalogs (in-process executor — no lost-response channel) and resolves
+  via read-back; only a Postgres catalog can yield genuine
+  `Indeterminate`.
 - Readers must **never** consult the raw `__ducklake_metadata_*`
   passthrough for coverage — it is not snapshot-pinned (#28). The
   extension obligations are tracked in #118.
