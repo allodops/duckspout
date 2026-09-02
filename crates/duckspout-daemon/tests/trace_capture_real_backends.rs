@@ -19,8 +19,8 @@
 //! `DUCKSPOUT_CONFORMANCE_*` env vars naming the backends are unset, this
 //! test prints why and returns — a contributor's plain `cargo test` never
 //! needs `MinIO`/Postgres running. The CI gate does **not** inherit that
-//! skip: `scripts/trace-conformance.mjs`'s real-backend tier checks `CI`
-//! and fails closed if the vars are absent there, per §8.2.
+//! skip: `scripts/trace-conformance.mjs`'s real-backend tier checks
+//! `GITHUB_ACTIONS` and fails closed if the vars are absent there, per §8.2.
 
 mod common;
 
@@ -57,7 +57,7 @@ async fn captured_trace_against_real_minio_and_postgres() {
         eprintln!(
             "trace_capture_real_backends: DUCKSPOUT_CONFORMANCE_* env vars absent — skipping \
              (Docker-optional dev convenience, §8.2; the CI gate does not inherit this skip: \
-             scripts/trace-conformance.mjs's real-backend tier fails closed instead when CI=true)"
+             scripts/trace-conformance.mjs's real-backend tier fails closed instead in GitHub Actions)"
         );
         return;
     };

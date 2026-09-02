@@ -25,7 +25,7 @@
 //      than comparing it to a committed fixture) — each doctored variant
 //      must fail through exactly its named mechanism, same one-tooth
 //      discipline as tier 1. Endpoint env vars absent: fails in CI
-//      (`CI=true`, fail-closed per §8.2 — a gate that cannot run fails, it
+//      (`GITHUB_ACTIONS` set, fail-closed per §8.2 — a gate that cannot run fails, it
 //      does not shrug), skips with a notice for a contributor without
 //      Docker running this outside CI.
 //
@@ -110,6 +110,15 @@ const haltCursor = (out) => {
   return m ? Number(m[1]) : null;
 };
 
+/** The last N lines of a captured process's combined stdout+stderr, for
+ * failure messages — a bare exit code (e.g. from `tla2tools.jar missing —
+ * run 'just tla-install' first` exiting in milliseconds, nowhere near
+ * TLC's real runtime) is otherwise indistinguishable from an actual
+ * refinement counterexample, and both currently render as "failed
+ * refinement" (incident: PR #161's conformance job, root-caused to the
+ * `conformance` CI job missing the tla-mc job's jar-install step). */
+const outTail = (out, n = 15) => out.trim().split("\n").slice(-n).join("\n");
+
 function assertExpectation(name, expectation, decodeError, tlc) {
   const expect = expectation.expect;
   if (expect === "decoder") {
@@ -122,7 +131,9 @@ function assertExpectation(name, expectation, decodeError, tlc) {
     fail(`trace-conformance: ${name}: decoder rejected (${decodeError}) but the expected mechanism is '${expect}' — a tooth is hiding behind another`);
   if (expect === "conforms") {
     if (tlc.code !== 0)
-      fail(`trace-conformance: ${name}: a conforming trace failed refinement (exit ${tlc.code})`);
+      fail(
+        `trace-conformance: ${name}: a conforming trace failed refinement (exit ${tlc.code}):\n${outTail(tlc.out)}`,
+      );
     info(`  ${name}: conforms`);
     return;
   }
@@ -184,7 +195,10 @@ async function liveTier(vocabulary) {
   const decodeError = decode(await Bun.file(fresh).text(), vocabulary);
   if (decodeError !== null) fail(`trace-conformance: fresh capture failed decoding: ${decodeError}`);
   const tlc = await refine(fresh);
-  if (tlc.code !== 0) fail(`trace-conformance: the FRESH capture failed refinement (exit ${tlc.code}) — the implementation drifted from the model`);
+  if (tlc.code !== 0)
+    fail(
+      `trace-conformance: the FRESH capture failed refinement (exit ${tlc.code}) — the implementation drifted from the model:\n${outTail(tlc.out)}`,
+    );
   info("  fresh capture conforms");
 }
 
@@ -305,7 +319,7 @@ async function assertDoctoredMechanism(doctoring, records, vocabulary, scratch) 
 async function realBackendsTier(vocabulary) {
   const missing = REAL_BACKEND_ENV.filter((name) => !process.env[name]);
   if (missing.length > 0) {
-    if (process.env.CI === "true")
+    if (process.env.GITHUB_ACTIONS)
       fail(
         `trace-conformance: real-backend tier: CI must provide MinIO + Postgres (missing ${missing.join(", ")}) — an absent endpoint fails, it does not skip (§8.2)`,
       );
@@ -342,7 +356,9 @@ async function realBackendsTier(vocabulary) {
   if (decodeError !== null) fail(`trace-conformance: real-backend capture failed decoding: ${decodeError}`);
   const tlc = await refine(fresh);
   if (tlc.code !== 0)
-    fail(`trace-conformance: the real-backend capture failed refinement (exit ${tlc.code}) — the implementation drifted from the model`);
+    fail(
+      `trace-conformance: the real-backend capture failed refinement (exit ${tlc.code}) — the implementation drifted from the model:\n${outTail(tlc.out)}`,
+    );
   info("  real-backend capture conforms");
   const records = parseTrace(text);
   for (const doctoring of REAL_BACKEND_DOCTORINGS)

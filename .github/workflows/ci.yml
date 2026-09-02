@@ -183,6 +183,17 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup
+      # `just conformance` runs `tla.mjs tv` (fixtures, live, and
+      # real-backend tiers all refine through it) — same cache + install
+      # pattern as the tla-mc job above; without this the jars are absent
+      # and every tier fails in under a second, misreported by the generic
+      # "failed refinement (exit 1)" branch as if TLC had actually run.
+      - name: Cache the TLA+ jars
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: specs/.tools
+          key: tla-jars-${{ hashFiles('scripts/tla.mjs') }}
+      - run: just tla-install
       - name: Start MinIO (dev/CI-only conformance backend)
         run: |
           docker run -d --name duckspout-minio -p 9000:9000 -p 9001:9001 \
