@@ -1,5 +1,6 @@
 //! The disclosed node-status endpoint (§9.3, R-9): `NodeId`, the closed
-//! [`OverloadStatus`]/rung, watermark per partition, and `drain_stalled` —
+//! [`OverloadStatus`](duckspout_types::OverloadStatus)/rung, watermark per
+//! partition, and `drain_stalled` —
 //! the same [`NodeStatus`] vocabulary docs/operations.md §9.3.2 mandates
 //! "identically on the health endpoint, the metrics, and the registry" (v0.1
 //! ships the first of those three transports; the metrics exposition and

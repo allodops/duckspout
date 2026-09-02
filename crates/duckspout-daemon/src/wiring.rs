@@ -1,6 +1,6 @@
 //! The daemon's composition root (§10.4): `StagingEngine` +
 //! `OtlpLogsService` (gRPC listener) + `DrainCoordinator` (ticked off the
-//! [`Clock`](duckspout_types::Clock) port, single-node so no takeover) +
+//! [`Clock`] port, single-node so no takeover) +
 //! `DuckLakeCommitter` + `WatermarkLedger` into one running process, plus
 //! the [`crate::status`] disclosure listener.
 //!
@@ -12,7 +12,7 @@
 //!   doubles).
 //! - The drain loop: a background pass that (a) notes newly-closed windows
 //!   (the "ingest roller" `duckspout-staging/src/seal.rs` module docs assign
-//!   the composition — see [`note_closed_windows`]) and (b) drains every
+//!   the composition — see `note_closed_windows` below) and (b) drains every
 //!   window the coordinator reports eligible, through the real
 //!   `DuckLakeCommitter`.
 //! - The [`crate::status`] endpoint: `NodeId`, the overload rung, watermark
@@ -50,7 +50,7 @@
 //!   issue #153.
 //! - **Multi-tenant dataset declarations** (§9.6.2): v0.1 ships exactly one
 //!   built-in dataset, `otlp_logs` (the OTLP adapter's fixed target); its
-//!   drain plan ([`otlp_logs_drain_plan`]) is hardcoded rather than read
+//!   drain plan (`otlp_logs_drain_plan`) is hardcoded rather than read
 //!   from a declaration ledger that does not exist yet.
 
 use std::future::Future;
@@ -276,7 +276,7 @@ pub struct DaemonHandle(Arc<DaemonCore>);
 
 impl DaemonHandle {
     /// Runs one drain-loop pass immediately, off the reactor (module docs of
-    /// [`run_drain_tick_blocking`]).
+    /// `run_drain_tick_blocking` below).
     pub async fn drain_once(&self) -> DrainTickReport {
         run_drain_tick_blocking(Arc::clone(&self.0)).await
     }
