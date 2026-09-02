@@ -4,28 +4,46 @@
 //! the lake actually holds the rows, and the disclosed status endpoint
 //! agrees — end to end, over every piece #38 wires together.
 //!
-//! This is the first test that runs staging, drain, `DuckLake`, and the
-//! watermark ledger together as the daemon composes them (rather than each
-//! protocol crate's own unit/property suite, or `tests/otlp_e2e.rs`'s
-//! staging-only composition) — treated accordingly: thorough, not a smoke
-//! puff.
+//! This is the first test that runs staging, drain, `DuckLake`, the
+//! watermark ledger, **and** Flight serving together as the daemon composes
+//! them (rather than each protocol crate's own unit/property suite,
+//! `tests/otlp_e2e.rs`'s staging-only composition, or `tests/flight_e2e.rs`'s
+//! `HotFlightService`-in-isolation harness) — treated accordingly: thorough,
+//! not a smoke puff.
 //!
-//! # Substituted step: reading the drained data back
+//! # Querying the drained data back: two independent proofs
 //!
-//! The task this test satisfies asks to "query them back via Flight" — Arrow
-//! Flight serving (issue #39, PR #151) was still an open, unmerged PR when
-//! this branch was cut, so there is no `FlightService` to query yet
-//! (`wiring`'s module docs). This test substitutes the honest alternative:
-//! it reads the rows straight out of the drained `DuckLake` catalog with its
-//! own `DuckDB` connection, which proves the same thing Flight would have
-//! for the hot tier — the data that was accepted is durably, correctly
-//! present — one layer further down the pipeline. Flight-path coverage
-//! lands once #151 merges.
+//! This test's original cut (issue #38, before #151 merged) could not query
+//! Flight — there was no `FlightService` on `main` yet — so it substituted
+//! reading the drained rows straight out of the `DuckLake` catalog with a
+//! raw `DuckDB` connection. That substitute stays: it is still the only
+//! proof that data survived the full accept→stage→drain→commit path into
+//! the lake, one layer further down the pipeline than Flight reaches (hot
+//! data is dropped from staging once its window drains — `DropWindow`,
+//! `duckspout-drain`'s coordinator docs — so Flight cannot see window 0
+//! after this test's drain tick commits it).
+//!
+//! What is new: a **real Flight round-trip** (issue #39/#151, wired into
+//! `Daemon::boot`/`serve` by this branch) against window 1 — the second
+//! window this test opens by rolling past `hot.window = "1s"`, which stays
+//! open (undrained, still in the hot tier) for the whole test. A real
+//! `FlightServiceClient` binds the window's schema through `get_flight_info`
+//! and streams its rows through `do_get`, proving the daemon's bound Flight
+//! listener serves the exact rows the OTLP client just ingested — the proof
+//! the lake read-back cannot give, since it never sees hot-only data.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::{FlightDescriptor, Ticket};
 use duckspout_daemon::wiring::Daemon;
+use duckspout_staging::arrow::array::{Array as _, AsArray as _};
+use duckspout_staging::arrow::datatypes::DataType;
+use duckspout_types::{DatasetId, PartitionId, TenantId, WindowId};
+use futures::TryStreamExt as _;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
 };
@@ -177,6 +195,69 @@ fn drained_row_count(catalog_path: &std::path::Path, data_path: &std::path::Path
     .unwrap()
 }
 
+/// One `do_get` round-trip: ticket in, decoded `RecordBatch`es out — the
+/// same helper shape `tests/flight_e2e.rs` uses against `HotFlightService`
+/// directly, exercised here over the real daemon-bound listener instead.
+async fn flight_query_rows(
+    client: &mut FlightServiceClient<tonic::transport::Channel>,
+    sql: &str,
+) -> Vec<duckspout_staging::arrow::record_batch::RecordBatch> {
+    let stream = client
+        .do_get(Ticket::new(sql.to_owned().into_bytes()))
+        .await
+        .unwrap()
+        .into_inner();
+    FlightRecordBatchStream::new_from_flight_data(
+        stream.map_err(|s| FlightError::Tonic(Box::new(s))),
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap()
+}
+
+/// The Flight round-trip proof (module docs): `get_flight_info` binds the
+/// result schema and hands back a ticket carrying the same SQL, `do_get`
+/// streams the rows, and the decoded rows match what the OTLP client
+/// ingested into `window1_table` — the still-hot window Flight can see that
+/// the lake read-back cannot.
+async fn assert_flight_serves_hot_window(flight_addr: std::net::SocketAddr, window1_table: &str) {
+    let flight_channel = tonic::transport::Endpoint::from_shared(format!("http://{flight_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to the real Flight listener");
+    let mut flight_client = FlightServiceClient::new(flight_channel);
+
+    let sql = format!("SELECT body FROM {window1_table} ORDER BY body");
+    let info = flight_client
+        .get_flight_info(FlightDescriptor::new_cmd(sql.clone().into_bytes()))
+        .await
+        .expect("get_flight_info against the hot window")
+        .into_inner();
+    let ticket = info.endpoint[0]
+        .ticket
+        .clone()
+        .expect("one endpoint ticket");
+    assert_eq!(ticket.ticket, bytes::Bytes::from(sql.clone().into_bytes()));
+    let schema = info.try_decode_schema().unwrap();
+    assert_eq!(schema.fields().len(), 1, "bound schema: body only");
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+
+    let batches = flight_query_rows(&mut flight_client, &sql).await;
+    let bodies: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| {
+            let col = batch.column(0).as_string::<i32>();
+            (0..col.len()).map(move |i| col.value(i).to_owned())
+        })
+        .collect();
+    assert_eq!(
+        bodies,
+        vec!["e2e-boot log 0", "e2e-boot log 1"],
+        "Flight served exactly window 1's 2 still-hot rows, matching what was ingested"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn otlp_to_lake_end_to_end_through_the_public_daemon_api() {
     let root = tempfile::tempdir().unwrap();
@@ -192,6 +273,7 @@ async fn otlp_to_lake_end_to_end_through_the_public_daemon_api() {
     let handle = daemon.handle();
     let otlp_addr = daemon.otlp_addr();
     let status_addr = daemon.status_addr();
+    let flight_addr = daemon.flight_addr();
     assert_eq!(handle.node_id().as_str().rsplit('/').next(), Some("1"));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -278,6 +360,17 @@ async fn otlp_to_lake_end_to_end_through_the_public_daemon_api() {
         wire_status["watermarks"][0]["complete_through_ms"],
         watermark.complete_through_ms
     );
+
+    // --- Query the still-hot window back over a real Flight client (§7.4) ---
+    // Window 0 (7 rows) just drained and is gone from staging (`DropWindow`,
+    // module docs); window 1 (the 2 rows that rolled it) is still open and
+    // hot, and is exactly what remote-hot querying is for — read the data a
+    // node is currently ingesting, not yet in the lake.
+    let dataset = DatasetId::new(duckspout_accept::otlp::OTLP_LOGS_DATASET);
+    let partition = PartitionId::from_tenant_shard(&TenantId::new("tenant-a"), 0);
+    let window1_table =
+        duckspout_staging::naming::window_table_name(&dataset, &partition, WindowId(1));
+    assert_flight_serves_hot_window(flight_addr, &window1_table).await;
 
     // --- SIGTERM choreography: readiness false, finish, exit (§9.1.2) ---
     shutdown_tx.send(()).unwrap();

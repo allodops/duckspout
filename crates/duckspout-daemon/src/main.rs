@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         otlp_addr = %daemon.otlp_addr(),
         status_addr = %daemon.status_addr(),
+        flight_addr = %daemon.flight_addr(),
         node_id = %daemon.handle().node_id(),
         "daemon booted"
     );

@@ -361,6 +361,14 @@ pub mod defaults {
     pub fn max_concurrent_hot_scans() -> u32 {
         8
     }
+    /// 2 GiB — `query.max_hot_bytes_per_query`'s steady-state base (§7.8),
+    /// unlike `hot.max_bytes` a fixed constant, not an autodetected
+    /// fraction of anything: the byte budget is workload-derived, with no
+    /// host quantity to derive a default from.
+    #[must_use]
+    pub fn max_hot_bytes_per_query() -> u64 {
+        2 * 1024 * 1024 * 1024
+    }
     /// 4 MiB.
     #[must_use]
     pub fn max_payload_bytes() -> u64 {
