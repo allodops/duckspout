@@ -20,6 +20,13 @@ inputs:
       (the msrv job passes "1.96"; everyone else omits it).
     required: false
     default: ""
+  instr-gate:
+    description: >-
+      Install iai-callgrind-runner + valgrind (the instr-gate job passes
+      "true"; every other job omits it — no sense taxing every armed job
+      with a tool only one gate uses).
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -77,3 +84,21 @@ runs:
       with:
         distribution: temurin
         java-version: "21"
+
+    # instr-gate (§8.6, ADR-0005; issue #46): iai-callgrind-runner MUST
+    # match the `iai-callgrind` library's version exactly (its own
+    # requirement) — keep this pin and the workspace Cargo.toml dependency
+    # pin equal on every bump. Valgrind itself is an apt package, not a
+    # cargo tool, so it is a separate step; Ubuntu's `valgrind` package is
+    # not independently version-pinned (no upstream pin surface for apt),
+    # consistent with the other apt-installed system tools this action
+    # relies on implicitly (e.g. the base image's linker).
+    - name: Install iai-callgrind-runner (pinned, matches Cargo.toml)
+      if: inputs.instr-gate == 'true'
+      uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+      with:
+        tool: iai-callgrind-runner@0.16.1
+    - name: Install valgrind
+      if: inputs.instr-gate == 'true'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends valgrind

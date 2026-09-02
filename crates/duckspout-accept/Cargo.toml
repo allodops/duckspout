@@ -32,6 +32,13 @@ proptest = { workspace = true }
 # it into tonic — dev-only; production sockets belong to the daemon.
 tokio = { workspace = true, features = ["net"] }
 tokio-stream = { workspace = true }
+# §8.6's per-PR instr-gate (ADR-0005, issue #46): deterministic
+# instruction-count baseline for the Accept decode step (§4.3).
+iai-callgrind = { workspace = true }
+
+[[bench]]
+name = "decode"
+harness = false
 
 [lints]
 workspace = true

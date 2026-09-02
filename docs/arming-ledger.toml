@@ -134,6 +134,20 @@ milestone = ""
 issue = 0
 spec = "§8"
 
+# Armed by the #46 arming PR (v0.1): §8.6's per-PR deterministic
+# instruction-count gate (ADR-0005) — iai-callgrind over the ack-path hot
+# functions (§4.3), baseline +15% ceiling, baselines in
+# floors/instr-baselines/.
+[[gate]]
+id = "instr-gate"
+status = "armed"
+cadence = "pr"
+recipe = "instr-gate"
+workflow_job = "ci.yml:instr-gate"
+milestone = ""
+issue = 46
+spec = "§8 (ADR-0005)"
+
 # --- armed, cadence = "nightly" (nightly.yml only, never `just ci`) ---
 
 [[gate]]
@@ -172,16 +186,6 @@ workflow_job = ""
 milestone = "v0.2"
 issue = 57
 spec = "§8.1"
-
-[[gate]]
-id = "instr-gate"
-status = "staged"
-cadence = "pr"
-recipe = "instr-gate"
-workflow_job = ""
-milestone = "v0.1"
-issue = 46
-spec = "§8 (ADR-0005)"
 
 [[gate]]
 id = "smoke"

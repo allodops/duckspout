@@ -1,0 +1,5 @@
+{
+  "instructions": 4017957,
+  "measured_at": "2026-09-02",
+  "note": "recomputed by `bun scripts/instr-gate.mjs --update-baseline` (§8.6: an explicit baseline-update commit, reviewed line by line)"
+}
