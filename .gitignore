@@ -4,6 +4,7 @@ target/
 # TLC scratch + counterexample litter (SEED s§2 notes)
 states/
 *_TTrace_*.tla
+*_TTrace_*.bin
 
 # TLA+ tooling jars, fetched by `just tla-install` (scripts/tla.mjs)
 specs/.tools/

@@ -1,0 +1,26 @@
+# Pinned exact reachable-state counts per clean configuration (3.1; docs/
+# verification.md 8.1): `just tla-mc <Module>` fails on any drift -- a state
+# space that silently changed is a model that silently stopped exploring
+# something.  Every number below was produced by an actual TLC run of the
+# committed clean .cfg on this repository's pinned tla2tools ("N distinct
+# states found"); update it only together with the model change that moves
+# it, and say why in the PR.  Measured on Temurin 17 (CI provides 21; the
+# reachable-state count is JVM-independent -- it is a property of the model,
+# not the runtime).
+
+# Ingest.cfg -- 2 nodes, RF=2, 1 partition, 2 windows, 4 requests with
+# DKey(q1)=DKey(q2) (the normative colliding-dedup-key pin), MaxCrashes=1;
+# all 10 safety invariants + LadderMonotone + EveryRequestResolves.  41m12s.
+Ingest = 232052
+
+# Drain.cfg -- 3 nodes, RF=2, 1 event-class partition, 1 window, 1 request,
+# two-drainer pinned claim set, IndetOn={n1}; all 10 safety invariants +
+# LadderMonotone + EveryRequestResolves + WatermarkEventuallyAdvances.
+# 38m05s.
+Drain = 398526
+
+# Schema.cfg -- 2 nodes, RF=2, 2 partitions (data on p2, dataset home p1),
+# 1 dataset, lattice SUBSET{c1,c2}, 1 data request, MaxCrashes=0; all 10
+# safety invariants + SchemaConvergence + LadderMonotone + SchemaMonotone
+# + EveryRequestResolves.  09m09s.
+Schema = 36191
