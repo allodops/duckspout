@@ -139,7 +139,7 @@ smoke:
 
 # --- nightly ---
 
-# Mutation-floor ratchet via cargo-mutants (nightly by ADR-0009) (Ⓜ v0.1)
+# Mutation-floor ratchet via cargo-mutants (nightly by ADR-0009) (nightly.yml:mutation-floor)
 [group('nightly')]
 mutants:
     bun scripts/lib/proc.mjs staged floors.mjs mutation

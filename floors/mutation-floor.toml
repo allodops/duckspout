@@ -1,0 +1,35 @@
+# Measured, ratcheted mutation-kill-rate floor (§8.6, ADR-0009; issue #49).
+# Recomputed nightly by `bun scripts/floors.mjs mutation` — never a cached
+# value or a PR's own claim (§8.6's CI-recomputes-never-trusts posture).
+# Nightly cadence only: the merge queue never runs this (ADR-0009).
+#
+# Scope: duckspout-accept, duckspout-staging, duckspout-replication,
+# duckspout-drain, duckspout-watermark (AGENTS.md's "protocol crates" list).
+# Metric: caught / (caught + missed) * 100 — unviable and timeout mutants
+# excluded from both sides (neither is a tested-and-passed result).
+#
+# Measured 2026-09-02, cargo-mutants 27.1.0, all 464 mutants cargo-mutants
+# generates for the five crates above (`cargo mutants --list -p ...`
+# confirms the count). Measured in two passes on a heavily contended shared
+# host (this session's own build regime, not a CI characteristic): the
+# first pass (464 mutants, -j4) was interrupted mid-run after completing
+# 238 (133 caught, 71 missed, 4 timeout, 30 unviable); `cargo mutants
+# --iterate -j2` resumed against the same output directory, excluding the
+# 163 already-caught-or-unviable mutants and retesting the remaining 301
+# (71 missed + 4 timeout + 226 not yet run) to completion: 168 caught, 65
+# missed, 68 unviable, 0 timeout. Combined, final totals across all 464:
+#   caught = 133 + 168 = 301
+#   missed = 65 (the converged result for every previously-missed/timeout/
+#            untested mutant, superseding the first pass's stale 71)
+#   unviable = 30 + 68 = 98
+#   total = 301 + 65 + 98 = 464
+#   kill rate = 301 / (301 + 65) = 82.24%
+# A production nightly run is a single clean invocation (never interrupted,
+# never resumed) — this two-pass reconciliation is specific to how this
+# measurement was taken in this session, not how the armed gate runs.
+#
+# Floor set to measured minus a 2.0 percentage-point margin, rounded down
+# to 1dp — absorbs ordinary run-to-run noise (a flaky test, a borderline
+# timeout) without being so loose it stops ratcheting real regressions
+# (same posture as floors/coverage-floor.toml's ~2.5pp margin).
+floor = 80.2
