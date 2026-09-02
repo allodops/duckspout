@@ -148,6 +148,18 @@ milestone = ""
 issue = 46
 spec = "§8 (ADR-0005)"
 
+# Armed by the #47 arming PR (v0.1): §8.6's per-PR 1M-record ingest smoke
+# bound — order-of-magnitude regression catch, release-mode, real daemon.
+[[gate]]
+id = "smoke"
+status = "armed"
+cadence = "pr"
+recipe = "smoke"
+workflow_job = "ci.yml:smoke"
+milestone = ""
+issue = 47
+spec = "§8.6"
+
 # --- armed, cadence = "nightly" (nightly.yml only, never `just ci`) ---
 
 [[gate]]
@@ -187,15 +199,6 @@ milestone = "v0.2"
 issue = 57
 spec = "§8.1"
 
-[[gate]]
-id = "smoke"
-status = "staged"
-cadence = "pr"
-recipe = "smoke"
-workflow_job = ""
-milestone = "v0.1"
-issue = 47
-spec = "§8.6"
 
 # --- staged, cadence = "nightly" (future nightly.yml jobs; s§6.3) ---
 

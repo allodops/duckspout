@@ -1,0 +1,7 @@
+# Measured, ratcheted bound for the smoke gate (§8.6; issue #47).
+# Recomputed by `bun scripts/smoke.mjs --update-baseline` — an explicit,
+# reviewed baseline-update commit, never run silently by the gate itself.
+# Ceiling applied by scripts/smoke.mjs: seconds * 1.5 (generous — an
+# order-of-magnitude regression catch, not a tight latency claim).
+seconds = 28
+measured_at = "2026-09-02"
