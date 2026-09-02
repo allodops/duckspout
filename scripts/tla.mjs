@@ -17,7 +17,10 @@ const JARS = [
   {
     name: "tla2tools.jar",
     url: "https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar",
-    sha256: "eabd140a70f49eb9305a3bd3f3df944eddf87e5a90d329789085f8953a80533a",
+    // Upstream replaced the v1.8.0 release asset on 2026-09-01 (GitHub API
+    // `updated_at`); this pin tracks the digest GitHub publishes for the
+    // hosted asset (verified via `gh api repos/tlaplus/tlaplus/releases`).
+    sha256: "dbcc75552f21978a4846688b8e23be1a6b6c0b3fcee35d78fec2df167958ec94",
   },
   {
     name: "CommunityModules-deps.jar",
@@ -90,9 +93,17 @@ async function mc(name) {
   const counts = (await import(countsPath, { with: { type: "toml" } })).default;
   for (const mod of modules(name)) {
     info(`tla mc: ${mod}`);
-    const { code, out } = await tlcCaptured(["-config", `${mod}.cfg`, "-checkpoint", "0", "-cleanup", `${mod}.tla`]);
+    const { code, out } = await tlcCaptured(["-config", `${mod}.cfg`, "-checkpoint", "0", "-cleanup", "-workers", "auto", `${mod}.tla`]);
     if (code !== 0) process.exit(code);
-    const m = /(\d+) distinct states found/.exec(out);
+    // The FINAL BFS summary — "N distinct states found, K states left on
+    // queue." — is the count to pin; TLC's interim Progress lines share the
+    // "distinct states found" phrase but wrap it as "found (R ds/min), K
+    // states left on queue", so the comma directly after "found" is what
+    // disambiguates the summary from progress. Take the last such match: on
+    // a run long enough to print progress, an unanchored first-match read
+    // would latch onto an early Progress count instead.
+    const matches = [...out.matchAll(/(\d+) distinct states found, \d+ states left on queue/g)];
+    const m = matches.at(-1);
     if (!m) fail(`tla mc: ${mod}: could not read the distinct-state count from TLC output`);
     const pinned = counts[mod];
     if (pinned === undefined) fail(`tla mc: ${mod}: no pinned count in specs/state-counts.toml`);
@@ -107,7 +118,7 @@ async function mc(name) {
   if (existsSync(brokenDir)) {
     for (const cfg of readdirSync(brokenDir).filter((f) => f.endsWith(".cfg")).sort()) {
       const mod = cfg.replace(/\.cfg$/, "");
-      const code = await tlc(["-config", `broken/${cfg}`, "-checkpoint", "0", "-cleanup", `broken/${mod}.tla`]);
+      const code = await tlc(["-config", `broken/${cfg}`, "-checkpoint", "0", "-cleanup", "-workers", "auto", `broken/${mod}.tla`]);
       if (code === 0) fail(`tla mc: broken/${mod} passed — a broken variant must stay red`);
       info(`tla mc: broken/${mod}: red as required`);
     }
@@ -118,7 +129,7 @@ async function sim(name) {
   requireTools();
   for (const mod of modules(name)) {
     info(`tla sim: ${mod}`);
-    const code = await tlc(["-config", `${mod}.cfg`, "-simulate", "-checkpoint", "0", "-cleanup", `${mod}.tla`]);
+    const code = await tlc(["-config", `${mod}.cfg`, "-simulate", "-checkpoint", "0", "-cleanup", "-workers", "auto", `${mod}.tla`]);
     if (code !== 0) process.exit(code);
   }
 }

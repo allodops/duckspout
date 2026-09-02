@@ -1,0 +1,8 @@
+---------------------- MODULE Witness_SupplementCommits ----------------------
+\* Non-vacuity witness (3.6, armed): a supplement part commits beside a winner with disjoint coverage.
+\* This configuration asserts the witness state/step is UNREACHABLE
+\* and MUST fail -- the counterexample TLC prints IS the witness.
+\* Overrides vs the clean Drain.cfg: Requests   = {q1}; -- the smallest scope the
+\* witness needs; constants otherwise identical.
+EXTENDS Drain
+=============================================================================

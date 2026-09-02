@@ -2,12 +2,16 @@
 
 > This README carries the **§3 prose** of `DUCKSPOUT.md` — modeling
 > philosophy, module map, liveness/findings doctrine, broken variants and
-> witnesses, trace conformance — absorbed per docs/seed.md s§10. The **formal
-> content** (§3.2 state space, §3.3 action set, §3.4 invariants, and the
-> modules themselves) **lives verbatim in [`formal-core.md`](formal-core.md) until the `.tla` files land
-> at v0.1/v0.2** per the arming ledger: every `.tla`/`.cfg` path here is
-> reserved-absent (Ⓜ), tracked by ledger rows `tla-mc-core` (v0.1) and
-> `tla-mc-replication` (v0.2). Section citations (`§n`) refer to
+> witnesses, trace conformance — absorbed per docs/seed.md s§10. The **v0.1
+> modules are landed** (issue #41): `DuckSpoutCore.tla` +
+> `Ingest`/`Drain`/`Schema` with clean configs, `broken/` variants,
+> witnesses and FINDINGS, and pinned counts in `state-counts.toml`; every
+> transcription judgment call is logged in
+> [`TRANSCRIPTION-NOTES.md`](TRANSCRIPTION-NOTES.md). The verbatim
+> §3.2–§3.4 text stays in [`formal-core.md`](formal-core.md) until
+> `Replication.tla` lands (ledger row `tla-mc-replication`, v0.2) — it is
+> still that module's source; the `traces/` + `fixtures/` siblings land
+> with ledger row `conformance`. Section citations (`§n`) refer to
 > `DUCKSPOUT.md` until its absorption completes.
 
 ## The formal core (§3)
