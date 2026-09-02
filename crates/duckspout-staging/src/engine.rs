@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
-use arrow::array::{ArrayRef, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
@@ -643,7 +643,7 @@ impl StageTxn<'_> {
         // Staged-bytes accounting (§4.5): the payload's in-memory Arrow
         // size, recorded on the window's registry row in this same
         // transaction — the measure and the data commit or vanish together.
-        let bytes = batch.get_array_memory_size() as u64;
+        let bytes = record_batch_content_bytes(batch)?;
         self.writer.conn.execute(
             "UPDATE duckspout_windows SET staged_bytes = staged_bytes + ?
              WHERE dataset = ? AND partition = ? AND window_id = ?",
@@ -1008,7 +1008,7 @@ impl StagingReader {
         let mut scanned_bytes: u64 = 0;
         let mut batches = Vec::new();
         for batch in stmt.query_arrow([])? {
-            scanned_bytes = scanned_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            scanned_bytes = scanned_bytes.saturating_add(record_batch_content_bytes(&batch)?);
             if scanned_bytes > guards.max_bytes {
                 return Err(StagingError::ScanBudgetExceeded {
                     scanned_bytes,
@@ -1137,6 +1137,31 @@ fn load_windows(conn: &Connection) -> Result<HashMap<WindowKey, WindowMeta>, Sta
         );
     }
     Ok(windows)
+}
+
+/// A batch's actual content size — the shared unit behind §4.5's
+/// staged-bytes ladder measure and §7.8's scan-budget accounting.
+///
+/// `RecordBatch::get_array_memory_size` sums each column's *underlying
+/// buffer capacity*; per arrow-rs's own documented semantics, a column
+/// sliced (zero-copy) from a shared allocation reports that allocation's
+/// **full** size, once per buffer. Every batch on both call sites of this
+/// function is exactly that: `StreamReader`-decoded from one shared IPC
+/// message, or `duckdb`'s own `query_arrow` output — so summing
+/// `get_array_memory_size` over a 14-column batch counted the same
+/// underlying bytes up to 14 times over (confirmed empirically: a 2000-row
+/// OTLP batch decodes to ~213 KB of real content but ~6 MB of reported
+/// "memory", a ~29x inflation that drove staging into false rung-2
+/// throttling under realistic 1M-record volume — see the smoke gate's
+/// `smoke_volume` test). `ArrayData::get_slice_memory_size` is arrow-rs's
+/// own remedy: the size a batch built fresh with exactly this data would
+/// need, independent of how the buffers it was sliced from were sized.
+fn record_batch_content_bytes(batch: &RecordBatch) -> Result<u64, StagingError> {
+    let mut bytes: u64 = 0;
+    for column in batch.columns() {
+        bytes += column.to_data().get_slice_memory_size()? as u64;
+    }
+    Ok(bytes)
 }
 
 /// The staged payload-type subset → `DuckDB` DDL type. Closed and small on
