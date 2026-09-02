@@ -68,8 +68,8 @@ use std::sync::Mutex;
 
 use duckdb::Connection;
 use duckspout_types::{
-    AttachInfo, BoxFuture, CommitOutcome, LakeCommitter, LakeError, PartName, PartitionId,
-    SchemaEvolution, WatermarkRow, WindowManifest,
+    AttachInfo, BoxFuture, CommitOutcome, DatasetId, LakeCommitter, LakeError, OriginSeqRange,
+    PartName, PartitionId, SchemaEvolution, WatermarkRow, WindowId, WindowManifest,
 };
 
 /// The lake catalog alias every SQL statement addresses.
@@ -477,6 +477,104 @@ impl DuckLakeCommitter {
             }
         }
         Ok(rows)
+    }
+
+    /// Every committed window manifest recorded in the lake, across every
+    /// partition and dataset (§6.8, ADR-0010's "authoritative-but-
+    /// reconstructible" property; issue #153). Deliberately **not** part of
+    /// the [`LakeCommitter`] port: it is a `DuckLake`-specific boot-recovery
+    /// read, consumed only by `duckspout-daemon`'s own composition code
+    /// (which already binds this concrete type in `open_lake`) — keeping it
+    /// off the port keeps `LakeCommitter`'s six critical-path operations
+    /// (§6.4) exactly six, per the Neutrality Keep Rule (§11) and
+    /// `docs/seed.md`'s enumeration of them. A future non-`DuckLake` backend
+    /// wired into the daemon would need its own equivalent read (or the port
+    /// would need to grow one, decided then, not speculatively here).
+    ///
+    /// One row per `(partition, window_id, part_name)` in
+    /// `duckspout_manifests` collapses back into one [`WindowManifest`] per
+    /// `(partition, window_id)` — the scalar fields (`dataset`, `rows`,
+    /// event-time bounds, `dedup_removed`, `origin_coverage`) are identical
+    /// across a window's part rows because `commit_files` always writes them
+    /// from the same [`WindowManifest`] argument in one transaction (§6.4);
+    /// only `parts` varies per row. Expired parts are **included** — `expire`
+    /// only marks `duckspout_manifests` rows, never deletes them (TN-36) —
+    /// because a window's contribution to completeness does not un-happen
+    /// when its file is later expired.
+    ///
+    /// # Errors
+    ///
+    /// [`LakeError::Backend`] for a query or decode failure (a stored
+    /// `origin_coverage` value that fails to deserialize means the lake's
+    /// own record is corrupt — surfaced, never silently skipped, R-3).
+    pub fn read_manifests(&self) -> Result<Vec<WindowManifest>, LakeError> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT partition, window_id, part_name, dataset, rows, event_time_min_ms, \
+                 event_time_max_ms, dedup_removed, origin_coverage
+                 FROM lake.duckspout_manifests
+                 ORDER BY partition, window_id",
+            )
+            .map_err(|e| backend(&e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(|e| backend(&e))?;
+
+        let mut manifests: Vec<WindowManifest> = Vec::new();
+        for row in rows {
+            let (
+                partition,
+                window_id,
+                part_name,
+                dataset,
+                row_count,
+                event_time_min_ms,
+                event_time_max_ms,
+                dedup_removed,
+                coverage_json,
+            ) = row.map_err(|e| backend(&e))?;
+            let window_id = WindowId(u64::try_from(window_id).unwrap_or(u64::MAX));
+            match manifests.last_mut() {
+                Some(last) if last.partition.as_str() == partition && last.window_id == window_id => {
+                    last.parts.push(PartName::new(part_name));
+                }
+                _ => {
+                    let origin_coverage: Vec<OriginSeqRange> = serde_json::from_str(&coverage_json)
+                        .map_err(|e| {
+                            LakeError::Backend(format!(
+                                "decode origin_coverage for partition {partition} window \
+                                 {}: {e}",
+                                window_id.0
+                            ))
+                        })?;
+                    manifests.push(WindowManifest {
+                        dataset: DatasetId::new(dataset),
+                        partition: PartitionId::new(partition),
+                        window_id,
+                        origin_coverage,
+                        rows: u64::try_from(row_count).unwrap_or(0),
+                        event_time_min_ms,
+                        event_time_max_ms,
+                        dedup_removed: u64::try_from(dedup_removed).unwrap_or(0),
+                        parts: vec![PartName::new(part_name)],
+                    });
+                }
+            }
+        }
+        Ok(manifests)
     }
 
     fn evolve_schema_blocking(&self, change: &SchemaEvolution) -> Result<(), LakeError> {
