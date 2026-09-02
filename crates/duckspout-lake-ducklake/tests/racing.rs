@@ -11,6 +11,21 @@
 //! #119's false-pass zone (per-process POSIX locks). The Postgres
 //! topology carries the same snapshot-commit conflict through the same
 //! extension code path.
+//!
+//! # Known upstream flake (issue #157)
+//!
+//! `repeated_races_never_double_commit` occasionally `SIGSEGV`s under CI's
+//! concurrent test load (reproduced locally at ~1.7–2% per attempt under
+//! contention; 0% in isolated runs). Root-caused to a race inside the
+//! third-party `ducklake` extension's name-map cache
+//! (`DuckLakeCatalog::LoadNameMaps` → `DuckLakeNameMapSet::Add` →
+//! `DuckLakeNameMapEntry::GetHash`), several native frames below the `CALL
+//! ducklake_add_data_files` this crate issues — not a bug in this crate or
+//! in the test's synchronization (full backtrace and analysis in #157). A
+//! red run with this exact signature is a known environment/dependency
+//! flake to re-run, not a signal to bisect this crate's commits — and the
+//! test stays exactly as strict as it is: weakening it would defeat the
+//! §6.6 fence proof it exists to establish.
 
 mod common;
 
