@@ -227,7 +227,11 @@ jobs:
   # number (§8.6's CI-recomputes-never-trusts posture).
   coverage-floor:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A cold coverage-instrumented full-workspace build compiles under
+    # different rustc flags than the `test` job's own cache entry, so it
+    # cannot ride that cache; budgeted like tla-mc's own heaviest-gate
+    # allowance rather than the other jobs' 45 minutes.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
