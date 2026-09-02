@@ -187,6 +187,20 @@ milestone = ""
 issue = 48
 spec = "§8.1"
 
+# Armed by the #49 arming PR (v0.1): §8.6's mutation-kill-rate floor over
+# the protocol crates (ADR-0009's flagged deviation — nightly, not per-PR;
+# cargo-mutants over this workspace is hours-scale). A red run auto-files a
+# `blocked` issue (nightly.yml:mutation-floor-red-issue).
+[[gate]]
+id = "mutation-floor"
+status = "armed"
+cadence = "nightly"
+recipe = "mutants"
+workflow_job = "nightly.yml:mutation-floor"
+milestone = ""
+issue = 49
+spec = "§8 (ADR-0009)"
+
 # --- staged, cadence = "pr" (future ci.yml jobs; s§6.1 lower table) ---
 
 [[gate]]
@@ -201,16 +215,6 @@ spec = "§8.1"
 
 
 # --- staged, cadence = "nightly" (future nightly.yml jobs; s§6.3) ---
-
-[[gate]]
-id = "mutation-floor"
-status = "staged"
-cadence = "nightly"
-recipe = "mutants"
-workflow_job = ""
-milestone = "v0.1"
-issue = 49
-spec = "§8 (ADR-0009)"
 
 [[gate]]
 id = "ctk-distributed"

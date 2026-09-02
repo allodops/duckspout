@@ -1,11 +1,10 @@
 # nightly.yml — armed nightly gates (SEED s§6.3).
 #
-# Armed: hack-features (bootstrap) and tla-sim (#48).
+# Armed: hack-features (bootstrap), tla-sim (#48), mutation-floor (#49).
 # Staged nightly jobs are NOT present here — each is a staged ledger row in
 # docs/arming-ledger.toml and arms by protected-set PR at its milestone:
-#   mutation-floor (v0.1, ADR-0009: a red run auto-files a
-#   `blocked` issue) · ctk-distributed (v0.2) / ctk-release-gate (v0.3) ·
-#   bench-card (v0.4, docs/bench/methodology.md must exist first).
+#   ctk-distributed (v0.2) / ctk-release-gate (v0.3) · bench-card (v0.4,
+#   docs/bench/methodology.md must exist first).
 name: Nightly
 
 on:
@@ -96,5 +95,65 @@ jobs:
           EOF
           gh api "repos/${REPO}/issues" \
             -f title="Red nightly tla-sim run" \
+            -F body=@"${RUNNER_TEMP}/body.md" \
+            -f "labels[]=blocked"
+
+  # §8.6's mutation-kill-rate floor (ledger row mutation-floor, ADR-0009):
+  # cargo-mutants over the protocol crates only (scripts/floors.mjs's
+  # PROTOCOL_CRATES list), compared against floors/mutation-floor.toml.
+  # Nightly, not per-PR — ADR-0009's flagged deviation from §8's tier table
+  # (cargo-mutants over this workspace is hours-scale; a per-PR run would
+  # make the merge queue unusable). timeout-minutes is generous for the
+  # same reason.
+  mutation-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: just mutants
+
+  # A red nightly must not scroll by unseen: file a `blocked` issue so the
+  # dispatcher surfaces it before assigning new work (s§9.4) — the exact
+  # discipline ADR-0009 names for the mutation floor specifically. Deduped:
+  # an already open red-mutation-floor issue means no second filing.
+  # github.token is fine here: creating an issue needs to trigger no other
+  # workflow (same rationale as tla-sim-red-issue above).
+  mutation-floor-red-issue:
+    needs: [mutation-floor]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File the blocking issue for the red mutation-floor run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          open=$(gh api "repos/${REPO}/issues?labels=blocked&state=open" \
+            --jq '[.[] | select(.title == "Red nightly mutation-floor run")] | length')
+          if [ "$open" -gt 0 ]; then
+            echo "an open red-mutation-floor issue already exists; not filing another"
+            exit 0
+          fi
+          cat > "${RUNNER_TEMP}/body.md" <<EOF
+          The nightly mutation-kill-rate floor (docs/verification.md §8.6;
+          ledger row mutation-floor, ADR-0009) went red: ${RUN_URL}
+
+          Reproduce locally: \`bun scripts/floors.mjs mutation\` (runs
+          cargo-mutants over the protocol crates and compares the kill rate
+          against floors/mutation-floor.toml) on the same commit. Fix
+          forward (strengthen the tests a surviving mutant exposed) or
+          revert the causing change; this issue blocks new loop work until
+          resolved (ADR-0009 discipline, s§9.4).
+          EOF
+          gh api "repos/${REPO}/issues" \
+            -f title="Red nightly mutation-floor run" \
             -F body=@"${RUNNER_TEMP}/body.md" \
             -f "labels[]=blocked"
