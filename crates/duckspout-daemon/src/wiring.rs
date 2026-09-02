@@ -212,15 +212,10 @@ impl DaemonCore {
 
     fn status_snapshot(&self) -> StatusSnapshot {
         let drain_stalled = self.drain_stalled.load(Ordering::Relaxed);
-        let status = self.stager.status(drain_stalled).unwrap_or(
-            // The engine's own accounting is unreadable: fail closed to the
-            // top rung rather than default to a false "normal" (§11:
-            // ambiguity fails closed).
-            duckspout_types::NodeStatus {
-                overload: duckspout_types::OverloadStatus::RefusingIngest,
-                replication_degraded: false,
-            },
-        );
+        // `EngineStager::status` is infallible as of PR #151 (`staged_bytes`
+        // no longer fails), so there is no accounting-unreadable case left
+        // to fail closed against.
+        let status = self.stager.status(drain_stalled);
         StatusSnapshot {
             node_id: self.node_id.clone(),
             ready: self.ready.load(Ordering::Relaxed),

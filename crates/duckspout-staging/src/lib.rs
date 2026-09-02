@@ -58,8 +58,8 @@ pub mod seal;
 
 #[cfg(feature = "duckdb")]
 pub use engine::{
-    CHECKPOINT_THRESHOLD_DEFERRED, DedupEntry, HOT_DB_FILE, StageTxn, StagingConfig, StagingEngine,
-    StagingError, StagingReader, WindowRef,
+    CHECKPOINT_THRESHOLD_DEFERRED, DedupEntry, HOT_DB_FILE, ScanGuards, StageTxn, StagingConfig,
+    StagingEngine, StagingError, StagingReader, WindowRef,
 };
 #[cfg(feature = "duckdb")]
 pub use stager::{EngineStager, StagerConfig};

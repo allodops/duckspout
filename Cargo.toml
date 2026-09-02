@@ -41,6 +41,10 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "
 tracing = "0.1"
 tracing-subscriber = "0.3"
 metrics = "0.24"
+# futures: stream combinators for the daemon's Flight serving surface
+# (arrow-flight's encoder emits futures streams); the ecosystem-standard
+# companion, no in-house candidate (R-third-party-first).
+futures = "0.3"
 object_store = "0.14"
 config = "0.15"
 thiserror = "2"
