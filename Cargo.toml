@@ -78,6 +78,11 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
+# dev-only: deterministic instruction-count benchmarking (§8.6, ADR-0005) —
+# per-PR gate `instr-gate` (issue #46). Wraps Valgrind's Callgrind, so the
+# ci.yml job installs `valgrind` alongside the pinned `iai-callgrind-runner`
+# binary (exact version match required, per iai-callgrind's own docs).
+iai-callgrind = "=0.16.1"
 # --- internal crates (lockstep 0.0.1, SEED D-13) ---
 duckspout-types = { path = "crates/duckspout-types", version = "0.0.1" }
 duckspout-accept = { path = "crates/duckspout-accept", version = "0.0.1" }

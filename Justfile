@@ -127,7 +127,7 @@ conformance:
 coverage:
     bun scripts/lib/proc.mjs staged floors.mjs coverage
 
-# iai-callgrind instruction counts vs floors/instr-baselines/, +15% ceiling (Ⓜ v0.1)
+# iai-callgrind instruction counts vs floors/instr-baselines/, +15% ceiling (ci.yml:instr-gate)
 [group('floors')]
 instr-gate:
     bun scripts/lib/proc.mjs staged instr-gate.mjs
