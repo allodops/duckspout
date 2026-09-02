@@ -122,16 +122,6 @@ spec = "s§3.4"
 # --- staged, cadence = "pr" (future ci.yml jobs; s§6.1 lower table) ---
 
 [[gate]]
-id = "tla-mc-core"
-status = "staged"
-cadence = "pr"
-recipe = "tla-mc"
-workflow_job = ""
-milestone = "v0.1"
-issue = 43
-spec = "§8.1"
-
-[[gate]]
 id = "tla-mc-replication"
 status = "staged"
 cadence = "pr"
@@ -244,3 +234,17 @@ workflow_job = "ci.yml:pr-title"
 milestone = ""
 issue = 0
 spec = "CONTRIBUTING.md PR-title rule; release-plz feeds on squash subjects (D-13)"
+
+# Armed by the #43 arming PR (v0.1). Deliberately the LAST armed pr row so
+# `just ci` runs the multi-hour TLC sweep after every fast gate; in ci.yml
+# the tla-mc job fans the modules out as a matrix (ADR-0006: latency managed
+# by parallelism and caching, never paths-filters or nightly demotion).
+[[gate]]
+id = "tla-mc-core"
+status = "armed"
+cadence = "pr"
+recipe = "tla-mc"
+workflow_job = "ci.yml:tla-mc"
+milestone = ""
+issue = 43
+spec = "§8.1"
