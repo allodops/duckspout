@@ -76,18 +76,30 @@ pub struct OtlpGrpcAdapter;
 
 impl OtlpGrpcAdapter {
     /// Maps an OTLP error class onto a [`tonic::Status`] with the
-    /// spec-exact code and a diagnostic message. (The `RetryInfo` detail
-    /// payload on the `UNAVAILABLE` rows is attached once the overload
-    /// ladder's growing-delay policy exists to compute it — issue #33; the
-    /// status *codes* are complete and spec-exact now.)
+    /// spec-exact code and a diagnostic message. Exactly the
+    /// `carries_retry_info` rows get a `google.rpc.RetryInfo` detail with
+    /// `retry_after_ms` (§4.5's growing delay for the ladder rows; the
+    /// caller's fixed default for the rest); non-retryable rows carry no
+    /// detail — nothing non-retryable pretends to be (§4.6).
     #[must_use]
-    pub fn to_tonic_status(class: OtlpErrorClass, detail: &str) -> tonic::Status {
+    pub fn to_tonic_status(
+        class: OtlpErrorClass,
+        detail: &str,
+        retry_after_ms: u64,
+    ) -> tonic::Status {
         let code = match class.grpc_code() {
             duckspout_types::GrpcCode::InvalidArgument => tonic::Code::InvalidArgument,
             duckspout_types::GrpcCode::ResourceExhausted => tonic::Code::ResourceExhausted,
             duckspout_types::GrpcCode::Unavailable => tonic::Code::Unavailable,
         };
-        tonic::Status::new(code, format!("duckspout: {detail}"))
+        let message = format!("duckspout: {detail}");
+        if class.carries_retry_info() {
+            let mut details = tonic_types::ErrorDetails::new();
+            details.set_retry_info(Some(std::time::Duration::from_millis(retry_after_ms)));
+            <tonic::Status as tonic_types::StatusExt>::with_error_details(code, message, details)
+        } else {
+            tonic::Status::new(code, message)
+        }
     }
 
     /// Decodes one already-prost-decoded logs export into the fixed OTLP

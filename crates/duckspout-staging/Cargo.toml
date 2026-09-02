@@ -25,6 +25,12 @@ arrow = { workspace = true, optional = true }
 # engine).
 duckdb = { workspace = true, optional = true, features = ["appender-arrow"] }
 duckspout-types = { workspace = true }
+# serde_json encodes the dedup window's stored outcome (§4.4.1) — the
+# replayed ack evidence — as the entry's text column.
+serde_json = { workspace = true }
+# sha2 computes the §4.4.1 content hash over the decoded records (the
+# ClickHouse-convergent dedup key when no idempotency token is sent).
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use duckspout_accept::OtlpLogsService;
+use duckspout_accept::server::AdmissionConfig;
 use duckspout_staging::arrow::array::AsArray as _;
-use duckspout_staging::{EngineStager, StagingConfig, StagingEngine};
+use duckspout_staging::{EngineStager, StagerConfig, StagingConfig, StagingEngine};
 use duckspout_types::{
     BoxFuture, Clock, DatasetId, NodeId, PartitionId, Storage, StorageError, StoragePath, TenantId,
     WindowId,
@@ -162,7 +163,12 @@ async fn otlp_export_acked_then_rows_durably_present() {
     let stager = Arc::new(EngineStager::new(
         Arc::clone(&engine),
         FixedClock(AtomicU64::new(0)),
-        60_000_000_000,
+        StagerConfig {
+            window_nanos: 60_000_000_000,
+            dedup_ttl_ms: 24 * 60 * 60 * 1000,
+            dedup_max_entries: 100_000,
+            hot_max_bytes: u64::MAX,
+        },
     ));
 
     // The daemon's serving shape: the blocking engine commit runs inside
@@ -170,7 +176,14 @@ async fn otlp_export_acked_then_rows_durably_present() {
     // (production wraps the port in spawn_blocking at composition).
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let service = OtlpLogsService::new(Arc::clone(&stager)).into_server();
+    let service = OtlpLogsService::new(
+        Arc::clone(&stager),
+        AdmissionConfig {
+            max_payload_bytes: 4 * 1024 * 1024,
+            max_inflight_bytes: u64::MAX,
+        },
+    )
+    .into_server();
     tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(service)

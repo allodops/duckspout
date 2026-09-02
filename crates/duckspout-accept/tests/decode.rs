@@ -17,6 +17,7 @@ use opentelemetry_proto::tonic::common::v1::{
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message as _;
+use tonic_types::StatusExt as _;
 
 fn str_attr(key: &str, value: &str) -> KeyValue {
     KeyValue {
@@ -264,8 +265,10 @@ fn wire_decode_accepts_protobuf_and_rejects_garbage() {
 }
 
 /// Obligation 3: the adapter's wire mapping is exactly the types-crate OTLP
-/// error table — spec-exact codes, `RetryInfo` on precisely the UNAVAILABLE
-/// rows. Would catch an adapter that invents its own vocabulary.
+/// error table — spec-exact codes, and a `google.rpc.RetryInfo` detail on
+/// precisely the `carries_retry_info` rows (everything retryable says how
+/// to retry, nothing non-retryable pretends to be — §4.5, §4.6). Would
+/// catch an adapter that invents its own vocabulary.
 #[test]
 fn error_mapping_is_the_types_table_verbatim() {
     let all = [
@@ -282,8 +285,13 @@ fn error_mapping_is_the_types_table_verbatim() {
         let wire = OtlpGrpcAdapter.map_error(class);
         assert_eq!(wire.grpc_code, class.grpc_code());
         assert_eq!(wire.retry_info, class.carries_retry_info());
-        let status = OtlpGrpcAdapter::to_tonic_status(class, "detail");
+        let status = OtlpGrpcAdapter::to_tonic_status(class, "detail", 1_234);
         // The numeric gRPC code on the wire equals the table's code.
         assert_eq!(status.code() as u32, class.grpc_code().code());
+        assert_eq!(
+            status.get_details_retry_info().is_some(),
+            class.carries_retry_info(),
+            "{class:?}: RetryInfo on exactly the retryable rows"
+        );
     }
 }

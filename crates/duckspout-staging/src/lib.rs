@@ -43,7 +43,7 @@
 #![forbid(unsafe_code)]
 
 pub use duckspout_types::{
-    Clock, StageCommitter, StageError, StagedCoverage, Storage, StorageError,
+    Clock, StageCommitter, StageError, StageOutcome, StagedCoverage, Storage, StorageError,
 };
 
 pub mod naming;
@@ -58,11 +58,11 @@ pub mod seal;
 
 #[cfg(feature = "duckdb")]
 pub use engine::{
-    CHECKPOINT_THRESHOLD_DEFERRED, HOT_DB_FILE, StageTxn, StagingConfig, StagingEngine,
+    CHECKPOINT_THRESHOLD_DEFERRED, DedupEntry, HOT_DB_FILE, StageTxn, StagingConfig, StagingEngine,
     StagingError, StagingReader, WindowRef,
 };
 #[cfg(feature = "duckdb")]
-pub use stager::EngineStager;
+pub use stager::{EngineStager, StagerConfig};
 
 #[cfg(feature = "duckdb")]
 pub use seal::{EngineSealSurface, SEAL_SCRATCH_DIR};
