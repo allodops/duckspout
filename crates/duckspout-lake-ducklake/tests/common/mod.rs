@@ -33,6 +33,7 @@ pub fn open_committer(paths: &LakePaths) -> DuckLakeCommitter {
         catalog_uri: paths.catalog.display().to_string(),
         data_path: paths.data.display().to_string(),
         multi_process: false,
+        s3: None,
     })
     .expect("committer opens")
 }
@@ -48,6 +49,7 @@ pub fn open_committer_sqlite(dir: &Path, paths: &LakePaths) -> DuckLakeCommitter
         catalog_uri: format!("sqlite:{}", dir.join("catalog.sqlite").display()),
         data_path: paths.data.display().to_string(),
         multi_process: false,
+        s3: None,
     })
     .expect("sqlite-catalog committer opens")
 }

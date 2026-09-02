@@ -7,6 +7,13 @@
 // module independently and none uses all of it.
 #![allow(dead_code)]
 
+// The trace-capture choreography (§8.2): shared between the local-double
+// test (`trace_capture.rs`) and the real-backend capture
+// (`trace_capture_real_backends.rs`, issue #44) so the accept → staging →
+// drain composition the trace format asserts exists exactly once (DRY) —
+// only the lake backend the caller hands in differs.
+pub mod capture;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};

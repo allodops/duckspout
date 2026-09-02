@@ -671,6 +671,9 @@ async fn open_lake(
         // #119) never needs to reject a DuckDB-file catalog — that
         // restriction is replication's (v0.2) concern.
         multi_process: false,
+        // v0.1 always drains to local NVMe (§9.1); no daemon config knob
+        // requests S3 yet, so the metadata connection never needs one.
+        s3: None,
     })?);
     ensure_otlp_logs_table(&committer).await?;
     let parts_store: Arc<dyn object_store::ObjectStore> = Arc::new(
