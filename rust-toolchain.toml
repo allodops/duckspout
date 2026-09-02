@@ -2,4 +2,8 @@
 # root Cargo.toml (`rust-version = "1.96"`); bump freely pre-1.0.
 [toolchain]
 channel = "1.98.0"
-components = ["rustfmt", "clippy"]
+# llvm-tools: cargo-llvm-cov's own dependency (ledger row `coverage-floor`,
+# armed by the #45 arming PR) — pinned explicitly rather than left to
+# cargo-llvm-cov's own auto-install fallback, same discipline as
+# rustfmt/clippy above.
+components = ["rustfmt", "clippy", "llvm-tools"]
