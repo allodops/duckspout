@@ -89,6 +89,62 @@ pub struct DuckLakeConfig {
     /// Whether more than one process will commit through this catalog.
     /// `true` rejects a `DuckDB`-file catalog at open (issue #119).
     pub multi_process: bool,
+    /// S3-compatible credentials the embedded `DuckDB` executor needs when
+    /// `data_path` is itself an `s3://` URI: `ducklake_add_data_files`
+    /// reads a sealed part's own footer to register it, so the *metadata*
+    /// connection needs read access to the object the drain's
+    /// `object_store` client just PUT — a second, independent credential
+    /// path from the drain's own S3 client (§6.1). `None` for a local
+    /// `data_path` (v0.1's only production topology, §9.1); the first
+    /// caller is the conformance gate's real-backend capture (§8.2, issue
+    /// #44), which is also the first thing in this repository to talk to
+    /// S3 at all.
+    pub s3: Option<S3Access>,
+}
+
+/// The S3-compatible endpoint + credentials `CREATE SECRET` needs
+/// (`DuckDB`'s own `httpfs` extension, trusted as documented per
+/// R-trust-official-docs:
+/// a secret's `ENDPOINT`/`URL_STYLE`/`USE_SSL` fields are exactly `MinIO`'s
+/// documented S3-compatibility knobs). Never logged: [`S3Access`]'s own
+/// `Debug` impl redacts the credential fields (§9.5).
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3Access {
+    /// `host:port`, no scheme (`DuckDB`'s `httpfs` `ENDPOINT` secret field
+    /// convention — `use_ssl` carries the scheme separately), e.g. `MinIO`'s
+    /// `127.0.0.1:9000`.
+    pub endpoint: String,
+    /// A region string `DuckDB`'s `httpfs` requires even against a
+    /// region-less endpoint like `MinIO`; any non-empty value is accepted by
+    /// the endpoint, `us-east-1` is the documented convention.
+    pub region: String,
+    /// The `MinIO`/S3 access key id. Redacted by this struct's [`Debug`]
+    /// impl (§9.5).
+    pub access_key_id: String,
+    /// The `MinIO`/S3 secret access key. Redacted by this struct's [`Debug`]
+    /// impl (§9.5).
+    pub secret_access_key: String,
+    /// `true` for `MinIO` and most self-hosted S3-compatible stores
+    /// (`URL_STYLE 'path'`); `false` for AWS S3's virtual-hosted style.
+    pub url_style_path: bool,
+    /// `false` for a plain-HTTP dev endpoint (`MinIO`'s default); `true` for
+    /// TLS-terminated S3.
+    pub use_ssl: bool,
+}
+
+impl std::fmt::Debug for S3Access {
+    // Secrets are never printed (§9.5) — same discipline as
+    // DuckLakeCommitter's own Debug impl.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Access")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .field("url_style_path", &self.url_style_path)
+            .field("use_ssl", &self.use_ssl)
+            .finish()
+    }
 }
 
 /// The catalog backend classes of issue #119.
@@ -154,6 +210,32 @@ impl DuckLakeCommitter {
         // replayed after the winner (module docs; §6.5's no-blind-retry).
         conn.execute_batch("SET ducklake_max_retry_count = 0;")
             .map_err(|e| backend(&e))?;
+        if let Some(s3) = &config.s3 {
+            // httpfs is DuckDB's own S3 client; ducklake_add_data_files
+            // resolves an s3:// DATA_PATH through it, so the metadata
+            // connection needs the same credential the drain's
+            // object_store client PUT the part with (struct docs).
+            conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+                .map_err(|e| LakeError::Backend(format!("install/load httpfs extension: {e}")))?;
+            conn.execute_batch(&format!(
+                "CREATE OR REPLACE SECRET duckspout_s3 (
+                     TYPE s3,
+                     KEY_ID '{}',
+                     SECRET '{}',
+                     ENDPOINT '{}',
+                     REGION '{}',
+                     URL_STYLE '{}',
+                     USE_SSL {}
+                 );",
+                sql_str_body(&s3.access_key_id),
+                sql_str_body(&s3.secret_access_key),
+                sql_str_body(&s3.endpoint),
+                sql_str_body(&s3.region),
+                if s3.url_style_path { "path" } else { "vhost" },
+                s3.use_ssl,
+            ))
+            .map_err(|e| LakeError::Backend(format!("create S3 secret: {e}")))?;
+        }
         let journal = match kind {
             // #119: the default rollback journal deadlocks the drain's
             // COMMIT against any open client transaction.
@@ -674,6 +756,7 @@ mod tests {
             catalog_uri: "/tmp/meta.ducklake".into(),
             data_path: "/tmp/data".into(),
             multi_process: true,
+            s3: None,
         })
         .expect_err("issue #119: duckdb-file catalogs are single-process");
         assert!(matches!(err, LakeError::Misconfigured(_)));

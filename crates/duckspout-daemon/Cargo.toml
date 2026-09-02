@@ -70,6 +70,12 @@ tempfile = { workspace = true }
 # survived past drain (Flight, wired in `wiring.rs`, only ever sees the hot
 # tier; `tests/e2e_boot.rs`'s module docs).
 duckdb = { workspace = true, features = ["appender-arrow"] }
+# The conformance gate's real-backend capture (§8.2, issue #44) is the
+# first thing in this repository to talk to S3: object_store's own client,
+# feature-gated here because it is dev-only — production wiring stays
+# local-filesystem at v0.1 (wiring.rs; no in-house candidate,
+# R-third-party-first).
+object_store = { workspace = true, features = ["aws"] }
 
 [lints]
 workspace = true

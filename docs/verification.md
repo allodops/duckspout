@@ -196,6 +196,23 @@ gracefully for a contributor without Docker; **the CI gate does not inherit
 that skip** — with the endpoint absent, the gate fails rather than
 reporting a green run that checked nothing.
 
+> **Flagged deviation (issue #44's arming PR).** Two scope narrowings, both
+> traceable to the same v0.1/RF = 1 boundary `specs/traces/IngestTrace.tla`'s
+> module header already argues: (1) the doctoring set is **three** of the
+> four table rows, not four — the Receipt row has no armed instrument at
+> RF = 1 (no receipts are ever journaled with a single replica), so it stays
+> undoctored here and arms with v0.2's receipted traces, the same deferral
+> the trace config's own omission of `WatermarkHonesty` already documents.
+> (2) the capture this variant validates is the **happy path** over real
+> MinIO + Postgres — it demonstrates the real credential/attach/PUT plumbing
+> works end to end, but does not itself force a genuine **Indeterminate**
+> resolution (that needs fault injection against the real catalog
+> connection, which is §8.4's CTK-distributed tier machinery, not yet
+> built). Real Indeterminate resolution stays exercised at v0.2/nightly by
+> that tier; this gate's job at v0.1 is proving the real-backend path
+> conforms and the doctoring teeth bite against it, not injecting faults
+> into it.
+
 ## §8.3 CTK, in-memory tier
 
 Runs on every CI run inside the armed `test` ledger row (workspace test

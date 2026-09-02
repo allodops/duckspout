@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // trace-conformance.mjs — the `conformance` ledger row's script (§8.2;
-// staged, arms at v0.1 via issue #44). Three tiers, fail-closed:
+// armed at v0.1 by issue #44). Three tiers, fail-closed:
 //
 //   1. FIXTURES (the teeth): every specs/fixtures/*-manifest.toml row runs —
 //      the conforming traces must pass refinement, and every doctored trace
@@ -13,11 +13,21 @@
 //      tests/trace_capture.rs) and validated against the refinement spec —
 //      a static fixture certifies capture day; the fresh trace certifies
 //      the code under test.
-//   3. REAL BACKENDS (MinIO + Postgres): STAGED — its inputs (CI service
-//      containers and the real-backend capture profile) do not exist yet;
-//      they land with the #44 arming PR. Reported staged, never as success
-//      (s§5.1), so this script exits 78 overall even when tiers 1–2 are
-//      green.
+//   3. REAL BACKENDS (MinIO + Postgres, issue #44): a FRESH trace is
+//      captured against real MinIO + Postgres
+//      (duckspout-daemon's tests/trace_capture_real_backends.rs, the same
+//      choreography as tier 2's composition — tests/common/capture.rs —
+//      over a real S3-compatible object store and a real Postgres
+//      DuckLake catalog instead of local doubles) and validated against
+//      the refinement spec, THEN doctored the same ways fixtures are
+//      (§8.2: "static fixtures would go stale the moment an adapter
+//      changed", so this tier doctors the trace it just generated rather
+//      than comparing it to a committed fixture) — each doctored variant
+//      must fail through exactly its named mechanism, same one-tooth
+//      discipline as tier 1. Endpoint env vars absent: fails in CI
+//      (`CI=true`, fail-closed per §8.2 — a gate that cannot run fails, it
+//      does not shrug), skips with a notice for a contributor without
+//      Docker running this outside CI.
 //
 // Mechanism assertions read TLC's own output: a refinement halt prints
 // <<"TraceHalt", N>> from the failed POSTCONDITION (N = the 1-based NDJSON
@@ -178,6 +188,167 @@ async function liveTier(vocabulary) {
   info("  fresh capture conforms");
 }
 
+// ---------------------------------------------------------------------------
+// Tier 3: real backends (MinIO + Postgres, issue #44). Connection facts come
+// in one env var per fact (never a pre-assembled DSN/URL) — the same
+// convention `.github/workflows/ci.yml`'s `conformance` job and
+// `trace_capture_real_backends.rs` share.
+// ---------------------------------------------------------------------------
+const REAL_BACKEND_ENV = [
+  "DUCKSPOUT_CONFORMANCE_S3_ENDPOINT",
+  "DUCKSPOUT_CONFORMANCE_S3_BUCKET",
+  "DUCKSPOUT_CONFORMANCE_S3_ACCESS_KEY_ID",
+  "DUCKSPOUT_CONFORMANCE_S3_SECRET_ACCESS_KEY",
+  "DUCKSPOUT_CONFORMANCE_POSTGRES_DSN",
+];
+
+/** Renumber (node, seq) densely per node, in the given order (D-6) — every
+ * doctoring below removes one or two entries and must re-densify the rest. */
+function renumber(records) {
+  const next = new Map();
+  return records.map((r) => {
+    const seq = next.get(r.node) ?? 0;
+    next.set(r.node, seq + 1);
+    return { node: r.node, seq, event: r.event };
+  });
+}
+
+const toNdjson = (records) => `${records.map((r) => JSON.stringify(r)).join("\n")}\n`;
+const parseTrace = (text) => text.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
+
+/** The §8.2 doctoring table, minus the Receipt row: v0.1 is RF = 1 (no
+ * receipts are ever journaled, module header of specs/traces/IngestTrace.tla)
+ * so that doctoring is not reachable here — armed at v0.2 with receipted
+ * traces, same deferral the trace config's own WatermarkHonesty omission
+ * documents. Each `make` returns `null` when the fresh capture's shape
+ * doesn't contain the step to remove (fails loud, never silently skipped).
+ */
+const REAL_BACKEND_DOCTORINGS = [
+  {
+    name: "mid-trace-stagecommit",
+    expect: "halt",
+    make(records) {
+      const idx = records.findIndex(
+        (r, i) =>
+          r.event === "StageCommit" &&
+          i < records.length - 1 &&
+          records.slice(i + 1).some((later) => later.event === "ClientAck"),
+      );
+      return idx === -1 ? null : renumber(records.filter((_, i) => i !== idx));
+    },
+  },
+  {
+    name: "trailing-lakecommit",
+    expect: "invariant",
+    invariant: "TraceComplete",
+    make(records) {
+      const idx = records.findLastIndex((r) => r.event === "LakeCommitOk");
+      if (idx === -1) return null;
+      const drop = new Set([idx]);
+      if (records[idx + 1]?.event === "DropWindow") drop.add(idx + 1);
+      return renumber(records.filter((_, i) => !drop.has(i)));
+    },
+  },
+  {
+    name: "trailing-clientack",
+    expect: "invariant",
+    invariant: "TraceComplete",
+    make(records) {
+      const last = records.length - 1;
+      return records[last]?.event === "ClientAck"
+        ? renumber(records.filter((_, i) => i !== last))
+        : null;
+    },
+  },
+];
+
+async function assertDoctoredMechanism(doctoring, records, vocabulary, scratch) {
+  const doctored = doctoring.make(records);
+  if (doctored === null)
+    fail(
+      `trace-conformance: real-backend doctoring '${doctoring.name}': the fresh capture has no matching step to remove — the composition's shape changed`,
+    );
+  const text = toNdjson(doctored);
+  const decodeError = decode(text, vocabulary);
+  if (decodeError !== null)
+    fail(
+      `trace-conformance: real-backend doctoring '${doctoring.name}': doctored trace rejected by the decoder (${decodeError}), expected mechanism '${doctoring.expect}' — a tooth is hiding behind another`,
+    );
+  const path = join(scratch, `ingest-real-${doctoring.name}.ndjson`);
+  await Bun.write(path, text);
+  const tlc = await refine(path);
+  if (tlc.code === 0)
+    fail(
+      `trace-conformance: real-backend doctoring '${doctoring.name}': TLC ACCEPTED a doctored trace — the '${doctoring.expect}' tooth went blunt`,
+    );
+  if (doctoring.expect === "halt") {
+    const at = haltCursor(tlc.out);
+    if (at === null)
+      fail(
+        `trace-conformance: real-backend doctoring '${doctoring.name}': expected a refinement halt, TLC printed no TraceHalt cursor`,
+      );
+    if (tlc.out.includes("is violated"))
+      fail(
+        `trace-conformance: real-backend doctoring '${doctoring.name}': an invariant fired before the expected refinement halt — wrong mechanism`,
+      );
+    info(`  real-backend doctoring '${doctoring.name}': refinement halt at entry ${at} — as required`);
+    return;
+  }
+  const wanted = `Invariant ${doctoring.invariant} is violated`;
+  if (!tlc.out.includes(wanted))
+    fail(
+      `trace-conformance: real-backend doctoring '${doctoring.name}': expected "${wanted}", not found in TLC output — wrong mechanism`,
+    );
+  info(`  real-backend doctoring '${doctoring.name}': ${doctoring.invariant} violated — as required`);
+}
+
+async function realBackendsTier(vocabulary) {
+  const missing = REAL_BACKEND_ENV.filter((name) => !process.env[name]);
+  if (missing.length > 0) {
+    if (process.env.CI === "true")
+      fail(
+        `trace-conformance: real-backend tier: CI must provide MinIO + Postgres (missing ${missing.join(", ")}) — an absent endpoint fails, it does not skip (§8.2)`,
+      );
+    notice(
+      `real-backend tier: ${missing.join(", ")} absent — skipping locally (Docker-optional dev convenience, §8.2; the CI gate does not inherit this skip)`,
+    );
+    return;
+  }
+  const scratch = mkdtempSync(join(tmpdir(), "duckspout-trace-real-"));
+  // "ingest-" prefix: tla.mjs tv pairs a trace with its *Trace.tla spec by
+  // filename prefix (<module>-*.ndjson ↔ <Module>Trace.tla) — see refine().
+  const fresh = join(scratch, "ingest-real-backends-capture.ndjson");
+  info("  capturing a fresh trace against real MinIO + Postgres (duckspout-daemon tests/trace_capture_real_backends.rs)");
+  const code = await run(
+    [
+      "cargo",
+      "nextest",
+      "run",
+      "-p",
+      "duckspout-daemon",
+      "--test",
+      "trace_capture_real_backends",
+      "--retries",
+      "0",
+    ],
+    { env: { ...process.env, DUCKSPOUT_TRACE_CAPTURE_OUT: fresh } },
+  );
+  if (code !== 0)
+    fail(`trace-conformance: real-backend capture failed (cargo nextest exit ${code}) — no fresh trace, no green (fail-closed)`);
+  if (!existsSync(fresh))
+    fail("trace-conformance: the real-backend capture test passed but wrote no trace — fail-closed");
+  const text = await Bun.file(fresh).text();
+  const decodeError = decode(text, vocabulary);
+  if (decodeError !== null) fail(`trace-conformance: real-backend capture failed decoding: ${decodeError}`);
+  const tlc = await refine(fresh);
+  if (tlc.code !== 0)
+    fail(`trace-conformance: the real-backend capture failed refinement (exit ${tlc.code}) — the implementation drifted from the model`);
+  info("  real-backend capture conforms");
+  const records = parseTrace(text);
+  for (const doctoring of REAL_BACKEND_DOCTORINGS)
+    await assertDoctoredMechanism(doctoring, records, vocabulary, scratch);
+}
+
 async function main() {
   for (const input of [join(TRACES, "IngestTrace.tla"), join(TRACES, "IngestTrace.cfg")]) {
     if (!existsSync(input)) {
@@ -188,12 +359,8 @@ async function main() {
   const vocabulary = await journaledVocabulary();
   await group("trace-conformance: fixtures (the teeth)", () => fixturesTier(vocabulary));
   await group("trace-conformance: live capture", () => liveTier(vocabulary));
-  // Real-backend tier: staged until #44 lands MinIO + Postgres capture
-  // profiles and CI service containers. Staged is never success (s§5.1).
-  notice(
-    "STAGED: real-backend tier (MinIO + Postgres capture, §8.2) — inputs land with the #44 arming PR; fixtures and live capture are green, overall verdict stays STAGED",
-  );
-  process.exit(STAGED);
+  await group("trace-conformance: real backends (MinIO + Postgres)", () => realBackendsTier(vocabulary));
+  notice("trace-conformance: fixtures, live capture, and real backends all conform");
 }
 
 await main();

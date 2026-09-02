@@ -150,11 +150,70 @@ jobs:
           MODULE: ${{ matrix.module }}
         run: just tla-mc "$MODULE"
 
+  # §8.2's trace-conformance gate (ledger row `conformance`, armed by issue
+  # #44): real MinIO + Postgres, the same images/credentials as
+  # deploy/compose/compose.yaml's dev-only conformance backends — an
+  # endpoint absent is a fail, never a skip (§8.2, s§5.1). MinIO is started
+  # by hand (`docker run`, not the `services:` block) because it needs the
+  # `server /data …` command override GH Actions' service-container config
+  # has no field for; Postgres's default image CMD already starts the
+  # server, so it is an ordinary service container. `just conformance` runs
+  # all three tiers (fixtures, live, real backends) for real.
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+        env:
+          POSTGRES_USER: duckspout
+          # Dev/CI-only credential for a loopback-bound container; never a
+          # production value (secrets are file paths, §9.5).
+          POSTGRES_PASSWORD: duckspout-dev
+          POSTGRES_DB: duckspout_catalog
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U duckspout -d duckspout_catalog"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Start MinIO (dev/CI-only conformance backend)
+        run: |
+          docker run -d --name duckspout-minio -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=duckspout \
+            -e MINIO_ROOT_PASSWORD=duckspout-dev \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data --console-address ":9001"
+          until docker exec duckspout-minio mc ready local; do sleep 2; done
+      - name: Create the conformance MinIO bucket
+        # The bundled `mc`'s implicit `local` alias (the same convenience
+        # `mc ready local` above and the image's own healthcheck in
+        # compose.yaml use) has no credentials for mutating calls — `mc mb`
+        # needs an authenticated alias, supplied here via `mc`'s documented
+        # MC_HOST_<alias> env-var form rather than a persisted `mc alias
+        # set` (nothing else in this container needs the credential to
+        # survive the step).
+        run: docker exec -e MC_HOST_local=http://duckspout:duckspout-dev@127.0.0.1:9000 duckspout-minio mc mb --ignore-existing local/duckspout-conformance
+      - env:
+          DUCKSPOUT_CONFORMANCE_S3_ENDPOINT: 127.0.0.1:9000
+          DUCKSPOUT_CONFORMANCE_S3_BUCKET: duckspout-conformance
+          DUCKSPOUT_CONFORMANCE_S3_ACCESS_KEY_ID: duckspout
+          DUCKSPOUT_CONFORMANCE_S3_SECRET_ACCESS_KEY: duckspout-dev
+          DUCKSPOUT_CONFORMANCE_POSTGRES_DSN: "postgres:dbname=duckspout_catalog host=127.0.0.1 port=5432 user=duckspout password=duckspout-dev"
+        run: just conformance
+
   # Fan-in: the single required mechanical check (SEED s§6.1). `if: always()`
   # so it runs even when a need fails; the step then fails unless every need
   # succeeded — a cancelled or skipped need is a failure, never a pass.
   ci-ok:
-    needs: [fmt, clippy, test, deny, docs, invariants, msrv, workflows, pr-title, tla-mc]
+    needs:
+      [fmt, clippy, test, deny, docs, invariants, msrv, workflows, pr-title, tla-mc, conformance]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
