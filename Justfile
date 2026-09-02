@@ -132,7 +132,7 @@ coverage:
 instr-gate:
     bun scripts/lib/proc.mjs staged instr-gate.mjs
 
-# 1M-record ingest smoke bound (§8.6) (Ⓜ v0.1)
+# 1M-record ingest smoke bound (§8.6) (ci.yml:smoke)
 [group('floors')]
 smoke:
     bun scripts/lib/proc.mjs staged smoke.mjs

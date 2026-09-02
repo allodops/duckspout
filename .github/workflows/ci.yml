@@ -3,12 +3,10 @@
 # Every job body after setup is `just <recipe>`: the chain is
 # GHA → just → scripts (SEED s§5). No `paths:` filters, ever (ADR-0006).
 #
-# Staged gates (smoke) are deliberately NOT jobs here — a permanently-red
-# or skipped-green job would poison the loop. Each lives as a staged row in
-# docs/arming-ledger.toml with a milestone and tracking issue; arming one =
-# add its job block + its ci-ok `needs:` entry + flip its ledger row, in one
-# protected-set PR (SEED s§6.1). conformance was armed by the #44 arming
-# PR; coverage-floor by the #45 arming PR; instr-gate by the #46 arming PR.
+# Per-PR staged gates are all armed as of this PR (SEED s§6.1): conformance
+# by the #44 arming PR, coverage-floor by #45, instr-gate by #46, smoke by
+# #47. A future staged gate follows the same pattern: add its job block +
+# its ci-ok `needs:` entry + flip its ledger row, in one protected-set PR.
 name: CI
 
 on:
@@ -257,6 +255,22 @@ jobs:
           instr-gate: "true"
       - run: just instr-gate
 
+  # §8.6's per-PR 1M-record ingest smoke gate (ledger row smoke, issue #47):
+  # the real daemon, release-mode, accept → stage → drain → DuckLake at
+  # volume — an order-of-magnitude regression catch, never a latency claim
+  # (ADR-0005 reserves that role for instr-gate). `--release` compiles the
+  # full dependency tree (including the bundled DuckDB C++ build) under yet
+  # another cargo profile from `test`'s dev profile, hence the long timeout.
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: just smoke
+
   # Fan-in: the single required mechanical check (SEED s§6.1). `if: always()`
   # so it runs even when a need fails; the step then fails unless every need
   # succeeded — a cancelled or skipped need is a failure, never a pass.
@@ -276,6 +290,7 @@ jobs:
         conformance,
         coverage-floor,
         instr-gate,
+        smoke,
       ]
     if: always()
     runs-on: ubuntu-latest
