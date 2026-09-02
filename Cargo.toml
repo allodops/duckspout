@@ -1,12 +1,10 @@
 # DuckSpout virtual workspace root (SEED s§3.1).
-# No root package; every member lives under crates/, spike/ is quarantined.
+# No root package; every member lives under crates/. spike/ was quarantined
+# here (D-11) and deleted at v0.1 once #35/#36 superseded it (issue #122).
 
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# A nested package that is neither member nor excluded breaks `cargo` invoked
-# inside it, so the exclude is mandatory, not optional (SEED D-11).
-exclude = ["spike"]
 
 [workspace.package]
 version = "0.0.1"
