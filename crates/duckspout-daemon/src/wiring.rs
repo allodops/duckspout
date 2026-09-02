@@ -15,6 +15,21 @@
 //!   the composition — see `note_closed_windows` below) and (b) drains every
 //!   window the coordinator reports eligible, through the real
 //!   `DuckLakeCommitter`.
+//! - **Watermark reconstruction at boot** (§6.8, ADR-0010; issue #153):
+//!   before the drain coordinator is built, [`Daemon::boot`] reads back
+//!   every committed window manifest through
+//!   [`duckspout_lake_ducklake::DuckLakeCommitter::read_manifests`] and
+//!   replays it through [`duckspout_watermark::WatermarkLedger::reconstruct`]
+//!   — the exact function the live drain path uses, run over the stored
+//!   record instead of as-it-happens (`reconstruct.rs`'s module docs: "one
+//!   rule, two entry points"). A never-drained node's lake has no manifests,
+//!   so this reduces to the empty ledger v0.1 used to hardcode; a restarting
+//!   node with prior commits gets the true per-partition dense-next window
+//!   back, so `DrainCoordinator`'s pre-commit fence does not reject the real
+//!   next window as `WindowAhead`. Deliberately **not** a `LakeCommitter`
+//!   port method (`read_manifests`'s own doc comment) — it stays a
+//!   `DuckLake`-specific boot read on the concrete committer this module
+//!   already binds.
 //! - The [`crate::status`] endpoint: `NodeId`, the overload rung, watermark
 //!   per partition, `drain_stalled` (§9.3, R-9).
 //! - **Arrow Flight serving** over the hot store (issue #39, PR #151,
@@ -41,16 +56,6 @@
 //!   default: "still optional/None by default"). Journaling turns on only
 //!   once the `conformance` ledger row arms (issue #44), which is a CI/CTK
 //!   concern, not a boot-wiring one.
-//! - **Watermark reconstruction from the lake's manifest history at boot**
-//!   (§6.8, `docs/design/drain.md`'s "Boot recovery obligation", ADR-0010):
-//!   `LakeCommitter` (the six-operation, backend-neutral contract, §6.4)
-//!   exposes no manifest-enumeration operation, so the daemon cannot
-//!   rebuild a restarted node's `WatermarkLedger` through the port alone.
-//!   v0.1 boots a fresh (empty) ledger every time — correct for a node that
-//!   has never drained before (this issue's smoke test), unsafe on restart
-//!   of a node with prior commits (`DrainCoordinator`'s dense-next fence
-//!   would then reject the true next window as "ahead"). Tracked as
-//!   issue #153.
 //! - **Multi-tenant dataset declarations** (§9.6.2): v0.1 ships exactly one
 //!   built-in dataset, `otlp_logs` (the OTLP adapter's fixed target); its
 //!   drain plan (`otlp_logs_drain_plan`) is hardcoded rather than read
@@ -128,6 +133,13 @@ pub enum BootError {
     /// `otlp_logs`' schema is a fixed, reviewed constant).
     #[error("dataset schema column has arrow type {0}, outside the supported lake subset")]
     UnsupportedSchemaColumn(String),
+    /// The lake's manifest record is corrupt — a duplicate window id (the
+    /// §6.6 fence makes one impossible via the normal drain path), an
+    /// overlapping-coverage or malformed row (§6.8, issue #153). Boot fails
+    /// closed rather than starting the watermark ledger from a guess (R-3):
+    /// an honest lake's own record always reconstructs.
+    #[error("reconstructing the watermark ledger from the lake's manifest record: {0}")]
+    WatermarkReconstruction(#[from] duckspout_watermark::ReconstructError),
 }
 
 /// How one background drain tick went — logged, not otherwise consumed
@@ -357,14 +369,19 @@ impl Daemon {
         let seal_surface = Arc::new(EngineSealSurface::new(Arc::clone(&engine)));
 
         let (committer, parts_store) = open_lake(config).await?;
+
+        // --- Watermark ledger: reconstructed from the lake's manifest
+        // --- record, never booted empty (§6.8, ADR-0010; issue #153) — see
+        // --- `reconstruct_watermark_ledger`.
+        let ledger = Arc::new(SharedLedger::new(reconstruct_watermark_ledger(&committer)?));
+
         let scratch_storage: Arc<dyn Storage> =
             Arc::new(FsStorage::create(config.node.data_dir.clone())?);
 
-        let ledger = Arc::new(SharedLedger::new(WatermarkLedger::new()));
         let drain = DrainCoordinator::new(
             Arc::clone(&seal_surface) as Arc<dyn SealSurface>,
             Arc::clone(&ledger) as Arc<dyn duckspout_types::WatermarkBookkeeping>,
-            Arc::clone(&committer),
+            Arc::clone(&committer) as Arc<dyn LakeCommitter>,
             parts_store,
             scratch_storage,
             Arc::new(clock) as Arc<dyn duckspout_types::Clock>,
@@ -649,6 +666,41 @@ fn note_closed_windows(stager: &Stager, seal_surface: &EngineSealSurface<FsStora
     }
 }
 
+/// Reconstructs the boot-time `WatermarkLedger` from the lake's manifest
+/// record (§6.8, ADR-0010; issue #153) — the module docs' "Watermark
+/// reconstruction at boot" bullet explains why this must run before the
+/// drain coordinator starts. A never-drained node's lake has no manifests,
+/// so this reduces to the empty ledger v0.1 used to hardcode — a strict
+/// generalization, not a behavior change for that case.
+///
+/// # Errors
+///
+/// [`BootError::Lake`] if the manifest read fails;
+/// [`BootError::WatermarkReconstruction`] if the lake's own record is
+/// corrupt — boot fails closed rather than guessing (R-3).
+fn reconstruct_watermark_ledger(
+    committer: &DuckLakeCommitter,
+) -> Result<WatermarkLedger, BootError> {
+    let manifests = committer.read_manifests()?;
+    let reconstruction = WatermarkLedger::reconstruct(manifests, &[], &[])?;
+    for stall in &reconstruction.stalls {
+        // Not fatal (module docs: temporary conservatism, never a false
+        // `complete`, R-9 disclosure) — the watermark simply stands below
+        // the stalled window until whatever it is waiting on resolves (a
+        // later window, a loss-ledger row at v0.2).
+        tracing::warn!(?stall, "watermark stalled below a recorded window at boot");
+    }
+    for manifest in &reconstruction.deferred {
+        tracing::warn!(
+            dataset = %manifest.dataset,
+            partition = %manifest.partition,
+            window = manifest.window_id.0,
+            "manifest deferred past a window-id gap at boot (orphan-reconcile candidate, §6.8)"
+        );
+    }
+    Ok(reconstruction.ledger)
+}
+
 /// Opens the lake committer and the parts object store (§6.1, §6.4,
 /// ADR-0010), and evolves the fixed `otlp_logs` table into existence
 /// (module docs of [`ensure_otlp_logs_table`]).
@@ -660,10 +712,10 @@ fn note_closed_windows(stager: &Stager, seal_surface: &EngineSealSurface<FsStora
 /// `lake.*` mapping).
 async fn open_lake(
     config: &DaemonConfig,
-) -> Result<(Arc<dyn LakeCommitter>, Arc<dyn object_store::ObjectStore>), BootError> {
+) -> Result<(Arc<DuckLakeCommitter>, Arc<dyn object_store::ObjectStore>), BootError> {
     std::fs::create_dir_all(&config.lake.uri)?;
     let catalog_uri = catalog_uri_with_secret(&config.catalog.dsn, &config.catalog.password_file)?;
-    let committer: Arc<dyn LakeCommitter> = Arc::new(DuckLakeCommitter::open(DuckLakeConfig {
+    let committer = Arc::new(DuckLakeCommitter::open(DuckLakeConfig {
         catalog_uri,
         data_path: config.lake.uri.clone(),
         // v0.1 is single-node (SCOPE, issue #38): exactly one process ever
@@ -675,7 +727,7 @@ async fn open_lake(
         // requests S3 yet, so the metadata connection never needs one.
         s3: None,
     })?);
-    ensure_otlp_logs_table(&committer).await?;
+    ensure_otlp_logs_table(&(Arc::clone(&committer) as Arc<dyn LakeCommitter>)).await?;
     let parts_store: Arc<dyn object_store::ObjectStore> = Arc::new(
         object_store::local::LocalFileSystem::new_with_prefix(&config.lake.uri)?,
     );

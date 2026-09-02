@@ -128,7 +128,7 @@ everything below it is one backend crate. The contract has six operations:
 | `replace_files` | Atomically swap named objects for named replacements. | **Emergency only** (operator-invoked repair, declared-loss annulment §9). Never scheduled, never on the drain path — its existence is not a license to compact. |
 | `evolve_schema` | Apply a monotone, lossless schema change (§2's type lattice). Idempotent; concurrent applications converge. | Commutative-join semantics make crash-retry and concurrent owners safe. |
 | `expire` | Whole-file DELETE of named parts (§3 `Expire`). | Metadata-only from the table's perspective; the physical DELETE is the object's second and last storage operation. The changelog-coverage guard (Keep Rule 10; `SnapshotCovered`, §3) is enforced above the port, before `expire` is ever called. |
-| `read_watermarks` | Return the last committed watermark state for named partitions. | The read-back half of Indeterminate resolution (§6.5) and of boot-time recovery (§5). |
+| `read_watermarks` | Return the last committed watermark state for named partitions. | The read-back half of Indeterminate resolution (§6.5). Insufficient alone for boot-time `WatermarkLedger` recovery — its row carries only `complete_through_ms`, not the dense per-partition window id the drain's fence needs; full recovery replays the manifest record instead (section 8, issue #153). |
 | `attach_info` | Return what a querying DuckDB needs to attach this lake (catalog URI, credentials shape, dialect quirks). | Feeds the catalog extension's bind (§7). |
 
 **First implementation: DuckLake** (`duckspout-lake-ducklake`). The
@@ -299,6 +299,26 @@ derivable from (a) the dense manifest sequence in the lake and (b) live hot
 staging state on the nodes. Nodes and claims are soft state throughout
 (`docs/design/replication.md`); watermarks are the only registry state that
 matters, and even they can be rebuilt.
+
+**Ordinary boot recovery** (every daemon start, not just PITR; issue #153).
+`duckspout-watermark`'s `WatermarkLedger::reconstruct(manifests, losses,
+staging)` replays a manifest history through the same advance rule the live
+path uses — "one rule, two entry points" (`reconstruct.rs` module docs) — so
+the recomputed state is the authoritative state, never a parallel
+approximation. `Daemon::boot` (`duckspout-daemon/src/wiring.rs`) calls it
+before the drain coordinator starts: manifests come from
+`DuckLakeCommitter::read_manifests`, a `DuckLake`-specific inherent method
+(not a `LakeCommitter` port operation — that would grow the port past its
+six critical-path operations for a boot-only read; the port's `Neutrality`
+Keep Rule, section 4, is unaffected). Losses (§5.8's ceremony) and live hot
+coverage (`AppliedWatermarkRow`) are v0.2 concerns not yet persisted, so v0.1
+reconstructs with empty `losses`/`staging` inputs; that only weakens the
+*diagnostic* classification of a blocking coverage hole
+(`reconstruct::CoverageHole::in_hot`), never the recomputed
+`complete_through` itself, which is a pure function of the manifest record
+alone. A future non-`DuckLake` backend wired into the daemon needs its own
+equivalent manifest read (or a promotion of this method onto the port,
+decided then).
 
 **Catalog PITR recovery procedure (sketch — full runbook in
 `docs/operations.md`):**
