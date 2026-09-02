@@ -35,7 +35,17 @@ const TEST_ARGS = [
   "--no-capture",
 ];
 
+// `cargo nextest run` compiles-then-runs in one invocation; on a cold CI
+// checkout the release build of the whole dependent crate graph (daemon +
+// bundled DuckDB) dominates and swamps any real per-PR timing signal —
+// measured locally (warm target dir) this looked like ~28s, on a fresh GHA
+// runner the SAME invocation took 886.9s, entirely compile time. §8.6's
+// bound is about the 1M-record SCENARIO, never build latency (that
+// conflation is exactly the distinction ADR-0005 draws for instr-gate too)
+// — so the build is run once, untimed, and only the second (already-built,
+// nextest-skips-recompiling) invocation is what `measure()` clocks.
 async function measure() {
+  await group("build smoke_volume (release, untimed)", () => run([...TEST_ARGS, "--no-run"]));
   const start = performance.now();
   const code = await group("run smoke_volume (release, 1M records)", () => run(TEST_ARGS));
   const elapsedSeconds = (performance.now() - start) / 1000;
