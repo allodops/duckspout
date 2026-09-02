@@ -141,20 +141,16 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
     /// orthogonal replication flag. `drain_stalled` is the drain's stall
     /// signal (v0.1: no drain exists, callers pass `false`);
     /// `replication_degraded` is replication's (v0.1: `false`).
-    ///
-    /// # Errors
-    ///
-    /// [`StageError::Backend`] if the engine's accounting is unreadable.
-    pub fn status(&self, drain_stalled: bool) -> Result<NodeStatus, StageError> {
-        let staged = self.engine.staged_bytes().map_err(|e| backend(&e))?;
-        Ok(NodeStatus {
+    #[must_use]
+    pub fn status(&self, drain_stalled: bool) -> NodeStatus {
+        NodeStatus {
             overload: OverloadStatus::from_measure(
-                staged,
+                self.engine.staged_bytes(),
                 self.config.hot_max_bytes,
                 drain_stalled,
             ),
             replication_degraded: false,
-        })
+        }
     }
 
     /// Count-cap dedup evictions so far (§4.4.1's below-horizon warning
@@ -281,7 +277,7 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
     /// checked before any work — and only here, so in-flight commits are
     /// never gated.
     fn admit(&self) -> Result<(), StageError> {
-        let staged = self.engine.staged_bytes().map_err(|e| backend(&e))?;
+        let staged = self.engine.staged_bytes();
         let max = self.config.hot_max_bytes;
         match OverloadStatus::from_measure(staged, max, false) {
             OverloadStatus::RefusingIngest => Err(StageError::RefusingIngest {

@@ -111,6 +111,45 @@ pub fn throttle_retry_delay_ms(staged_bytes: u64, max_bytes: u64) -> u64 {
     THROTTLE_RETRY_MIN_MS + (THROTTLE_RETRY_MAX_MS - THROTTLE_RETRY_MIN_MS) * position / span
 }
 
+/// The fill-scaled per-query byte budget's maximum multiplier (§7.8): at a
+/// completely full hot store the budget is twice its steady-state value. A
+/// constant, not a knob (R-12) — the base is the one configured number
+/// (`query.max_hot_bytes_per_query`).
+pub const QUERY_BUDGET_MAX_SCALE: u64 = 2;
+
+/// §7.8's fill-scaled per-query byte budget: `base_bytes` steady-state,
+/// scaling **up** linearly with the hot fill ratio once fill crosses the
+/// ladder's disclosure threshold ([`LADDER_DISCLOSE_PERCENT`]) — because
+/// when drains stall, hot is the *only* coverage and steady-state limits
+/// would kill querying exactly when it matters — reaching
+/// [`QUERY_BUDGET_MAX_SCALE`] × at 100% fill and clamping there. Scaling
+/// starts precisely where the pressure becomes a disclosed status: below
+/// it, steady state; a pure function, like the rung itself.
+///
+/// `max_bytes = 0` (no capacity configured — the fail-closed top rung,
+/// [`OverloadStatus::from_measure`]) yields the unscaled base: with no
+/// meaningful fill ratio the budget must not inflate.
+#[must_use]
+pub fn fill_scaled_budget(base_bytes: u64, staged_bytes: u64, max_bytes: u64) -> u64 {
+    if max_bytes == 0 {
+        return base_bytes;
+    }
+    let permille =
+        u64::try_from(u128::from(staged_bytes) * 1000 / u128::from(max_bytes)).unwrap_or(u64::MAX);
+    let onset = LADDER_DISCLOSE_PERCENT * 10;
+    if permille <= onset {
+        return base_bytes;
+    }
+    let span = LADDER_REFUSE_PERCENT * 10 - onset;
+    let position = (permille - onset).min(span);
+    let extra = u64::try_from(
+        u128::from(base_bytes) * u128::from(QUERY_BUDGET_MAX_SCALE - 1) * u128::from(position)
+            / u128::from(span),
+    )
+    .unwrap_or(u64::MAX);
+    base_bytes.saturating_add(extra)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +272,43 @@ mod tests {
             proptest::prop_assert!((THROTTLE_RETRY_MIN_MS..=THROTTLE_RETRY_MAX_MS).contains(&d_low));
             proptest::prop_assert!((THROTTLE_RETRY_MIN_MS..=THROTTLE_RETRY_MAX_MS).contains(&d_high));
             proptest::prop_assert!(d_low <= d_high);
+        }
+    }
+
+    /// §7.8's fill scaling: steady-state base at and below the disclosure
+    /// threshold, linear growth above it, exactly 2× at full, clamped
+    /// beyond — and no inflation when no capacity is configured.
+    #[test]
+    fn query_budget_scales_with_fill_from_disclose_to_full() {
+        let base = 2 * 1024 * 1024 * 1024_u64; // the 2 GiB default
+        let max = 100_000;
+        assert_eq!(fill_scaled_budget(base, 0, max), base);
+        assert_eq!(
+            fill_scaled_budget(base, 80_000, max),
+            base,
+            "onset is exclusive"
+        );
+        let mid = fill_scaled_budget(base, 90_000, max);
+        assert!(mid > base && mid < QUERY_BUDGET_MAX_SCALE * base);
+        assert_eq!(
+            fill_scaled_budget(base, 100_000, max),
+            QUERY_BUDGET_MAX_SCALE * base
+        );
+        assert_eq!(
+            fill_scaled_budget(base, 250_000, max),
+            QUERY_BUDGET_MAX_SCALE * base,
+            "clamped past full"
+        );
+        assert_eq!(
+            fill_scaled_budget(base, 123, 0),
+            base,
+            "no capacity, no inflation"
+        );
+        let mut last = 0;
+        for staged in (80_000..=100_000).step_by(500) {
+            let budget = fill_scaled_budget(base, staged, max);
+            assert!(budget >= last, "not monotone at staged={staged}");
+            last = budget;
         }
     }
 

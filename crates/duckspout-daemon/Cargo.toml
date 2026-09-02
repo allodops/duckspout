@@ -12,7 +12,11 @@ repository.workspace = true
 # docs): evolving `otlp_logs`' fixed Arrow schema into the lake needs the
 # same pinned Arrow types `logs_schema()` returns (compat-matrix row 1).
 arrow = { workspace = true }
+# The §7.4 Flight server half (serving.rs) rides arrow-flight + tonic;
+# futures supplies the stream combinators tonic's streaming responses need.
+arrow-flight = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
 config = { workspace = true }
 duckspout-accept = { workspace = true }
 duckspout-drain = { workspace = true }
@@ -37,7 +41,7 @@ serde_json = { workspace = true }
 # hot volume's capacity is read here, once, at boot.
 fs4 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "signal"] }
+tokio = { workspace = true, features = ["net", "signal", "sync"] }
 # The daemon binds the OTLP/gRPC listener directly (§9.6.1's
 # `node.otlp_listen`) — the accept crate builds the tonic service, never the
 # socket (§10.1). `tokio-stream` wraps that bound `TcpListener` into the

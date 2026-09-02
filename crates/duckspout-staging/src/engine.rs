@@ -52,6 +52,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
@@ -60,7 +61,7 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 use duckspout_types::{
-    BoxFuture, DatasetId, NodeId, OriginSeqRange, PartitionId, StagedCoverage, Storage,
+    BoxFuture, Clock, DatasetId, NodeId, OriginSeqRange, PartitionId, StagedCoverage, Storage,
     StoragePath, TenantId, WindowId,
 };
 
@@ -126,6 +127,29 @@ pub enum StagingError {
     /// around (§11).
     #[error("corrupt engine state: {0}")]
     Corrupt(String),
+    /// A guarded scan crossed its per-query byte budget (§7.8) — a typed
+    /// abort, **never truncation**: no partial result is returned.
+    #[error(
+        "scan aborted: {scanned_bytes} bytes crossed the per-query budget of \
+         {budget_bytes} (§7.8 — narrow the range, raise \
+         query.max_hot_bytes_per_query, or read the lake)"
+    )]
+    ScanBudgetExceeded {
+        /// Bytes accumulated when the budget check tripped.
+        scanned_bytes: u64,
+        /// The (fill-scaled) budget that was in force.
+        budget_bytes: u64,
+    },
+    /// A guarded scan crossed its deadline (§7.8) — a typed abort, never
+    /// truncation.
+    #[error(
+        "scan aborted: deadline of {deadline_ms} ms exceeded \
+         (§7.8 — narrow the range, raise query.hot_scan_deadline, or read the lake)"
+    )]
+    ScanDeadlineExceeded {
+        /// The deadline that was in force, in milliseconds.
+        deadline_ms: u64,
+    },
 }
 
 /// How to open a [`StagingEngine`].
@@ -184,8 +208,12 @@ struct WriterInner {
     window_hw: HashMap<(DatasetId, PartitionId), u64>,
     /// Total staged bytes across live windows — the running mirror of
     /// `sum(duckspout_windows.staged_bytes)`, the ladder's measure
-    /// numerator (§4.5).
-    staged_bytes: u64,
+    /// numerator (§4.5). Shared with the engine as an atomic so the
+    /// measure is readable **without the write mutex** — the serving
+    /// path's guard computation must never sit behind an open
+    /// `StageCommit` transaction (#114); writers update it while holding
+    /// the lock.
+    staged_bytes: Arc<AtomicU64>,
 }
 
 /// One live window's registry mirror: its table name plus its accounted
@@ -201,6 +229,9 @@ struct WindowMeta {
 /// scheme, and the storage-port boundary.
 pub struct StagingEngine<S: Storage> {
     writer: Mutex<WriterInner>,
+    /// The lock-free side of the staged-bytes measure (field docs on
+    /// [`WriterInner`]).
+    staged_bytes: Arc<AtomicU64>,
     storage: S,
     origin: NodeId,
     hot_dir: PathBuf,
@@ -269,7 +300,9 @@ impl<S: Storage> StagingEngine<S> {
         let applied = load_applied(&conn, &config.origin)?;
         let windows = load_windows(&conn)?;
         let window_hw = load_window_hw(&conn)?;
-        let staged_bytes = windows.values().map(|meta| meta.bytes).sum();
+        let staged_bytes = Arc::new(AtomicU64::new(
+            windows.values().map(|meta| meta.bytes).sum(),
+        ));
 
         // Name durability for hot.db and hot.db.wal (module docs; ADR-0003).
         block_on(storage.fsync_dir(StoragePath::new("")))?;
@@ -280,8 +313,9 @@ impl<S: Storage> StagingEngine<S> {
                 applied,
                 windows,
                 window_hw,
-                staged_bytes,
+                staged_bytes: Arc::clone(&staged_bytes),
             }),
+            staged_bytes,
             storage,
             origin: config.origin,
             hot_dir: config.hot_dir,
@@ -391,7 +425,7 @@ impl<S: Storage> StagingEngine<S> {
         writer.windows.remove(&key);
         // The dropped window's bytes leave the ladder measure with it
         // (§4.5: staged_bytes sums over LIVE staging tables).
-        writer.staged_bytes = writer.staged_bytes.saturating_sub(meta.bytes);
+        writer.staged_bytes.fetch_sub(meta.bytes, Ordering::SeqCst);
         Ok(true)
     }
 
@@ -419,11 +453,11 @@ impl<S: Storage> StagingEngine<S> {
     /// the rows (exact over what was appended; a proxy for on-disk bytes,
     /// which the engine's own compression makes unknowable per window).
     ///
-    /// # Errors
-    ///
-    /// [`StagingError::WriterPoisoned`].
-    pub fn staged_bytes(&self) -> Result<u64, StagingError> {
-        Ok(self.lock_writer()?.staged_bytes)
+    /// Lock-free by design: read from an atomic the write path maintains,
+    /// so a guard computation on the serve path never waits behind an open
+    /// `StageCommit` transaction (#114).
+    pub fn staged_bytes(&self) -> u64 {
+        self.staged_bytes.load(Ordering::SeqCst)
     }
 
     /// The live micro-window tables, sorted by (dataset, partition, window).
@@ -664,7 +698,7 @@ impl StageTxn<'_> {
             if let Some(meta) = self.writer.windows.get_mut(&key) {
                 meta.bytes += bytes;
             }
-            self.writer.staged_bytes += bytes;
+            self.writer.staged_bytes.fetch_add(bytes, Ordering::SeqCst);
         }
         let coverage = self.pending_coverage();
         for (partition, (_, last)) in &self.pending_applied {
@@ -906,6 +940,19 @@ impl Drop for StageTxn<'_> {
     }
 }
 
+/// The §7.8 per-scan guard values, computed by the serving layer per query
+/// (the byte budget fill-scaled via `fill_scaled_budget`, the deadline from
+/// `query.hot_scan_deadline`). The concurrency guard is not here: it gates
+/// *entry* to a scan and lives where scans are admitted, not inside one.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanGuards {
+    /// Per-query byte budget over the scanned batches' Arrow memory size.
+    pub max_bytes: u64,
+    /// Deadline as a span of [`Clock::monotonic_nanos`] time from the
+    /// scan's start.
+    pub deadline_nanos: u64,
+}
+
 /// A dedicated read connection (#114). Queries run on `DuckDB`'s MVCC
 /// snapshots of committed state and never touch the write mutex. For
 /// reading: the serve path and the drain own their query discipline —
@@ -932,6 +979,62 @@ impl StagingReader {
         let mut stmt = self.conn.prepare(sql)?;
         let batches: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
         Ok((stmt.schema(), batches))
+    }
+
+    /// [`Self::query_arrow`] under the §7.8 per-query guards: the byte
+    /// budget and the deadline are checked as each engine-produced batch
+    /// arrives, and a tripped guard is a **typed abort, never truncation**
+    /// — the partial result is discarded, not returned. Byte accounting is
+    /// the batches' in-memory Arrow size (the same unit as the ladder's
+    /// staged-bytes measure); the deadline is measured on the [`Clock`]
+    /// port. This is the cooperative half of enforcement — batch-granular
+    /// by construction; [`Self::interrupt_handle`] is the hard half a
+    /// serving layer arms for scans stuck *inside* one engine call.
+    ///
+    /// # Errors
+    ///
+    /// [`StagingError::ScanBudgetExceeded`] /
+    /// [`StagingError::ScanDeadlineExceeded`] for tripped guards;
+    /// [`StagingError::Engine`] for SQL or execution failures (including a
+    /// scan killed by [`Self::interrupt_handle`]).
+    pub fn query_arrow_guarded(
+        &self,
+        sql: &str,
+        clock: &dyn Clock,
+        guards: &ScanGuards,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), StagingError> {
+        let started = clock.monotonic_nanos();
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut scanned_bytes: u64 = 0;
+        let mut batches = Vec::new();
+        for batch in stmt.query_arrow([])? {
+            scanned_bytes = scanned_bytes.saturating_add(batch.get_array_memory_size() as u64);
+            if scanned_bytes > guards.max_bytes {
+                return Err(StagingError::ScanBudgetExceeded {
+                    scanned_bytes,
+                    budget_bytes: guards.max_bytes,
+                });
+            }
+            if clock.monotonic_nanos().saturating_sub(started) > guards.deadline_nanos {
+                return Err(StagingError::ScanDeadlineExceeded {
+                    deadline_ms: guards.deadline_nanos / 1_000_000,
+                });
+            }
+            batches.push(batch);
+        }
+        Ok((stmt.schema(), batches))
+    }
+
+    /// The engine-level interrupt handle for this read connection — the
+    /// hard half of the §7.8 deadline ("enforced via scan interrupt"): a
+    /// serving layer arms a watchdog that fires this when a scan is stuck
+    /// inside a single engine call, where the cooperative per-batch check
+    /// of [`Self::query_arrow_guarded`] cannot run. Interrupting fails the
+    /// in-flight statement on this connection only; the write path and
+    /// other readers are untouched.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> Arc<duckdb::InterruptHandle> {
+        self.conn.interrupt_handle()
     }
 
     /// Row count of one micro-window table, addressed by identity (the

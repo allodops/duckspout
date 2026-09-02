@@ -47,6 +47,6 @@ pub use ports::{
     StageError, StageOutcome, StagedCoverage, Storage, StorageError, StoragePath, Transport,
     TransportError, WatermarkBookkeeping, WireError, WireRequest,
 };
-pub use status::{NodeStatus, OverloadStatus, throttle_retry_delay_ms};
+pub use status::{NodeStatus, OverloadStatus, fill_scaled_budget, throttle_retry_delay_ms};
 pub use trace::{EnvironmentEvent, TraceEvent, TraceRecord, TraceSink};
 pub use watermark::{AppliedWatermarkRow, DimensionWatermarkRow, WatermarkRow};

@@ -430,7 +430,7 @@ fn ladder_throttles_at_95_and_refuses_at_100() {
         committed(stager.stage_blocking(&decoded("t", 100, 0)).unwrap());
         engine = Arc::clone(stager.engine());
     }
-    let staged = engine.staged_bytes().unwrap();
+    let staged = engine.staged_bytes();
     assert!(staged > 0, "accounting must see the staged batch");
 
     // A stager whose capacity puts the current fill at exactly 100%.
@@ -474,7 +474,7 @@ fn in_flight_work_completes_at_every_rung() {
         committed(stager.stage_blocking(&decoded("t", 10, 0)).unwrap());
         engine = Arc::clone(stager.engine());
     }
-    let staged = engine.staged_bytes().unwrap();
+    let staged = engine.staged_bytes();
 
     // An in-flight transaction (begun before the rung would gate it)
     // commits fine — the engine has no ladder, by design.
@@ -519,25 +519,25 @@ fn status_discloses_the_rung() {
         committed(stager.stage_blocking(&decoded("t", 100, 0)).unwrap());
         engine = Arc::clone(stager.engine());
     }
-    let staged = engine.staged_bytes().unwrap();
+    let staged = engine.staged_bytes();
 
     let (roomy, _, _) = stager_on(Arc::clone(&engine), config(staged * 100));
     assert_eq!(
-        roomy.status(false).unwrap().overload,
+        roomy.status(false).overload,
         duckspout_types::OverloadStatus::Normal
     );
     let (pressured, _, _) = stager_on(Arc::clone(&engine), config(staged * 100 / 90));
     assert_eq!(
-        pressured.status(false).unwrap().overload,
+        pressured.status(false).overload,
         duckspout_types::OverloadStatus::StagingPressure
     );
     assert_eq!(
-        pressured.status(true).unwrap().overload,
+        pressured.status(true).overload,
         duckspout_types::OverloadStatus::DrainStalled
     );
     let (full, _, _) = stager_on(engine, config(staged));
     assert_eq!(
-        full.status(false).unwrap().overload,
+        full.status(false).overload,
         duckspout_types::OverloadStatus::RefusingIngest
     );
 }
@@ -552,24 +552,20 @@ fn staged_bytes_track_commit_drop_and_reopen() {
     let after_commit;
     {
         let (stager, _, _) = stager_over(dir.path());
-        assert_eq!(stager.engine().staged_bytes().unwrap(), 0);
+        assert_eq!(stager.engine().staged_bytes(), 0);
         committed(stager.stage_blocking(&decoded("t", 100, 0)).unwrap());
-        after_commit = stager.engine().staged_bytes().unwrap();
+        after_commit = stager.engine().staged_bytes();
         assert!(after_commit > 0);
     }
     {
         let engine = open_engine(dir.path(), "node-a/1");
-        assert_eq!(
-            engine.staged_bytes().unwrap(),
-            after_commit,
-            "accounting is durable"
-        );
+        assert_eq!(engine.staged_bytes(), after_commit, "accounting is durable");
         assert!(
             engine
                 .drop_window(&dataset, &partition, WindowId(0))
                 .unwrap()
         );
-        assert_eq!(engine.staged_bytes().unwrap(), 0, "dropped bytes leave M");
+        assert_eq!(engine.staged_bytes(), 0, "dropped bytes leave M");
     }
 }
 
