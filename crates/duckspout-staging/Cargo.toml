@@ -36,6 +36,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # The tests' real-filesystem Storage impl handles Bytes payloads.
 bytes = { workspace = true }
+# The table-naming injectivity law (§2.3, §8.5) over arbitrary identifiers.
+proptest = { workspace = true }
 # The engine's own tests drive real DuckDB files (it IS the storage here);
 # the raw connection is the checkpoint-scheme control leg (#109 evidence).
 duckdb = { workspace = true, features = ["appender-arrow"] }

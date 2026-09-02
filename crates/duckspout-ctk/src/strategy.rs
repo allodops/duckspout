@@ -86,4 +86,26 @@ mod tests {
             assert!(strategy.next_index(pending) < pending);
         }
     }
+
+    proptest::proptest! {
+        /// The [`ScheduleStrategy`] contract as a law, over any seed and any
+        /// pending-size call history: the index stays `< pending`, and the
+        /// same construction replayed against the same call sequence makes
+        /// the same choices (R-determinism — the reproduction handle).
+        /// Would catch a modulo/cast bug at extreme pending sizes and any
+        /// hidden state or ambient randomness in the stream.
+        #[test]
+        fn contract_holds_for_any_seed_and_call_history(
+            seed in proptest::prelude::any::<u64>(),
+            pendings in proptest::collection::vec(1usize..=1 << 20, 1..64),
+        ) {
+            let mut first = SeededRandom::new(seed);
+            let mut second = SeededRandom::new(seed);
+            for pending in pendings {
+                let index = first.next_index(pending);
+                proptest::prop_assert!(index < pending);
+                proptest::prop_assert_eq!(index, second.next_index(pending));
+            }
+        }
+    }
 }

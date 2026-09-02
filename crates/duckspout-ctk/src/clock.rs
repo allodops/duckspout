@@ -1,15 +1,25 @@
 //! The virtual clock: the [`Clock`] port's deterministic double.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use duckspout_types::Clock;
+
+use crate::sync::atomic::{AtomicU64, Ordering};
 
 /// A clock that advances only when told to. Monotonic time starts at 0;
 /// wall time is derived from it (the CTK's schedules need one totally
 /// ordered notion of time, not two).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct VirtualClock {
     nanos: AtomicU64,
+}
+
+impl Default for VirtualClock {
+    // Spelled out (not derived) so the loom builds need no `Default` on
+    // loom's atomics — see `crate::sync`.
+    fn default() -> Self {
+        Self {
+            nanos: AtomicU64::new(0),
+        }
+    }
 }
 
 impl VirtualClock {

@@ -7,9 +7,33 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Compiles the doubles' own sync primitives against loom's checked types so
+# `tests/loom.rs` can explore every memory-model interleaving (§8.3). A cargo
+# feature rather than the upstream `--cfg loom` RUSTFLAGS convention: the
+# workspace pins lints via `[lints] workspace = true` (no per-crate
+# `check-cfg` seam without a build script), a feature needs no flag plumbing
+# in the task frontend, and `cargo hack --each-feature` (nightly) keeps the
+# combination compiling. Never enabled by another crate: loom's primitives
+# panic outside `loom::model`.
+loom = ["dep:loom"]
+
 [dependencies]
 bytes = { workspace = true }
 duckspout-types = { workspace = true }
+loom = { workspace = true, optional = true }
+
+[dev-dependencies]
+# §8.5's determinism laws for the scheduler/strategy contract over arbitrary
+# seeds, not example seeds.
+proptest = { workspace = true }
+
+[[test]]
+name = "loom"
+# Without the feature the loom models cannot compile (the lib's primitives
+# are std's); nextest then skips the target instead of green-running an
+# empty binary.
+required-features = ["loom"]
 
 [lints]
 workspace = true

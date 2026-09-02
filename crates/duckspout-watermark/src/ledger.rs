@@ -720,6 +720,125 @@ mod tests {
         );
     }
 
+    // --- §8.5 law suite: advance monotonicity under arbitrary
+    // --- manifest/loss interleavings (issue #40; extends the
+    // --- reconstruction≡live property in `reconstruct.rs`).
+
+    mod laws {
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::testutil::build_history;
+
+        /// Applies one accepted mutation and asserts the two monotone
+        /// quantities never move backwards across it.
+        fn assert_monotone(
+            ledger: &WatermarkLedger,
+            partition: &PartitionId,
+            before_ms: Option<i64>,
+            before_through: Option<WindowId>,
+        ) {
+            let after_ms = ledger.complete_through_ms(partition);
+            let after_through = ledger.advanced_through(partition);
+            assert!(
+                after_ms >= before_ms,
+                "complete_through regressed: {before_ms:?} -> {after_ms:?}"
+            );
+            assert!(
+                after_through >= before_through,
+                "advance cursor regressed: {before_through:?} -> {after_through:?}"
+            );
+        }
+
+        /// Attempts three mutations the ledger must reject — a window-id
+        /// gap, overlapping coverage (when any is committed), a malformed
+        /// loss range — and asserts each is a TOTAL no-op.
+        fn assert_rejections_are_no_ops(ledger: &mut WatermarkLedger, partition: &PartitionId) {
+            let before = ledger.clone();
+            let gap = ledger.next_window(partition).0 + 5;
+            let gapped = manifest(partition.as_str(), gap, &[("o1", 1_000, 1_001)], 0);
+            ledger
+                .record_commit(&gapped)
+                .expect_err("a window-id gap must be rejected");
+            if let Some(record) = ledger
+                .advanced_through(partition)
+                .and_then(|w| ledger.window_record(partition, w).cloned())
+                && let Some(range) = record.origin_coverage.first()
+            {
+                let next = ledger.next_window(partition).0;
+                let mut overlap = manifest(partition.as_str(), next, &[], 0);
+                overlap.origin_coverage = vec![range.clone()];
+                ledger
+                    .record_commit(&overlap)
+                    .expect_err("re-committing committed coverage must be rejected");
+            }
+            ledger
+                .record_loss(&loss(partition.as_str(), "o1", 0, 3))
+                .expect_err("a 0-based loss range must be rejected");
+            assert_eq!(*ledger, before, "a rejected mutation must change nothing");
+        }
+
+        proptest! {
+            /// `WatermarkHonesty`'s monotone half as a law (§6.8, §3): under
+            /// ANY interleaving of committed manifests and loss-ledger rows
+            /// — holes revealed then excused, all-late windows, losses
+            /// landing before their hole is even visible — `complete_through`
+            /// and the advance cursor never move backwards, and every
+            /// rejected mutation (window gap, overlapping coverage,
+            /// malformed range) is a total no-op. Would catch: an advance
+            /// rule that re-derives `complete_through` from the newest
+            /// window alone (an all-late window would regress it), a loss
+            /// row recomputing the cursor from scratch, or a rejection that
+            /// leaves partial coverage behind (the probe-set design exists
+            /// exactly to prevent that).
+            #[test]
+            fn watermark_never_regresses_under_any_interleaving(
+                plans in prop::collection::vec(
+                    prop::collection::vec(
+                        prop::option::of((1u8..=4, 0u8..=3, any::<bool>())),
+                        3,
+                    ),
+                    1..=6,
+                ),
+                event_maxes in prop::collection::vec(-100i16..=1000, 6),
+                dedups in prop::collection::vec(0u8..=3, 6),
+                picks in prop::collection::vec(any::<bool>(), 24),
+            ) {
+                let partition = PartitionId::new("pa");
+                let (manifests, losses) = build_history("pa", &plans, &event_maxes, &dedups);
+
+                // Interleave: `picks` chooses commit vs. loss at each step;
+                // commits keep their dense order (the ledger enforces it),
+                // losses keep generation order — the interleaving point is
+                // the free variable.
+                let mut ledger = WatermarkLedger::new();
+                let mut commits = manifests.iter();
+                let mut loss_rows = losses.iter();
+                let mut picks = picks.iter();
+                loop {
+                    let take_commit = *picks.next().unwrap_or(&true);
+                    let before_ms = ledger.complete_through_ms(&partition);
+                    let before_through = ledger.advanced_through(&partition);
+                    if take_commit {
+                        let Some(m) = commits.next() else { break };
+                        ledger.record_commit(m).expect("dense history commits");
+                    } else {
+                        let Some(row) = loss_rows.next() else { continue };
+                        ledger.record_loss(row).expect("loss records");
+                    }
+                    assert_monotone(&ledger, &partition, before_ms, before_through);
+                }
+                for row in loss_rows {
+                    let before_ms = ledger.complete_through_ms(&partition);
+                    let before_through = ledger.advanced_through(&partition);
+                    ledger.record_loss(row).expect("loss records");
+                    assert_monotone(&ledger, &partition, before_ms, before_through);
+                }
+                assert_rejections_are_no_ops(&mut ledger, &partition);
+            }
+        }
+    }
+
     #[test]
     fn loss_for_an_unknown_partition_records_without_a_watermark() {
         let mut ledger = WatermarkLedger::new();

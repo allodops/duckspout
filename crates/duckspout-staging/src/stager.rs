@@ -370,3 +370,75 @@ fn parse_outcome(outcome_json: &str) -> Result<Vec<StagedCoverage>, StagingError
 fn backend(error: &StagingError) -> StageError {
     StageError::Backend(error.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use duckspout_types::{DatasetId, DatasetKind, TenantId};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn batch(records: Vec<u8>, token: Option<String>) -> DecodedBatch {
+        DecodedBatch {
+            dataset: DatasetId::new("otlp_logs"),
+            kind: DatasetKind::Event,
+            tenant: TenantId::new("t"),
+            idempotency_key: token,
+            records: Bytes::from(records),
+        }
+    }
+
+    proptest! {
+        /// §8.5's dedup-determinism laws (issue #40) over the §4.4.1 key
+        /// derivation, as pure-function properties — the engine-level replay
+        /// behavior is exercised in `tests/stager.rs`; these pin the key
+        /// itself for ANY content and token:
+        ///
+        /// - equal `(content | token)` inputs derive equal keys, and the key
+        ///   reads NOTHING else (would catch a nonce, a timestamp, or batch
+        ///   metadata leaking into the key — every retry would then miss the
+        ///   window and duplicate);
+        /// - a token makes the key content-independent (§4.4.1 precedence —
+        ///   would catch content sneaking back in, where a client's retry
+        ///   with a re-encoded body would double-stage);
+        /// - token-derived and content-derived keys never collide, even for
+        ///   a token forged to look like a content hash (the `t:`/`h:`
+        ///   prefix discrimination — would catch the prefixes being
+        ///   dropped);
+        /// - distinct contents derive distinct keys (the content hash doing
+        ///   its job).
+        #[test]
+        fn dedup_key_is_a_pure_function_of_content_or_token(
+            content_a in prop::collection::vec(any::<u8>(), 0..64),
+            content_b in prop::collection::vec(any::<u8>(), 0..64),
+            token in ".{0,32}",
+        ) {
+            // Determinism + content-only dependence.
+            prop_assert_eq!(
+                dedup_key(&batch(content_a.clone(), None)),
+                dedup_key(&batch(content_a.clone(), None))
+            );
+            // Token precedence: content is invisible under a token.
+            prop_assert_eq!(
+                dedup_key(&batch(content_a.clone(), Some(token.clone()))),
+                dedup_key(&batch(content_b.clone(), Some(token.clone())))
+            );
+            // Prefix discrimination: a token can never collide with any
+            // content-derived key — including a token spelled exactly like
+            // one.
+            let content_key = dedup_key(&batch(content_a.clone(), None));
+            prop_assert_ne!(
+                dedup_key(&batch(content_b.clone(), Some(content_key.clone()))),
+                content_key
+            );
+            // Distinct contents → distinct keys.
+            if content_a != content_b {
+                prop_assert_ne!(
+                    dedup_key(&batch(content_a, None)),
+                    dedup_key(&batch(content_b, None))
+                );
+            }
+        }
+    }
+}

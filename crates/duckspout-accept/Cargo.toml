@@ -25,6 +25,9 @@ tonic = { workspace = true }
 tonic-types = { workspace = true }
 
 [dev-dependencies]
+# §8.5's codec laws (decode → IPC round-trip, tenant-charset totality) over
+# arbitrary OTLP payloads, not examples.
+proptest = { workspace = true }
 # The in-process gRPC tests bind an ephemeral loopback listener and stream
 # it into tonic — dev-only; production sockets belong to the daemon.
 tokio = { workspace = true, features = ["net"] }

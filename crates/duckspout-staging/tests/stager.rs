@@ -573,6 +573,83 @@ fn staged_bytes_track_commit_drop_and_reopen() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// §8.5 law suite (issue #40): replay-returns-original under arbitrary retry
+// interleavings — exhaustive over every arrival order at a tiny scope
+// (§3.1's posture), not sampled.
+// ---------------------------------------------------------------------------
+
+/// For EVERY arrival order of {A, A-retried, B, C} (all 24 permutations —
+/// the 12 distinct multiset arrangements, each reached twice because the
+/// duplicate pair is content-identical), the retry replays exactly the
+/// original's committed
+/// coverage — wherever it lands in the interleaving — and the final staged
+/// state holds each batch exactly once with a dense sequence. The
+/// example-based tests above pin single orders; this quantifies the §4.4.1
+/// law they instantiate. Would catch: a dedup entry written after commit
+/// instead of inside it (an interleaving-dependent duplicate), a stored
+/// outcome that depends on when the retry arrives, or a replay that
+/// consumes sequence numbers.
+#[test]
+fn replay_returns_the_original_under_every_retry_interleaving() {
+    // 0 and 1 are the duplicate pair; 2 and 3 are distinct bystanders.
+    let batches = |i: usize| match i {
+        0 | 1 => decoded("t", 2, 1_000),
+        2 => decoded("t", 1, 2_000),
+        _ => decoded("t", 3, 3_000),
+    };
+    let mut orders: Vec<[usize; 4]> = Vec::new();
+    for a in 0..4 {
+        for b in 0..4 {
+            for c in 0..4 {
+                for d in 0..4 {
+                    let mut seen = [false; 4];
+                    for i in [a, b, c, d] {
+                        seen[i] = true;
+                    }
+                    if seen == [true; 4] {
+                        orders.push([a, b, c, d]);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(orders.len(), 24);
+
+    for order in orders {
+        let dir = tempfile::tempdir().unwrap();
+        let (stager, _, _) = stager_over(dir.path());
+        let mut original: Option<Vec<duckspout_types::StagedCoverage>> = None;
+        for index in order {
+            let outcome = stager.stage_blocking(&batches(index)).unwrap();
+            match (index, &original) {
+                // First arrival of the duplicate pair commits…
+                (0 | 1, None) => original = Some(committed(outcome)),
+                // …and the other one replays IDENTICAL coverage, whenever
+                // it arrives.
+                (0 | 1, Some(first)) => {
+                    assert_eq!(
+                        &replayed(outcome),
+                        first,
+                        "order {order:?}: the retry must replay the original's ack evidence"
+                    );
+                }
+                _ => {
+                    committed(outcome);
+                }
+            }
+        }
+        // Exactly one copy of the duplicate pair landed: 2 + 1 + 3 rows,
+        // densely sequenced.
+        let partition = PartitionId::from_tenant_shard(&duckspout_types::TenantId::new("t"), 0);
+        assert_eq!(
+            stager.engine().applied_seq(&partition).unwrap(),
+            Some(6),
+            "order {order:?}: duplicate rows leaked into staging"
+        );
+    }
+}
+
 /// Drives a ready-or-not future to completion on this thread.
 fn pollster_block_on<T>(mut future: duckspout_types::BoxFuture<'_, T>) -> T {
     use std::task::{Context, Poll, Wake, Waker};

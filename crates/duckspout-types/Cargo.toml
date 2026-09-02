@@ -13,5 +13,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# §8.5's serialization-stability laws (trace NDJSON, the frozen manifest)
+# are properties over arbitrary payloads, not examples.
+proptest = { workspace = true }
+
 [lints]
 workspace = true

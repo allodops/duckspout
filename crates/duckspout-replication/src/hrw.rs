@@ -151,5 +151,58 @@ mod tests {
                 prop_assert!(new == old || new.as_str() == new_name);
             }
         }
+
+        /// Minimal disruption on removal (§8.5's "removing one node
+        /// reassigns only the partitions that node loses"), over arbitrary
+        /// memberships and an arbitrary victim — the exact dual of the add
+        /// law, quantified rather than fixed at 3→2 nodes like the unit
+        /// test above. Would catch a score that mixes membership into the
+        /// hash: a survivor's partition would move.
+        #[test]
+        fn minimal_disruption_on_arbitrary_remove(
+            names in proptest::collection::btree_set("[a-z]{1,8}", 2..12),
+            victim_index in proptest::prelude::any::<proptest::sample::Index>(),
+            parts in proptest::collection::vec("[a-z0-9/]{1,16}", 1..64),
+        ) {
+            let before: Vec<NodeId> = names.iter().map(NodeId::new).collect();
+            let victim = before[victim_index.index(before.len())].clone();
+            let after: Vec<NodeId> =
+                before.iter().filter(|n| **n != victim).cloned().collect();
+            for raw in parts {
+                let partition = PartitionId::new(raw);
+                let old = hrw_owner(&partition, &before).expect("nonempty");
+                let new = hrw_owner(&partition, &after).expect("nonempty");
+                prop_assert!(*old == victim || new == old,
+                    "{partition}: a survivor's partition moved from {old} to {new}");
+            }
+        }
+
+        /// The exactness form of minimal disruption, one level stronger
+        /// than the owner laws: removing a node merely DELETES it from the
+        /// full HRW ranking — every survivor keeps its relative order. The
+        /// ranking is the replica set (indices 1..RF) and the §4.3 ring
+        /// walk-down, so this is what makes membership change move only
+        /// the departed node's replica load. Implies both owner laws.
+        /// Would catch any per-(partition, node) score that is not
+        /// membership-independent.
+        #[test]
+        fn removal_projects_the_ranking_exactly(
+            names in proptest::collection::btree_set("[a-z]{1,8}", 2..12),
+            victim_index in proptest::prelude::any::<proptest::sample::Index>(),
+            parts in proptest::collection::vec("[a-z0-9/]{1,16}", 1..32),
+        ) {
+            let before: Vec<NodeId> = names.iter().map(NodeId::new).collect();
+            let victim = before[victim_index.index(before.len())].clone();
+            let after: Vec<NodeId> =
+                before.iter().filter(|n| **n != victim).cloned().collect();
+            for raw in parts {
+                let partition = PartitionId::new(raw);
+                let projected: Vec<&NodeId> = hrw_ranked(&partition, &before)
+                    .into_iter()
+                    .filter(|n| **n != victim)
+                    .collect();
+                prop_assert_eq!(projected, hrw_ranked(&partition, &after));
+            }
+        }
     }
 }

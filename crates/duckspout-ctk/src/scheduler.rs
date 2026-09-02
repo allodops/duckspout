@@ -239,6 +239,18 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    proptest::proptest! {
+        /// The §8.3 reproduction handle as a law: for ANY seed — not a
+        /// sampled example — the schedule replays bit-for-bit, and every
+        /// task completes. Would catch ambient nondeterminism leaking into
+        /// the executor (hash-map iteration order, real time, thread
+        /// scheduling) that a single pinned seed can easily miss.
+        #[test]
+        fn any_seed_replays_bit_for_bit(seed in proptest::prelude::any::<u64>()) {
+            proptest::prop_assert_eq!(record_order(seed), record_order(seed));
+        }
+    }
+
     #[test]
     fn custom_strategy_steers_the_schedule() {
         let scheduler =

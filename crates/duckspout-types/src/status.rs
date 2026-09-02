@@ -171,6 +171,71 @@ mod tests {
         );
     }
 
+    /// The numeric rung a status sits on — the yardstick the ladder laws
+    /// below compare with. The two rung-1 labels are the same rung (§4.5).
+    fn rung_level(status: OverloadStatus) -> u8 {
+        match status {
+            OverloadStatus::Normal => 0,
+            OverloadStatus::StagingPressure | OverloadStatus::DrainStalled => 1,
+            OverloadStatus::Throttling => 2,
+            OverloadStatus::RefusingIngest => 3,
+        }
+    }
+
+    proptest::proptest! {
+        /// `LadderMonotone`'s fill half as a law (§4.5, §8.5; issue #40):
+        /// for ANY capacity and ANY pair of fills, more staged bytes never
+        /// yields a lower rung — over the full u64 domain, where the
+        /// boundary-sweep unit test above cannot reach. Would catch an
+        /// inverted threshold comparison or an overflow in the widened
+        /// `M ≥ p%` arithmetic (exactly where `staged · 100` exceeds u64).
+        #[test]
+        fn rung_is_monotone_in_fill(
+            fill_a in proptest::prelude::any::<u64>(),
+            fill_b in proptest::prelude::any::<u64>(),
+            max in proptest::prelude::any::<u64>(),
+            stalled in proptest::prelude::any::<bool>(),
+        ) {
+            let (low, high) = (fill_a.min(fill_b), fill_a.max(fill_b));
+            proptest::prop_assert!(
+                rung_level(OverloadStatus::from_measure(low, max, stalled))
+                    <= rung_level(OverloadStatus::from_measure(high, max, stalled))
+            );
+        }
+
+        /// `drain_stalled` selects rung 1's LABEL only — for ANY measure it
+        /// never moves the rung itself (§4.5). Would catch the flag leaking
+        /// into the throttle/refuse decisions.
+        #[test]
+        fn stalled_flag_never_changes_the_rung(
+            staged in proptest::prelude::any::<u64>(),
+            max in proptest::prelude::any::<u64>(),
+        ) {
+            proptest::prop_assert_eq!(
+                rung_level(OverloadStatus::from_measure(staged, max, true)),
+                rung_level(OverloadStatus::from_measure(staged, max, false))
+            );
+        }
+
+        /// §4.5's growing delay as a law: for ANY measure the delay stays in
+        /// `[THROTTLE_RETRY_MIN_MS, THROTTLE_RETRY_MAX_MS]` and never
+        /// shrinks as fill grows — a delay that dips under pressure would
+        /// invite retries exactly when the node most needs them not to come.
+        #[test]
+        fn throttle_delay_is_bounded_and_monotone(
+            fill_a in proptest::prelude::any::<u64>(),
+            fill_b in proptest::prelude::any::<u64>(),
+            max in proptest::prelude::any::<u64>(),
+        ) {
+            let (low, high) = (fill_a.min(fill_b), fill_a.max(fill_b));
+            let (d_low, d_high) =
+                (throttle_retry_delay_ms(low, max), throttle_retry_delay_ms(high, max));
+            proptest::prop_assert!((THROTTLE_RETRY_MIN_MS..=THROTTLE_RETRY_MAX_MS).contains(&d_low));
+            proptest::prop_assert!((THROTTLE_RETRY_MIN_MS..=THROTTLE_RETRY_MAX_MS).contains(&d_high));
+            proptest::prop_assert!(d_low <= d_high);
+        }
+    }
+
     /// The throttle delay grows monotonically across the 95..100 band and
     /// clamps to its documented floor and ceiling.
     #[test]
