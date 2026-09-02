@@ -1,6 +1,6 @@
 [package]
 name = "duckspout-lake-ducklake"
-description = "The first LakeCommitter backend: DuckLake over a Postgres catalog. The only crate that knows DuckLake."
+description = "The first LakeCommitter backend: DuckLake through the ducklake extension's committed surface. The only crate that knows DuckLake."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The embedded metadata-commit executor (ADR-0002 bundled engine; the
+# ducklake extension is INSTALLed/LOADed at open, cached in ~/.duckdb).
+duckdb = { workspace = true }
 duckspout-types = { workspace = true }
+# The §6.8 manifest record's origin-coverage column is stored as JSON.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The published conformance suite this backend self-certifies against
+# (§6.4, §10.3).
+duckspout-lake-contract = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -807,7 +807,11 @@ dependencies = [
 name = "duckspout-lake-ducklake"
 version = "0.0.1"
 dependencies = [
+ "duckdb",
+ "duckspout-lake-contract",
  "duckspout-types",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
