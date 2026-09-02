@@ -63,6 +63,13 @@ tempfile = "3"
 # (R-third-party-first).
 tokio-stream = { version = "0.1", features = ["net"] }
 bytes = "1"
+# The daemon's composition root only (§10.1): the `hot.max_bytes` §9.6.1
+# default ("75% of volume at startup") needs the hot volume's total
+# capacity. Every crate in this workspace commits to
+# `#![forbid(unsafe_code)]`, so a raw `statvfs` FFI call is not an option
+# here — `fs4` is the safe, cross-platform wrapper (no in-house candidate
+# for a safe disk-capacity read, R-third-party-first).
+fs4 = "0.9"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

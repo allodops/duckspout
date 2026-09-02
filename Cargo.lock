@@ -784,28 +784,33 @@ name = "duckspout-ctl"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "serde_json",
 ]
 
 [[package]]
 name = "duckspout-daemon"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "bytes",
  "clap",
  "config",
+ "duckdb",
  "duckspout-accept",
  "duckspout-ctk",
  "duckspout-drain",
- "duckspout-lake-contract",
  "duckspout-lake-ducklake",
  "duckspout-replication",
  "duckspout-staging",
  "duckspout-types",
  "duckspout-watermark",
+ "fs4",
  "object_store",
  "opentelemetry-proto",
  "serde",
+ "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "toml",
@@ -1034,6 +1039,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs4"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8c6b3bd49c37d2aa3f3f2220233b29a7cd23f79d1fe70e5337d25fb390793de"
+dependencies = [
+ "rustix 0.38.44",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2497,9 +2512,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "socket2"
