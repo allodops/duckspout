@@ -1,6 +1,6 @@
 //! The §8.5 lattice-law suite for `evolve_schema` on the real backend
 //! (issue #40): "the schema-widening join is commutative, associative, and
-//! idempotent — the property that makes EvolveSchema crash-retry and
+//! idempotent — the property that makes `EvolveSchema` crash-retry and
 //! concurrent-owner convergence correct (§6)".
 //!
 //! Scoping, stated honestly: no free-standing lattice-join type exists in
