@@ -60,7 +60,8 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 use duckspout_types::{
-    BoxFuture, DatasetId, NodeId, OriginSeqRange, PartitionId, Storage, StoragePath, WindowId,
+    BoxFuture, DatasetId, NodeId, OriginSeqRange, PartitionId, StagedCoverage, Storage,
+    StoragePath, WindowId,
 };
 
 use crate::naming::window_table_name;
@@ -135,16 +136,6 @@ pub struct StagingConfig {
     pub origin: NodeId,
 }
 
-/// Per-origin seq coverage of one committed partition — exactly what
-/// `ClientAck` evidence needs (§4.3) and what `Forward` ships (§4.2.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedCoverage {
-    /// The partition the rows landed in.
-    pub partition: PartitionId,
-    /// The dense, contiguous seq range this commit covers.
-    pub range: OriginSeqRange,
-}
-
 /// One live micro-window table, from the engine's registry (§2.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowRef {
@@ -169,6 +160,12 @@ struct WriterInner {
     /// Live micro-window tables — the in-memory mirror of
     /// `duckspout_windows`.
     windows: HashMap<WindowKey, String>,
+    /// Highest window id ever created per (dataset, partition) — the
+    /// in-memory mirror of `duckspout_window_hw`. Survives `DropWindow` and
+    /// restart, which is what keeps allocated window ids dense and
+    /// never-reused (§2.3: contiguity of the per-partition window sequence
+    /// must stay decidable after windows drain away).
+    window_hw: HashMap<(DatasetId, PartitionId), u64>,
 }
 
 /// The staging engine: WAL=hot over one persistent `DuckDB` database. See
@@ -223,6 +220,11 @@ impl<S: Storage> StagingEngine<S> {
                  window_id  UBIGINT NOT NULL,
                  table_name VARCHAR NOT NULL,
                  PRIMARY KEY (dataset, partition, window_id));
+             CREATE TABLE IF NOT EXISTS duckspout_window_hw (
+                 dataset   VARCHAR NOT NULL,
+                 partition VARCHAR NOT NULL,
+                 hw        UBIGINT NOT NULL,
+                 PRIMARY KEY (dataset, partition));
              INSERT INTO duckspout_meta (key, n) VALUES ('wal_epoch', 1)
                  ON CONFLICT (key) DO UPDATE SET n = n + 1;
              COMMIT;",
@@ -230,6 +232,7 @@ impl<S: Storage> StagingEngine<S> {
 
         let applied = load_applied(&conn, &config.origin)?;
         let windows = load_windows(&conn)?;
+        let window_hw = load_window_hw(&conn)?;
 
         // Name durability for hot.db and hot.db.wal (module docs; ADR-0003).
         block_on(storage.fsync_dir(StoragePath::new("")))?;
@@ -239,6 +242,7 @@ impl<S: Storage> StagingEngine<S> {
                 conn,
                 applied,
                 windows,
+                window_hw,
             }),
             storage,
             origin: config.origin,
@@ -382,6 +386,29 @@ impl<S: Storage> StagingEngine<S> {
         Ok(self.lock_writer()?.applied.get(partition).copied())
     }
 
+    /// The highest window id ever created for `(dataset, partition)`, or
+    /// `None` if no window was ever created there. Unlike the live registry
+    /// ([`Self::list_windows`]) this survives `DropWindow` and restart, so
+    /// window allocators ([`crate::EngineStager`]) can keep
+    /// the per-partition window sequence dense without ever reusing a
+    /// drained window's id (§2.3).
+    ///
+    /// # Errors
+    ///
+    /// [`StagingError::WriterPoisoned`].
+    pub fn highest_window_id(
+        &self,
+        dataset: &DatasetId,
+        partition: &PartitionId,
+    ) -> Result<Option<WindowId>, StagingError> {
+        Ok(self
+            .lock_writer()?
+            .window_hw
+            .get(&(dataset.clone(), partition.clone()))
+            .copied()
+            .map(WindowId))
+    }
+
     /// Size of the engine's WAL file (`hot.db.wal`), if present.
     #[must_use]
     pub fn wal_size(&self) -> Option<u64> {
@@ -508,6 +535,12 @@ impl StageTxn<'_> {
         self.finished = true;
 
         for (key, table) in self.pending_windows.drain(..) {
+            let (dataset, partition, window) = key.clone();
+            self.writer
+                .window_hw
+                .entry((dataset, partition))
+                .and_modify(|hw| *hw = (*hw).max(window))
+                .or_insert(window);
             self.writer.windows.insert(key, table);
         }
         let mut coverage = Vec::with_capacity(self.pending_applied.len());
@@ -582,6 +615,15 @@ impl StageTxn<'_> {
             "INSERT INTO duckspout_windows (dataset, partition, window_id, table_name)
              VALUES (?, ?, ?, ?)",
             duckdb::params![dataset.as_str(), partition.as_str(), window.0, table],
+        )?;
+        // The never-reuse high-water rides the same transaction as the
+        // CREATE TABLE, so a crash cannot record one without the other.
+        self.writer.conn.execute(
+            "INSERT INTO duckspout_window_hw (dataset, partition, hw)
+             VALUES (?, ?, ?)
+             ON CONFLICT (dataset, partition) DO UPDATE
+                 SET hw = greatest(hw, excluded.hw)",
+            duckdb::params![dataset.as_str(), partition.as_str(), window.0],
         )?;
         self.pending_windows.push((key, table.clone()));
         Ok(table)
@@ -677,6 +719,25 @@ fn load_applied(
         applied.insert(PartitionId::new(partition), seq);
     }
     Ok(applied)
+}
+
+fn load_window_hw(
+    conn: &Connection,
+) -> Result<HashMap<(DatasetId, PartitionId), u64>, StagingError> {
+    let mut stmt = conn.prepare("SELECT dataset, partition, hw FROM duckspout_window_hw")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, u64>(2)?,
+        ))
+    })?;
+    let mut window_hw = HashMap::new();
+    for row in rows {
+        let (dataset, partition, hw) = row?;
+        window_hw.insert((DatasetId::new(dataset), PartitionId::new(partition)), hw);
+    }
+    Ok(window_hw)
 }
 
 fn load_windows(conn: &Connection) -> Result<HashMap<WindowKey, String>, StagingError> {

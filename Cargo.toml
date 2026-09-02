@@ -49,6 +49,11 @@ crc32fast = "1"
 # tests (issue #31); the de-facto standard, no in-house candidate
 # (R-third-party-first).
 tempfile = "3"
+# dev-only: wraps a test-local loopback TcpListener into the stream shape
+# tonic's serve_with_incoming takes (issue #32's in-process gRPC tests);
+# tokio's own ecosystem companion, no in-house candidate
+# (R-third-party-first).
+tokio-stream = { version = "0.1", features = ["net"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dataset::DatasetKind;
 use crate::ids::{DatasetId, PartName, PartitionId, TenantId};
-use crate::manifest::WindowManifest;
+use crate::manifest::{OriginSeqRange, WindowManifest};
 use crate::otlp::{GrpcCode, OtlpErrorClass};
 use crate::watermark::WatermarkRow;
 
@@ -166,18 +166,17 @@ pub trait Storage: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// An accept-side rejection produced while decoding (obligations 1–2 of
-/// §4.1.2).
+/// §4.1.2). Every variant is a permanent, non-retryable rejection: retrying
+/// the same bytes can never succeed (§4.1.2's `MalformedPermanent` class).
 #[derive(Debug, thiserror::Error)]
 pub enum AcceptError {
     /// The payload is malformed for this protocol; permanent (§4.1.2).
     #[error("malformed payload: {0}")]
     Malformed(String),
-    /// No tenant identity could be extracted (§4.1.2 obligation 2).
-    #[error("missing tenant identity")]
-    MissingTenant,
-    /// The adapter is a bootstrap stub; the real decoder lands at v0.1.
-    #[error("adapter not implemented: {0}")]
-    NotImplemented(&'static str),
+    /// The tenant header failed §2.2's validation (charset, length ≤ 150,
+    /// leading `_` reserved for system tenants).
+    #[error("invalid tenant identity: {0}")]
+    InvalidTenant(String),
 }
 
 /// One wire request as the accept seam receives it, protocol-opaque.
@@ -204,9 +203,13 @@ pub struct DecodedBatch {
     /// The idempotency token, when the client sent one — takes precedence
     /// over the content hash in the dedup key (§4.4.1).
     pub idempotency_key: Option<String>,
-    /// The decoded records. Bootstrap placeholder: the Arrow record-batch
-    /// representation lands with the v0.1 adapter (arrow types stay out of
-    /// this no-I/O crate until the encoding decision is absorbed).
+    /// The decoded records as one **Arrow IPC stream** (any number of record
+    /// batches over one schema), produced with the workspace's compat-pinned
+    /// arrow (compat-matrix row 1; `duckspout-staging` re-exports it). The
+    /// IPC encoding is what keeps this crate free of the arrow dependency —
+    /// this crate stays no-I/O and near-leafless (§10.1) — at the cost of one
+    /// in-memory encode/decode per batch on the accept path, bounded by
+    /// `max_payload_bytes` (§4.6).
     pub records: Bytes,
 }
 
@@ -242,6 +245,76 @@ pub trait AcceptAdapter: Send + Sync {
     /// vocabulary (obligation 3) — for OTLP, the spec's own retryable status
     /// table with no invented extensions.
     fn map_error(&self, class: OtlpErrorClass) -> WireError;
+}
+
+// ---------------------------------------------------------------------------
+// StageCommitter (v0.1)
+// ---------------------------------------------------------------------------
+
+/// Per-origin seq coverage of one committed partition — exactly what
+/// `ClientAck` evidence needs (§4.3) and what `Forward` ships (§4.2.3).
+///
+/// Defined here (ADR-0008: it crosses the accept↔staging boundary inside
+/// [`StageCommitter`]'s signature); `duckspout-staging` re-exports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedCoverage {
+    /// The partition the rows landed in.
+    pub partition: PartitionId,
+    /// The dense, contiguous seq range this commit covers.
+    pub range: OriginSeqRange,
+}
+
+/// A staging failure as the accept path sees it (§4.3): every variant is a
+/// **not-acked** outcome — the batch may be retried, and a retry can land on
+/// a healthy node, so adapters map these onto the retryable wire vocabulary
+/// (`StorageFailure`, §4.1.2).
+#[derive(Debug, thiserror::Error)]
+pub enum StageError {
+    /// The [`DecodedBatch::records`] bytes are not a decodable Arrow IPC
+    /// stream — an adapter↔stager contract breach, not client-malformed
+    /// input (the client's payload already decoded; §4.1.2's malformed class
+    /// is the adapter's to raise).
+    #[error("records are not a decodable Arrow IPC stream: {0}")]
+    MalformedRecords(String),
+    /// The staging backend failed the commit; nothing was staged and nothing
+    /// is acked (§4.3).
+    #[error("staging backend: {0}")]
+    Backend(String),
+}
+
+/// The staging port the accept path commits through (§4.3, ADR-0008): stage
+/// one decoded batch in one durable `StageCommit` transaction and return the
+/// per-partition coverage evidence `ClientAck` is built from.
+///
+/// Contract, in §4.3's vocabulary:
+///
+/// - `Ok` means `StageCommit` returned — the whole batch is fsynced-durable
+///   locally, atomically. The caller may ack once the replication floor is
+///   met (v0.1 single-node: RF = 1, so `Ok` **is** ack-worthy; the RF−1
+///   `Receipt` wait of §4.3 arrives with replication at v0.2 and slots
+///   between this call and the ack).
+/// - `Err` means nothing was staged and nothing may be acked. There is no
+///   partial outcome — a batch stages in its entirety or not at all (§4.1.2).
+/// - The dedup-window entry of §4.4.1 rides the same transaction; its
+///   client-visible semantics (replay, in-flight throttle) land with
+///   issue #33 on this same seam.
+///
+/// Home crate: `duckspout-staging` (the WAL=hot engine implements this; the
+/// engine is blocking, so implementations may resolve the returned future
+/// synchronously — callers embed the port off their reactor, ADR-0003).
+pub trait StageCommitter: Send + Sync {
+    /// Stages `batch` in one durable transaction (§4.3 `StageCommit`).
+    ///
+    /// Returns the committed per-origin seq coverage, one entry per
+    /// partition touched, sorted by partition.
+    ///
+    /// # Errors
+    ///
+    /// [`StageError`] — the batch is not staged and must not be acked.
+    fn stage_commit(
+        &self,
+        batch: DecodedBatch,
+    ) -> BoxFuture<'_, Result<Vec<StagedCoverage>, StageError>>;
 }
 
 // ---------------------------------------------------------------------------
