@@ -30,11 +30,19 @@ pub type OtlpLogs<S, C> = duckspout_accept::OtlpLogsService<Stager<S, C>>;
 /// The lake backend v1 wires by default (`lake.committer = "ducklake"`).
 pub type Committer = duckspout_lake_ducklake::DuckLakeCommitter;
 
-/// The drain driver over that backend, through the contract only.
-pub type Drain = duckspout_drain::DrainCoordinator<Committer>;
+/// The drain driver: port-typed (`dyn` seams), so the alias is the
+/// coordinator itself; the daemon hands it `Committer`, the staging seal
+/// surface, and the shared watermark ledger at construction (§10.4).
+pub type Drain = duckspout_drain::DrainCoordinator;
+
+/// The seal-side read surface the drain consumes (§6.2), over [`Staging`].
+pub type SealSurface<S> = duckspout_staging::EngineSealSurface<S>;
 
 /// The watermark view the daemon serves reads from (§7).
 pub type Watermarks = duckspout_watermark::WatermarkLedger;
+
+/// The watermark bookkeeping seam the drain consumes (ADR-0010).
+pub type DrainLedger = duckspout_watermark::SharedLedger;
 
 /// The self-certification report backends run against the contract (§10.3).
 pub type Conformance = duckspout_lake_contract::conformance::ConformanceReport;

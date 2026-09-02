@@ -1,67 +1,67 @@
-//! Drain choreography (§6): `SealPart` → `PutPart` → `LakeCommit`, late
-//! arrivals, the `SingleDrainCommit` guard, retention.
+//! Drain choreography (§6): `SealPart` → `PutPart` → `LakeCommit`, the
+//! §6.3 lateness hold, deterministic part naming, and the three-outcome
+//! commit discipline with the `SingleDrainCommit` fence sequenced above the
+//! port (ADR-0010).
 //!
-//! Layering (§10.1): this crate sees the lake exclusively through the
-//! `LakeCommitter` contract (`duckspout-lake-contract`) — it never depends
-//! on a concrete backend — and PUTs parts through [`object_store`] (§10.2:
-//! `PutPart` against every major store). Its workspace dependencies are
-//! `duckspout-types` and `duckspout-lake-contract`, nothing else.
+//! Layering (§10.1, ADR-0008): this crate sees the lake exclusively through
+//! the `LakeCommitter` contract (`duckspout-lake-contract`), staging
+//! through the [`duckspout_types::SealSurface`] port, and watermark
+//! bookkeeping through the [`duckspout_types::WatermarkBookkeeping`] port —
+//! it depends on no protocol sibling and no concrete backend. `PutPart`
+//! goes through [`object_store`] (§10.2: one PUT against every major
+//! store); time comes from the `Clock` port (D-2).
 //!
-//! Ⓢ bootstrap stub — the choreography lands at v0.1.
+//! The module map:
 //!
-//! Design home: `docs/design/drain.md` (lands at absorption; until then see
-//! `DUCKSPOUT.md` §6).
+//! - [`schedule`] — which closed micro-windows are drain-eligible (§6.3).
+//! - [`naming`] — the deterministic part name (§6.5, §2.7).
+//! - [`coordinator`] — the choreography itself, including the retry
+//!   discipline (evidence over blind replay, R-2) and the §6.5
+//!   one-read-back resolution of unsettled commits.
+//!
+//! What this crate deliberately does **not** do at v0.1, and why:
+//!
+//! - **Multi-window part packing and the §6.2 size/age sizing band**
+//!   (`drain.part_target_bytes`, `drain.max_age`): v0.1 seals one part per
+//!   micro-window, which is correct under every invariant — packing is a
+//!   PUT-cost optimization layered on the same choreography, and arrives
+//!   with the retention/sizing work (§6.2, §6.7).
+//! - **Supplement and snapshot commits** (§6.6–§6.7): the takeover-drain
+//!   and snapshot-rollover flows that produce them are replication
+//!   (`TakeoverDrain`) and retention work; the naming and fence vocabulary
+//!   for both already exist here ([`naming::PartDiscriminator`]).
+//! - **The cross-process racing-drains proof**: the fence *mechanism* below
+//!   the port is backend work — `DuckLake`'s snapshot-commit conflict,
+//!   implemented and proven by issue #36 per ADR-0010. This crate proves
+//!   the choreography half: two racing attempts through the port contract
+//!   yield exactly one commit, the loser resolving via read-back.
+//!
+//! Two TLC findings from the formal specs (PR #137) are load-bearing here:
+//!
+//! - **TN-32**: `DropWindow` is coverage-guarded — only rows the durable
+//!   commit's coverage (or the loss ledger) accounts for may leave staging;
+//!   uncovered residue (a late arrival landing between the seal `COPY` and
+//!   the drop) is kept for the supplement path. The guard is the
+//!   `SealSurface::drop_window` contract; this crate always passes the
+//!   commit's (or the bookkeeping's recorded) coverage.
+//! - **TN-36**: the "does this window's part already stand" fence must span
+//!   the lake **including expired parts** — a fence over live entries only
+//!   would re-admit a duplicate after retention expires the original. At
+//!   this crate's level the evidence used never weakens with expiry (the
+//!   watermark is monotone and the bookkeeping's dense-next cursor never
+//!   regresses); the backend-level `UNIQUE` fence must uphold the same
+//!   (issue #36's definition of done).
+//!
+//! Design home: `docs/design/drain.md`.
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+pub mod coordinator;
+pub mod naming;
+pub mod schedule;
 
-use duckspout_lake_contract::LakeCommitter;
-use duckspout_types::{LakeError, PartitionId, WindowId};
-
-/// The per-partition drain driver. Ⓢ v0.1: seals one sorted `COPY … TO` per
-/// window (§6.2), PUTs the sealed parts, and commits
-/// {parts + watermark} atomically through the contract (§6.4), guarded by
-/// `SingleDrainCommit` (§6.6).
-pub struct DrainCoordinator<C: LakeCommitter> {
-    committer: C,
-    parts_store: Arc<dyn object_store::ObjectStore>,
-}
-
-impl<C: LakeCommitter> DrainCoordinator<C> {
-    /// Wires a committer and the cold object store. No I/O happens until the
-    /// choreography lands (v0.1).
-    pub fn new(committer: C, parts_store: Arc<dyn object_store::ObjectStore>) -> Self {
-        Self {
-            committer,
-            parts_store,
-        }
-    }
-
-    /// The lake contract this coordinator commits through.
-    pub fn committer(&self) -> &C {
-        &self.committer
-    }
-
-    /// The object store sealed parts are PUT to (§6, §10.2).
-    #[must_use]
-    pub fn parts_store(&self) -> &Arc<dyn object_store::ObjectStore> {
-        &self.parts_store
-    }
-
-    /// Drains one window: `SealPart` → `PutPart` → `commit_files`, with
-    /// Indeterminate resolved by exactly one read-back (§6.5). Ⓢ v0.1.
-    ///
-    /// # Errors
-    ///
-    /// Always [`LakeError::NotImplemented`] until the choreography lands.
-    pub fn drain_window_stub(
-        &self,
-        _partition: &PartitionId,
-        _window: WindowId,
-    ) -> Result<(), LakeError> {
-        Err(LakeError::NotImplemented(
-            "drain choreography lands at v0.1 (§6)",
-        ))
-    }
-}
+pub use coordinator::{
+    DatasetDrainPlan, DrainCoordinator, DrainError, DrainOutcome, RequeueReason,
+};
+pub use naming::{PartDiscriminator, part_name};
+pub use schedule::{DrainConfig, eligible, hold_elapsed};

@@ -105,6 +105,32 @@ pub fn open_engine(hot_dir: &Path, origin: &str) -> StagingEngine<FsStorage> {
     .expect("open staging engine")
 }
 
+/// A log-shaped batch with caller-chosen bodies: `ts` (µs timestamp,
+/// NOT NULL, spaced 1 s apart from `first_ts_micros`), `severity` (Int32),
+/// `body` (Utf8) — for seal tests that assert on dedup keys and event-time
+/// bounds.
+pub fn bodies_batch(first_ts_micros: i64, bodies: &[&str]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("severity", DataType::Int32, true),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let ts: TimestampMicrosecondArray = (0..bodies.len())
+        .map(|i| Some(first_ts_micros + 1_000_000 * i64::try_from(i).expect("row index")))
+        .collect();
+    let severity: Int32Array = bodies.iter().map(|_| Some(0)).collect();
+    let body: StringArray = bodies.iter().map(|b| Some((*b).to_owned())).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(ts), Arc::new(severity), Arc::new(body)],
+    )
+    .expect("build bodies batch")
+}
+
 /// A synthetic OTLP-log-shaped payload batch: `ts` (µs timestamp, NOT NULL),
 /// `severity` (Int32), `body` (Utf8). `body_pad` controls the per-row byte
 /// weight for WAL-size-driven tests.

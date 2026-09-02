@@ -774,9 +774,11 @@ dependencies = [
 name = "duckspout-drain"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "duckspout-lake-contract",
  "duckspout-types",
  "object_store",
+ "thiserror",
 ]
 
 [[package]]

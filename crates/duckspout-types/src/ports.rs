@@ -23,7 +23,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::dataset::DatasetKind;
-use crate::ids::{DatasetId, PartName, PartitionId, TenantId};
+use crate::ids::{DatasetId, PartName, PartitionId, TenantId, WindowId};
 use crate::manifest::{OriginSeqRange, WindowManifest};
 use crate::otlp::{GrpcCode, OtlpErrorClass};
 use crate::watermark::WatermarkRow;
@@ -315,6 +315,242 @@ pub trait StageCommitter: Send + Sync {
         &self,
         batch: DecodedBatch,
     ) -> BoxFuture<'_, Result<Vec<StagedCoverage>, StageError>>;
+}
+
+// ---------------------------------------------------------------------------
+// SealSurface (v0.1)
+// ---------------------------------------------------------------------------
+
+/// One closed micro-window the staging side offers for drain (§6.2). The
+/// close instant feeds the §6.3 lateness hold: the drain schedules a window
+/// only once `drain.allowed_lateness` has elapsed past `closed_at_ms`, so
+/// ordinary network-delayed rows drain into their home window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainableWindow {
+    /// The dataset the window belongs to.
+    pub dataset: DatasetId,
+    /// The partition the window belongs to.
+    pub partition: PartitionId,
+    /// The dense per-partition window sequence number.
+    pub window: WindowId,
+    /// When the window closed to ordinary ingest, Unix milliseconds — the
+    /// instant the §6.3 lateness hold starts counting from.
+    pub closed_at_ms: i64,
+}
+
+/// What one `SealPart` run must do (§6.2): the one sorted, deduplicating
+/// `COPY` over the window's staging table, described declaratively so the
+/// drain stays engine-neutral.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealRequest {
+    /// The dataset whose window is sealed.
+    pub dataset: DatasetId,
+    /// The partition whose window is sealed.
+    pub partition: PartitionId,
+    /// The window to seal.
+    pub window: WindowId,
+    /// The part's sort order — the dataset's declared `sort_key`, or the
+    /// event-time default (§6.2). Column names of the staged payload.
+    pub order_by: Vec<String>,
+    /// The event-time column (a staged `TIMESTAMP` column): its min/max
+    /// over the sealed rows become the manifest's event-time statistics.
+    pub event_time_column: String,
+    /// Drain-time dedup key (§6.2): `Some(cols)` keeps, per distinct key,
+    /// the deterministic smallest-`(origin, seq)` winner and counts the rest
+    /// as `dedup_removed`; `None` seals every row.
+    pub dedup_key: Option<Vec<String>>,
+}
+
+/// A sealed part plus the bookkeeping the window manifest needs (§6.2,
+/// §6.8). Coverage is accounted **pre-dedup**: removed duplicates are still
+/// covered rows — that is why `dedup_removed` is recorded at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedPart {
+    /// Node-local scratch location of the sealed Parquet bytes, relative to
+    /// the composition's [`Storage`] root. The drain PUTs and then deletes
+    /// it; it is never served from.
+    pub path: StoragePath,
+    /// Rows sealed into the part (post-dedup).
+    pub rows: u64,
+    /// Event-time minimum over the sealed rows, Unix milliseconds. `0` for
+    /// an empty window.
+    pub event_time_min_ms: i64,
+    /// Event-time maximum over the sealed rows, Unix milliseconds. `0` for
+    /// an empty window.
+    pub event_time_max_ms: i64,
+    /// Rows removed by drain-time dedup (§6.2) — the manifest's
+    /// `dedup_removed`, passed through verbatim.
+    pub dedup_removed: u64,
+    /// Per-origin seq coverage of the window's staged rows (pre-dedup),
+    /// as maximal contiguous runs sorted by `(origin, first_seq)`.
+    pub origin_coverage: Vec<OriginSeqRange>,
+}
+
+/// A seal-side failure. Every variant is a not-sealed outcome; the window
+/// stays in staging untouched (R-5: acked data leaves staging only by
+/// successful drain).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SealError {
+    /// The window is not registered on this node.
+    #[error("window {window} of ({dataset}, {partition}) is unknown to staging")]
+    UnknownWindow {
+        /// The dataset addressed.
+        dataset: DatasetId,
+        /// The partition addressed.
+        partition: PartitionId,
+        /// The window addressed.
+        window: WindowId,
+    },
+    /// The staging backend failed the operation, described.
+    #[error("seal backend: {0}")]
+    Backend(String),
+}
+
+/// How a coverage-guarded `DropWindow` ended (§6.9; TLC finding TN-32,
+/// PR #137): only rows covered by the lake's committed coverage (or the
+/// loss ledger) may leave staging — an uncovered row is durable, acked
+/// data that will drain later (as a supplement, §6.6) and must survive the
+/// winner's drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DropOutcome {
+    /// Every staged row was covered: the whole window table is gone (the
+    /// O(1) path — the common case, where the committed coverage is the
+    /// entire window).
+    Dropped,
+    /// Uncovered rows existed (e.g. a late arrival landed between the seal
+    /// `COPY` and the drop): only the covered rows were deleted; the window
+    /// table survives holding exactly the residue, which a later
+    /// supplement drain accounts for.
+    ResidueKept {
+        /// The uncovered rows left in the window.
+        rows: u64,
+    },
+    /// The window was already gone — idempotent re-drop after a crash or a
+    /// racing completion.
+    AlreadyGone,
+}
+
+/// The seal-side read surface of staging (§6.2) — the port through which the
+/// drain consumes staging (ADR-0008: protocol×protocol edges are banned, so
+/// the trait lives here; `duckspout-staging` implements it over its engine).
+///
+/// Implementations back onto a blocking embedded engine; the returned
+/// futures may therefore complete work synchronously — callers embed the
+/// surface off their reactor exactly as for the engine itself.
+pub trait SealSurface: Send + Sync {
+    /// The closed micro-windows currently offered for drain, sorted by
+    /// `(dataset, partition, window)`. The open (current) window of a
+    /// partition is never offered; the §6.3 lateness hold on the closed
+    /// ones is the drain's scheduling decision, not this surface's.
+    fn drainable_windows(&self) -> BoxFuture<'_, Result<Vec<DrainableWindow>, SealError>>;
+
+    /// Seals one window (§6.2): a single sorted, deduplicating `COPY` of
+    /// the window's staged rows to one local Parquet part, returning the
+    /// part and the manifest bookkeeping. Re-sealing an undrained window is
+    /// legal and overwrites the scratch file (drain retries recompute, R-2).
+    fn seal_window(&self, request: SealRequest) -> BoxFuture<'_, Result<SealedPart, SealError>>;
+
+    /// Coverage-guarded `DropWindow` (§6.9; TN-32): removes from staging
+    /// **only** rows whose `(origin, seq)` falls inside `covered` — the
+    /// committed coverage of the window's durable `LakeCommit`(s). When
+    /// that covers every staged row (the common case), the whole table is
+    /// dropped O(1); otherwise the uncovered residue is kept
+    /// ([`DropOutcome::ResidueKept`]) — refusing to drop is always the
+    /// safe direction (R-5). Idempotent by design, the drain retries.
+    fn drop_window(
+        &self,
+        dataset: DatasetId,
+        partition: PartitionId,
+        window: WindowId,
+        covered: Vec<OriginSeqRange>,
+    ) -> BoxFuture<'_, Result<DropOutcome, SealError>>;
+}
+
+// ---------------------------------------------------------------------------
+// WatermarkBookkeeping (v0.1)
+// ---------------------------------------------------------------------------
+
+/// A rejected bookkeeping mutation, as the drain needs to see it. The rich
+/// diagnosis lives with the ledger crate; the port distinguishes exactly
+/// what the choreography acts on: the dense-next fence versus a malformed
+/// manifest.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LedgerRejection {
+    /// The window is not the partition's dense-next window (§6.8). A `got`
+    /// **below** `expected` means the commit already stands — the drain's
+    /// retry path detects "already stands" through this variant (or a
+    /// read-back), never by blindly re-recording.
+    #[error("window {got} is not the dense-next window of {partition} (expected {expected})")]
+    WindowNotNext {
+        /// The partition whose dense sequence was violated.
+        partition: PartitionId,
+        /// The dense-next window id the bookkeeping expects.
+        expected: WindowId,
+        /// The window id that was offered.
+        got: WindowId,
+    },
+    /// The manifest is malformed or inconsistent with committed state — a
+    /// caller bug, described; the bookkeeping is unchanged (R-3).
+    #[error("manifest rejected: {0}")]
+    Rejected(String),
+}
+
+/// The drain's window into watermark bookkeeping (ADR-0010, §6.4): the lake
+/// **stores** the watermark, the ledger crate **computes** it, and the drain
+/// carries the computed rows on `commit_files` — this port is the
+/// computation seam. Defined here because drain and watermark are both
+/// protocol crates (ADR-0008); `duckspout-watermark` implements it and the
+/// daemon wires the two together.
+///
+/// Methods take `&self`: implementations synchronize internally, and
+/// recording is process-local bookkeeping — durability is the committer's
+/// transaction, never this port's I/O.
+pub trait WatermarkBookkeeping: Send + Sync {
+    /// The dense-next window id the bookkeeping will accept for the
+    /// partition — `WindowId(0)` when nothing is recorded. The
+    /// choreography's pre-commit fence check reads this.
+    fn next_window(&self, partition: &PartitionId) -> WindowId;
+
+    /// The partition's current `complete_through`, Unix milliseconds,
+    /// inclusive — `None` while the partition has no provable watermark.
+    fn complete_through_ms(&self, partition: &PartitionId) -> Option<i64>;
+
+    /// The watermark row `commit_files` must carry for `manifest` (§6.4:
+    /// `WatermarkAdvance` rides `LakeCommit` atomically), computed without
+    /// recording anything. `Ok(None)` means the partition still has no
+    /// provable watermark; the commit then carries no row.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerRejection`] — the manifest is not recordable; nothing may be
+    /// committed under it.
+    fn advance_for(
+        &self,
+        manifest: &WindowManifest,
+    ) -> Result<Option<WatermarkRow>, LedgerRejection>;
+
+    /// Records a **durably committed** manifest (call only after
+    /// `CommitOutcome::Committed` or a read-back proving the commit stands)
+    /// and returns the partition's watermark row after the advance rule
+    /// re-runs.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerRejection`] — the bookkeeping is unchanged.
+    fn record_commit(
+        &self,
+        manifest: &WindowManifest,
+    ) -> Result<Option<WatermarkRow>, LedgerRejection>;
+
+    /// The recorded per-origin coverage of one committed window — what the
+    /// coverage-guarded `DropWindow` may remove from staging when the
+    /// manifest itself is no longer at hand (the §6.9 crash-recovery
+    /// completion; TN-32). `None` when the window is not recorded.
+    fn recorded_coverage(
+        &self,
+        partition: &PartitionId,
+        window: WindowId,
+    ) -> Option<Vec<OriginSeqRange>>;
 }
 
 // ---------------------------------------------------------------------------

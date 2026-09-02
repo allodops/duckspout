@@ -11,6 +11,10 @@ repository.workspace = true
 duckspout-lake-contract = { workspace = true }
 duckspout-types = { workspace = true }
 object_store = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
 
 [lints]
 workspace = true

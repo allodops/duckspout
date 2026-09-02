@@ -49,10 +49,17 @@
 mod coverage;
 mod ledger;
 mod loss;
+mod port;
 mod reconstruct;
 #[cfg(test)]
 mod testutil;
 
 pub use ledger::{AdvanceError, WatermarkLedger, WindowRecord};
 pub use loss::{DeclareLossRequest, LossLedgerRow, LostRange};
+pub use port::SharedLedger;
 pub use reconstruct::{CoverageHole, ReconstructError, Reconstruction, Stall, StallReason};
+
+/// The port this crate implements for the drain (ADR-0008 home-crate
+/// re-export): the drain computes nothing watermark-shaped itself — it
+/// carries what this crate computes (ADR-0010).
+pub use duckspout_types::{LedgerRejection, WatermarkBookkeeping};

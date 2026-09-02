@@ -22,6 +22,9 @@
 //!   the `StageCommit` transaction the accept path acks on (§4.3). The
 //!   accept path reaches staging only through that port; the daemon
 //!   composes the two crates (issue #32).
+//! - [`EngineSealSurface`] ([`seal`]) — the `SealSurface` port impl: the
+//!   drain's seal-side read surface (§6.2), one sorted deduplicating
+//!   `COPY … TO` per window on a read connection.
 //!
 //! What this crate does **not** do yet, by design: the dedup-window table
 //! and the overload ladder are the §4.4–§4.6 work (issue #33) and will ride
@@ -51,12 +54,24 @@ pub mod engine;
 pub mod stager;
 
 #[cfg(feature = "duckdb")]
+pub mod seal;
+
+#[cfg(feature = "duckdb")]
 pub use engine::{
     CHECKPOINT_THRESHOLD_DEFERRED, HOT_DB_FILE, StageTxn, StagingConfig, StagingEngine,
     StagingError, StagingReader, WindowRef,
 };
 #[cfg(feature = "duckdb")]
 pub use stager::EngineStager;
+
+#[cfg(feature = "duckdb")]
+pub use seal::{EngineSealSurface, SEAL_SCRATCH_DIR};
+
+/// The seal-side port this crate implements for the drain (ADR-0008
+/// home-crate re-export; §6.2's read surface).
+pub use duckspout_types::{
+    DrainableWindow, DropOutcome, SealError, SealRequest, SealSurface, SealedPart,
+};
 
 /// The arrow pin the engine's append/scan surfaces speak (compat-matrix
 /// row 1) — re-exported so embedders build batches against the same version.
