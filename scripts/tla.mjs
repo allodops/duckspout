@@ -125,11 +125,62 @@ async function mc(name) {
   }
 }
 
-async function sim(name) {
+/** Simulation configs (nightly tier, 8.1): every clean root cfg plus the
+ * sim-only scopes under specs/sim/ — configurations whose exhaustive space
+ * exceeds the per-PR bounded budget (DrainSnapshot: TN-35, >2.5M states)
+ * and therefore must NOT have a root cfg, because a root cfg enters mc's
+ * pinned-count discovery. Returns [module, cfg-path] pairs (SPECS-relative). */
+function simConfigs(name) {
+  const simDir = join(SPECS, "sim");
+  const simMods = existsSync(simDir)
+    ? readdirSync(simDir).filter((f) => f.endsWith(".cfg")).map((f) => f.replace(/\.cfg$/, ""))
+    : [];
+  const pick = (mod) => {
+    if (existsSync(join(SPECS, `${mod}.cfg`))) return [mod, `${mod}.cfg`];
+    if (simMods.includes(mod)) {
+      if (!existsSync(join(SPECS, `${mod}.tla`)))
+        fail(`tla sim: sim/${mod}.cfg exists but specs/${mod}.tla does not (fail-closed)`);
+      return [mod, `sim/${mod}.cfg`];
+    }
+    return fail(`tla sim: no ${mod}.cfg or sim/${mod}.cfg under specs/`);
+  };
+  if (name) return [pick(name.replace(/\.tla$/, ""))];
+  return [...new Set([...modules(), ...simMods])].sort().map(pick);
+}
+
+/** argv after `sim`: [Module] [--depth N] [--runs N] [--seed N]. Defaults
+ * keep a bare `just tla-sim` terminating (bare TLC -simulate never stops);
+ * nightly.yml passes the real budget and the run id as the seed. */
+function simArgs(argv) {
+  const opts = { name: undefined, depth: 100, runs: 100, seed: undefined };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--depth" || a === "--runs" || a === "--seed") {
+      const v = Number(argv[i + 1] ?? "");
+      i += 1;
+      if (!Number.isSafeInteger(v) || v < (a === "--seed" ? 0 : 1))
+        fail(`tla sim: ${a} needs a ${a === "--seed" ? "non-negative" : "positive"} integer (got '${argv[i] ?? ""}')`);
+      opts[a.slice(2)] = v;
+    } else if (a.startsWith("-")) {
+      fail(`tla sim: unknown flag '${a}' (usage: sim [Module] [--depth N] [--runs N] [--seed N])`);
+    } else if (opts.name !== undefined) {
+      fail(`tla sim: at most one module (got '${opts.name}' and '${a}')`);
+    } else opts.name = a;
+  }
+  return opts;
+}
+
+async function sim(argv) {
   requireTools();
-  for (const mod of modules(name)) {
-    info(`tla sim: ${mod}`);
-    const code = await tlc(["-config", `${mod}.cfg`, "-simulate", "-checkpoint", "0", "-cleanup", "-workers", "auto", `${mod}.tla`]);
+  const { name, depth, runs, seed } = simArgs(argv);
+  for (const [mod, cfg] of simConfigs(name)) {
+    // TLC's num= is PER WORKER (`-workers auto`); on failure TLC prints the
+    // full counterexample trace plus "Simulation using seed N and aril M" —
+    // the reproduction citation (nightly.yml seeds with the run id).
+    info(`tla sim: ${mod} (${cfg}; depth=${depth}, runs=${runs}/worker${seed === undefined ? "" : `, seed=${seed}`})`);
+    const args = ["-config", cfg, "-simulate", `num=${runs}`, "-depth", String(depth)];
+    if (seed !== undefined) args.push("-seed", String(seed));
+    const code = await tlc([...args, "-checkpoint", "0", "-cleanup", "-workers", "auto", `${mod}.tla`]);
     if (code !== 0) process.exit(code);
   }
 }
@@ -159,6 +210,6 @@ async function tv(trace) {
 const [cmd, arg] = process.argv.slice(2);
 if (cmd === "install") await install();
 else if (cmd === "mc") await mc(arg);
-else if (cmd === "sim") await sim(arg);
+else if (cmd === "sim") await sim(process.argv.slice(3));
 else if (cmd === "tv") await tv(arg);
 else fail(`tla.mjs: unknown subcommand '${cmd ?? ""}' (expected: install | mc | sim | tv)`);

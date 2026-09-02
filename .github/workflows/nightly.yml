@@ -1,9 +1,9 @@
 # nightly.yml — armed nightly gates (SEED s§6.3).
 #
-# Armed at bootstrap: hack-features only (arming ledger, cadence = "nightly").
+# Armed: hack-features (bootstrap) and tla-sim (#48).
 # Staged nightly jobs are NOT present here — each is a staged ledger row in
 # docs/arming-ledger.toml and arms by protected-set PR at its milestone:
-#   tla-sim (v0.1) · mutation-floor (v0.1, ADR-0009: a red run auto-files a
+#   mutation-floor (v0.1, ADR-0009: a red run auto-files a
 #   `blocked` issue) · ctk-distributed (v0.2) / ctk-release-gate (v0.3) ·
 #   bench-card (v0.4, docs/bench/methodology.md must exist first).
 name: Nightly
@@ -26,3 +26,75 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup
       - run: just hack-features
+
+  # §8.1's nightly simulation tier (ledger row tla-sim): TLC -simulate over
+  # every clean per-PR config PLUS the sim-only scopes under specs/sim/ —
+  # configurations whose exhaustive space exceeds the per-PR bounded budget
+  # (DrainSnapshot: TN-35, >2.5M states) — discovered by scripts/tla.mjs,
+  # no module list here. Depth 400 outruns the bounded tier's horizons; the
+  # seed is the run id, and TLC's "Simulation using seed N and aril M" log
+  # line is the reproduction citation for any red trace. TLC's num= is per
+  # worker (~4x on a 4-vCPU runner: ~2500 traces per module).
+  tla-sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      # scripts/tla.mjs is the authoritative jar pin (URL + SHA-256), so its
+      # hash keys the cache; `just tla-install` re-verifies the digests even
+      # on a cache hit before trusting the jars (same pattern as ci.yml).
+      - name: Cache the TLA+ jars
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: specs/.tools
+          key: tla-jars-${{ hashFiles('scripts/tla.mjs') }}
+      - run: just tla-install
+      - env:
+          SEED: ${{ github.run_id }}
+        run: just tla-sim --runs 625 --depth 400 --seed "$SEED"
+
+  # A red nightly must not scroll by unseen: file a `blocked` issue so the
+  # dispatcher surfaces it before assigning new work (s§9.4) — the same
+  # discipline ADR-0009 records for the mutation floor. Deduped: an already
+  # open red-tla-sim issue means no second filing. github.token is fine
+  # here: creating an issue needs to trigger no other workflow (same
+  # rationale as canary-reminder.yml).
+  tla-sim-red-issue:
+    needs: [tla-sim]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File the blocking issue for the red tla-sim run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          open=$(gh api "repos/${REPO}/issues?labels=blocked&state=open" \
+            --jq '[.[] | select(.title == "Red nightly tla-sim run")] | length')
+          if [ "$open" -gt 0 ]; then
+            echo "an open red-tla-sim issue already exists; not filing another"
+            exit 0
+          fi
+          cat > "${RUNNER_TEMP}/body.md" <<EOF
+          The nightly TLC simulation tier (docs/verification.md §8.1; ledger
+          row tla-sim) went red: ${RUN_URL}
+
+          The failing trace is printed in the job log, and the run is
+          reproducible from the log's "Simulation using seed N and aril M"
+          line (the seed is the workflow run id):
+          \`just tla-sim <Module> --runs 625 --depth 400 --seed N\` on the
+          same commit. Fix forward or revert the causing change; this issue
+          blocks new loop work until resolved (ADR-0009 discipline, s§9.4).
+          EOF
+          gh api "repos/${REPO}/issues" \
+            -f title="Red nightly tla-sim run" \
+            -F body=@"${RUNNER_TEMP}/body.md" \
+            -f "labels[]=blocked"

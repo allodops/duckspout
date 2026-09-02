@@ -105,10 +105,10 @@ tla-install:
 tla-mc *module:
     bun scripts/tla.mjs mc {{module}}
 
-# TLC simulation mode (nightly)
+# TLC simulation mode (nightly): [Module] [--depth N] [--runs N] [--seed N]
 [group('spec')]
-tla-sim *module:
-    bun scripts/tla.mjs sim {{module}}
+tla-sim *args:
+    bun scripts/tla.mjs sim {{args}}
 
 # TLC trace validation of an NDJSON trace against its *Trace.tla spec
 [group('spec')]
