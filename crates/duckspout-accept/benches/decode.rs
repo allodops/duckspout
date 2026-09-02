@@ -10,6 +10,15 @@
 //! `synthetic_request`): no randomness, so the instruction count this
 //! measures is reproducible byte-for-byte across runs — the property the
 //! per-PR gate needs (never wall-clock, ADR-0005).
+//!
+//! Crate-wide `missing_docs` allow: iai-callgrind's `#[library_benchmark]`
+//! and `library_benchmark_group!` generate undocumented items (a wrapper
+//! module, a harness fn, a group const). Workspace-wide `missing_docs` is
+//! `warn` (root `Cargo.toml` `[workspace.lints]`) but CI's
+//! `RUSTFLAGS=-D warnings` promotes it to a hard error; this bench binary
+//! has no public surface of its own to document, so the blanket allow costs
+//! nothing real.
+#![allow(missing_docs)]
 
 use std::hint::black_box;
 
@@ -67,6 +76,10 @@ fn synthetic_request() -> ExportLogsServiceRequest {
     }
 }
 
+// The benchmarked function: one `decode_logs` call over the fixed request
+// above. NOT a doc comment (`///`) — `#[library_benchmark]` rejects any
+// attribute on its function other than `#[bench::...]`/`#[benches::...]`
+// (including a `#[doc = ...]` a `///` comment would desugar to).
 #[library_benchmark]
 fn decode_logs() {
     let adapter = OtlpGrpcAdapter;

@@ -18,10 +18,19 @@
 //! guide) — and one fixed batch is appended and committed inside the
 //! measured function: deterministic row count, deterministic timestamps, no
 //! randomness in this crate's own code. `PRAGMA threads=1` in `setup()`
-//! pins DuckDB's own thread pool, without which the identical binary's
+//! pins `DuckDB`'s own thread pool, without which the identical binary's
 //! instruction count varied run-to-run (measured empirically) because the
 //! bundled engine's default task scheduler runs part of the commit on a
 //! background thread whose scheduling Valgrind does not make deterministic.
+//!
+//! Crate-wide `missing_docs` allow: iai-callgrind's `#[library_benchmark]`
+//! and `library_benchmark_group!` generate undocumented items (a wrapper
+//! module, a harness fn, a group const). Workspace-wide `missing_docs` is
+//! `warn` (root `Cargo.toml` `[workspace.lints]`) but CI's
+//! `RUSTFLAGS=-D warnings` promotes it to a hard error; this bench binary
+//! has no public surface of its own to document, so the blanket allow costs
+//! nothing real.
+#![allow(missing_docs)]
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -61,6 +70,11 @@ fn setup() -> Fixture {
     Fixture { _dir: dir, engine }
 }
 
+// The benchmarked function: one `append` + `commit()` transaction against
+// the `setup()`-built fixture. NOT a doc comment (`///`) —
+// `#[library_benchmark]` rejects any attribute on its function other than
+// `#[bench::...]`/`#[benches::...]` (including a `#[doc = ...]` a `///`
+// comment would desugar to).
 #[library_benchmark]
 #[bench::commit(setup())]
 fn stage_commit(fixture: Fixture) {
