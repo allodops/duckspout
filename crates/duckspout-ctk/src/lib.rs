@@ -39,6 +39,7 @@ pub mod ledger;
 pub mod scheduler;
 pub mod storage;
 pub mod strategy;
+mod sync;
 pub mod transport;
 
 pub use clock::VirtualClock;

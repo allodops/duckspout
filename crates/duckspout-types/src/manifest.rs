@@ -61,3 +61,56 @@ pub struct WindowManifest {
     /// The sealed parts' deterministic object names (§6.5).
     pub parts: Vec<PartName>,
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn arb_range() -> impl Strategy<Value = OriginSeqRange> {
+        (".{0,24}", any::<u64>(), any::<u64>()).prop_map(|(origin, a, b)| OriginSeqRange {
+            origin: NodeId::new(origin),
+            first_seq: a.min(b),
+            last_seq: a.max(b),
+        })
+    }
+
+    proptest! {
+        /// §8.5's manifest serialization-stability law: the frozen (§12.2)
+        /// [`WindowManifest`] round-trips losslessly through JSON for ANY
+        /// field values — ids with quotes and non-ASCII, extreme seqs,
+        /// negative event times. The manifest is what makes the watermark
+        /// reconstructible (§6.8); a field silently dropped, renamed, or
+        /// truncated by a serde attribute would corrupt every stored
+        /// manifest, and this is the test that catches it before the format
+        /// drifts.
+        #[test]
+        fn window_manifest_round_trips_any_values(
+            dataset in ".{0,24}",
+            partition in ".{0,24}",
+            window in any::<u64>(),
+            coverage in prop::collection::vec(arb_range(), 0..4),
+            rows in any::<u64>(),
+            t1 in any::<i64>(),
+            t2 in any::<i64>(),
+            dedup_removed in any::<u64>(),
+            parts in prop::collection::vec(".{0,24}", 0..3),
+        ) {
+            let manifest = WindowManifest {
+                dataset: DatasetId::new(dataset),
+                partition: PartitionId::new(partition),
+                window_id: WindowId(window),
+                origin_coverage: coverage,
+                rows,
+                event_time_min_ms: t1.min(t2),
+                event_time_max_ms: t1.max(t2),
+                dedup_removed,
+                parts: parts.into_iter().map(PartName::new).collect(),
+            };
+            let json = serde_json::to_string(&manifest).expect("serialize");
+            let back: WindowManifest = serde_json::from_str(&json).expect("deserialize");
+            prop_assert_eq!(back, manifest);
+        }
+    }
+}

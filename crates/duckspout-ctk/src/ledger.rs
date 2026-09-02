@@ -1,7 +1,8 @@
 //! Armed-vs-fired fault accounting (§8.3's vacuity discipline).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+
+use crate::sync::Mutex;
 
 /// How often a fault point was armed and how often it actually fired.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
