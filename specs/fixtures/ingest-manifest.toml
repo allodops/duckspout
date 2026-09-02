@@ -1,0 +1,70 @@
+# Fixture expectations for the Ingest trace-conformance self-test (§8.2's
+# teeth; runner: scripts/trace-conformance.mjs, spec:
+# specs/traces/IngestTrace.tla).  Every doctored fixture MUST be rejected by
+# exactly the mechanism named here — one tooth going blunt cannot hide
+# behind another — and the runner asserts halt cursors and invariant names,
+# never just "it failed".
+#
+# expect vocabulary:
+#   "conforms"  — TLC exit 0: the trace is a behavior of the model and
+#                 TraceComplete holds.
+#   "halt"      — obligation 1 fails: no model transition explains the entry
+#                 at `halt_at` (1-based NDJSON line); the runner asserts the
+#                 TraceHalt cursor printed by the failed POSTCONDITION.
+#   "invariant" — obligation 2 fails: TLC names `invariant` as violated.
+#   "decoder"   — the runner's structural decoder rejects it before TLC
+#                 (field shape, vocabulary, or per-node seq density).
+#
+# The conforming trace is authored at the module's documented scope (see
+# IngestTrace.tla's header): three requests on n1 across two windows, one
+# on n2 whose row is the TN-32 residue — uncovered by n1's winner part,
+# drained later as n2's supplement — plus the full winner and supplement
+# seal → put → commit → drop cycles.
+
+[[fixture]]
+file = "ingest-conforming.ndjson"
+expect = "conforms"
+
+[[fixture]]
+file = "ingest-captured.ndjson"
+expect = "conforms"
+# Captured from the real accept → staging → drain composition by
+# duckspout-daemon's tests/trace_capture.rs, which re-captures on every run
+# and asserts byte equality with this file — a capture-day fixture cannot
+# silently go stale (§8.2's live-generation posture; the runner also
+# validates the FRESH capture, not only this snapshot).
+
+[[fixture]]
+file = "ingest-doctored-ack-before-stagecommit.ndjson"
+expect = "halt"
+halt_at = 2
+why = "ClientAck reordered before its StageCommit: a recorded step the model cannot take (refinement halt at the ack, §8.2 row 1's mechanism)"
+
+[[fixture]]
+file = "ingest-doctored-missing-stagecommit.ndjson"
+expect = "halt"
+halt_at = 5
+why = "a mid-trace StageCommit deleted while its ClientAck stays recorded: the walk halts at the unexplainable ack (§8.2's deleted-step doctoring)"
+
+[[fixture]]
+file = "ingest-doctored-missing-clientack.ndjson"
+expect = "invariant"
+invariant = "TraceComplete"
+why = "the trailing ClientAck deleted: the request resolves in reality but not in the record — TraceComplete's resolution clause"
+
+[[fixture]]
+file = "ingest-doctored-missing-lakecommit.ndjson"
+expect = "invariant"
+invariant = "TraceComplete"
+why = "the supplement's LakeCommitOk (and its DropWindow) deleted after SealPart + PutPart: a PUT part left neither committed nor abandoned — TraceComplete's drain-pipeline clause"
+
+[[fixture]]
+file = "ingest-doctored-residue-dropwindow.ndjson"
+expect = "halt"
+halt_at = 14
+why = "issue #141 / TN-32: n2's supplement drain replaced by a bare DropWindow — dropping the window would remove an uncovered acked row, a transition the model refuses (residue must survive)"
+
+[[fixture]]
+file = "ingest-doctored-seq-gap.ndjson"
+expect = "decoder"
+why = "a per-node seq gap (n1: …3 then 5): D-6's dense per-node numbering is violated; the decoder rejects before refinement ever runs"

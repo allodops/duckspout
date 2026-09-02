@@ -10,9 +10,11 @@
 > [`TRANSCRIPTION-NOTES.md`](TRANSCRIPTION-NOTES.md). The verbatim
 > §3.2–§3.4 text stays in [`formal-core.md`](formal-core.md) until
 > `Replication.tla` lands (ledger row `tla-mc-replication`, v0.2) — it is
-> still that module's source; the `traces/` + `fixtures/` siblings land
-> with ledger row `conformance`. Section citations (`§n`) refer to
-> `DUCKSPOUT.md` until its absorption completes.
+> still that module's source; the `traces/` + `fixtures/` siblings for
+> Ingest landed with issue #42 (`traces/IngestTrace.tla` + the
+> `fixtures/ingest-*` family; the `conformance` row itself arms via #44).
+> Section citations (`§n`) refer to `DUCKSPOUT.md` until its absorption
+> completes.
 
 ## The formal core (§3)
 

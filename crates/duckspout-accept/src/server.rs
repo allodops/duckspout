@@ -33,7 +33,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use duckspout_types::{AcceptError, OtlpErrorClass, StageCommitter, StageError, StageOutcome};
+use duckspout_types::{
+    AcceptError, OtlpErrorClass, StageCommitter, StageError, StageOutcome, TraceEvent, TraceSink,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::{LogsService, LogsServiceServer},
@@ -78,6 +80,11 @@ pub struct OtlpLogsService<P> {
     admission: AdmissionConfig,
     /// Decoded-but-uncommitted bytes currently in flight (§4.6).
     inflight_bytes: AtomicU64,
+    /// The §3.7 capture seam: `ClientAck`, `Throttle`, and `Refuse` journal
+    /// here (docs/trace-mapping.md's attributions; `Accept` rides the
+    /// staging-side admission gate). `None` — the production default until
+    /// the `conformance` row arms — journals nothing.
+    trace: Option<Arc<dyn TraceSink>>,
 }
 
 impl<P> OtlpLogsService<P> {
@@ -90,7 +97,17 @@ impl<P> OtlpLogsService<P> {
             stager,
             admission,
             inflight_bytes: AtomicU64::new(0),
+            trace: None,
         }
+    }
+
+    /// Journals this service's §3.3 events (`ClientAck`, `Throttle`,
+    /// `Refuse`) through `sink` (§3.7; the trace-conformance harness's
+    /// capture side).
+    #[must_use]
+    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
+        self.trace = Some(sink);
+        self
     }
 
     /// Wraps the service into the tonic server type for the composition
@@ -151,20 +168,42 @@ impl<P: StageCommitter + 'static> LogsService for OtlpLogsService<P> {
             // DedupCheck + StageCommit via the port (§4.3–§4.5). The whole
             // batch stages durably or nothing does; nothing is acked until
             // this resolves.
-            match self
-                .stager
-                .stage_commit(decoded.batch)
-                .await
-                .map_err(|e| stage_status(&e))?
-            {
+            let outcome = match self.stager.stage_commit(decoded.batch).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // §3.3's ladder resolutions journal their action name
+                    // (§3.7): rung 2 is Throttle, rung 3 is Refuse. Other
+                    // failures (storage, malformed IPC) are not §3.3
+                    // actions and journal nothing — the model has no
+                    // failed-StageCommit transition.
+                    if let Some(trace) = &self.trace {
+                        match &error {
+                            StageError::Throttled { .. } => trace.record(TraceEvent::Throttle),
+                            StageError::RefusingIngest { .. } => trace.record(TraceEvent::Refuse),
+                            StageError::MalformedRecords(_) | StageError::Backend(_) => {}
+                        }
+                    }
+                    return Err(stage_status(&error));
+                }
+            };
+            match outcome {
                 // ClientAck (§4.3): v0.1 single-node — local durable is RF.
                 // The coverage is the ack evidence; the v0.2 Receipt wait
-                // consumes it here before this response is built.
-                StageOutcome::Committed(_coverage) => {}
+                // consumes it here before this response is built. The
+                // journal precedes the wire response (§3.7: journal before
+                // the corresponding external effect).
+                StageOutcome::Committed(_coverage) => {
+                    if let Some(trace) = &self.trace {
+                        trace.record(TraceEvent::ClientAck);
+                    }
+                }
                 // §4.4.1: a duplicate of an ack-complete entry replays the
                 // original success — same ack, no second staged copy (R-2).
                 // The warning body is recomputed from the identical payload,
                 // so replayed counts match the original's by construction.
+                // No journal: the §3.3 resolution IS the DedupCheck the
+                // staging side journaled — a second ClientAck would be a
+                // step the model cannot take.
                 StageOutcome::DuplicateAcked(_coverage) => {}
                 StageOutcome::DuplicateInFlight => {
                     return Err(OtlpGrpcAdapter::to_tonic_status(

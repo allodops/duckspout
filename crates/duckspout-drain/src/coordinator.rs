@@ -49,9 +49,10 @@ use std::sync::Arc;
 
 use duckspout_lake_contract::LakeCommitter;
 use duckspout_types::{
-    Clock, CommitOutcome, DatasetId, DrainableWindow, LakeError, LedgerRejection, PartitionId,
-    SealError, SealRequest, SealSurface, SealedPart, Storage, StorageError, StoragePath,
-    WatermarkBookkeeping, WatermarkRow, WindowId, WindowManifest,
+    Clock, CommitOutcome, DatasetId, DrainableWindow, DropOutcome, LakeError, LedgerRejection,
+    PartitionId, SealError, SealRequest, SealSurface, SealedPart, Storage, StorageError,
+    StoragePath, TraceEvent, TraceSink, WatermarkBookkeeping, WatermarkRow, WindowId,
+    WindowManifest,
 };
 use object_store::ObjectStoreExt as _;
 
@@ -173,6 +174,12 @@ pub struct DrainCoordinator {
     scratch: Arc<dyn Storage>,
     clock: Arc<dyn Clock>,
     config: DrainConfig,
+    /// The §3.7 capture seam: this crate's §3.3 events (`SealPart`,
+    /// `PutPart`, the `LakeCommit*` outcome names, `Reconcile`,
+    /// `DropWindow`) journal here (docs/trace-mapping.md's attributions).
+    /// `None` — the production default until the `conformance` row arms —
+    /// journals nothing.
+    trace: Option<Arc<dyn TraceSink>>,
 }
 
 impl DrainCoordinator {
@@ -197,6 +204,22 @@ impl DrainCoordinator {
             scratch,
             clock,
             config,
+            trace: None,
+        }
+    }
+
+    /// Journals this coordinator's §3.3 events through `sink` (§3.7; the
+    /// trace-conformance harness's capture side).
+    #[must_use]
+    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
+        self.trace = Some(sink);
+        self
+    }
+
+    /// Journals `event` when a sink is wired (§3.7).
+    fn journal(&self, event: TraceEvent) {
+        if let Some(trace) = &self.trace {
+            trace.record(event);
         }
     }
 
@@ -272,6 +295,8 @@ impl DrainCoordinator {
                 dedup_key: plan.dedup_key.clone(),
             })
             .await?;
+        // §3.3 SealPart: the one sorted, deduplicating COPY completed.
+        self.journal(TraceEvent::SealPart);
 
         // 3. Manifest + the watermark rows the commit carries (§6.4).
         let part = part_name(dataset, partition, window, &PartDiscriminator::Window);
@@ -304,6 +329,8 @@ impl DrainCoordinator {
         let data = self.scratch.get(sealed.path.clone()).await?;
         let location = object_store::path::Path::from(part.as_str());
         self.parts_store.put(&location, data.into()).await?;
+        // §3.3 PutPart: the object's one logical PUT is durable.
+        self.journal(TraceEvent::PutPart);
 
         // 5. LakeCommit, three-valued (§6.5).
         match self
@@ -312,10 +339,14 @@ impl DrainCoordinator {
             .await?
         {
             CommitOutcome::Committed => {
+                // §3.7's outcome-name rule: a commit journals its outcome —
+                // LakeCommitOk here, never a bare LakeCommit.
+                self.journal(TraceEvent::LakeCommitOk);
                 let watermark = self.finish_committed(&manifest, &sealed.path).await?;
                 Ok(DrainOutcome::Committed { watermark })
             }
             CommitOutcome::Aborted => {
+                self.journal(TraceEvent::LakeCommitAbort);
                 self.reconcile(
                     Unsettled::Aborted,
                     &manifest,
@@ -326,6 +357,9 @@ impl DrainCoordinator {
                 .await
             }
             CommitOutcome::Indeterminate => {
+                // One journaled name for both model successors (§3.7); the
+                // following Reconcile names the resolution.
+                self.journal(TraceEvent::LakeCommitIndeterminate);
                 self.reconcile(
                     Unsettled::Indeterminate,
                     &manifest,
@@ -363,6 +397,14 @@ impl DrainCoordinator {
             .iter()
             .find(|row| row.partition == *partition)
             .map(|row| row.complete_through_ms);
+        // §3.3 Reconcile: the ONE read-back resolving an Indeterminate
+        // outcome succeeded (whatever it decides below). An Aborted
+        // outcome's read-back is not the model's Reconcile — the model's
+        // abort is terminal — so it journals nothing; a failed read-back
+        // resolved nothing and journals nothing either.
+        if matches!(unsettled, Unsettled::Indeterminate) {
+            self.journal(TraceEvent::Reconcile);
+        }
 
         // The commit is observable through the watermark only when it
         // carried a strict advance: previewed strictly above the
@@ -434,7 +476,8 @@ impl DrainCoordinator {
         // commit's coverage accounts for may leave staging; a late arrival
         // that landed after the seal COPY is kept as residue for the
         // supplement path (§6.6).
-        self.seal
+        let dropped = self
+            .seal
             .drop_window(
                 manifest.dataset.clone(),
                 manifest.partition.clone(),
@@ -442,6 +485,13 @@ impl DrainCoordinator {
                 manifest.origin_coverage.clone(),
             )
             .await?;
+        // §3.3 DropWindow: journaled when covered rows actually left
+        // staging (Dropped, or ResidueKept's covered subset). AlreadyGone
+        // dropped nothing, and an empty coverage authorizes no drop —
+        // neither is a §3.3 step.
+        if !manifest.origin_coverage.is_empty() && !matches!(dropped, DropOutcome::AlreadyGone) {
+            self.journal(TraceEvent::DropWindow);
+        }
         Ok(watermark)
     }
 
@@ -465,9 +515,14 @@ impl DrainCoordinator {
             .ledger
             .recorded_coverage(partition, window)
             .unwrap_or_default();
-        self.seal
+        let authorized = !covered.is_empty();
+        let dropped = self
+            .seal
             .drop_window(dataset.clone(), partition.clone(), window, covered)
             .await?;
+        if authorized && !matches!(dropped, DropOutcome::AlreadyGone) {
+            self.journal(TraceEvent::DropWindow);
+        }
         Ok(DrainOutcome::AlreadyCommitted)
     }
 
