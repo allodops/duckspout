@@ -8,38 +8,63 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Dataset-declaration wiring is the daemon's (§9.6.2, `otlp.rs`'s module
+# docs): evolving `otlp_logs`' fixed Arrow schema into the lake needs the
+# same pinned Arrow types `logs_schema()` returns (compat-matrix row 1).
+arrow = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 duckspout-accept = { workspace = true }
 duckspout-drain = { workspace = true }
-duckspout-lake-contract = { workspace = true }
 duckspout-lake-ducklake = { workspace = true }
+# Placement (§5): `hrw_owner` re-exported below — any node accepts, then
+# forwards to the HRW owner. Not wired into the accept path at v0.1
+# (single-node, SCOPE of issue #38: "no replication yet"); the daemon still
+# declares the composition-shape seam so §10.1's crate graph is honest ahead
+# of the v0.2 forwarding wiring.
 duckspout-replication = { workspace = true }
 duckspout-staging = { workspace = true }
 duckspout-types = { workspace = true }
 duckspout-watermark = { workspace = true }
+# The parts store PUT (§6.1) — DrainCoordinator's object_store::ObjectStore
+# port; the daemon selects the concrete backend (local filesystem at v0.1,
+# §10.1) and hands the port a `dyn` handle.
+object_store = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true }
+serde_json = { workspace = true }
+# The composition root's own concrete OS-facing bit (§10.1): the
+# `hot.max_bytes` volume-fraction default has no config knob (R-12), so the
+# hot volume's capacity is read here, once, at boot.
+fs4 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+# The daemon binds the OTLP/gRPC listener directly (§9.6.1's
+# `node.otlp_listen`) — the accept crate builds the tonic service, never the
+# socket (§10.1). `tokio-stream` wraps that bound `TcpListener` into the
+# stream shape `serve_with_incoming_shutdown` takes.
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# `FsStorage`'s Storage-port payloads (§10.1's own concrete Storage impl).
+bytes = { workspace = true }
 
 [dev-dependencies]
 # The daemon is the one crate allowed to see accept AND staging concretely
 # (§10.1), so the accept→port→engine end-to-end test lives here: a real
 # gRPC client against the real WAL=hot engine.
-bytes = { workspace = true }
 # The trace-capture harness (§8.2, issue #42) journals through the CTK's
 # NdjsonTraceWriter — the daemon is composition, so the edge is legal.
+# `bytes` and `object_store` for this test are already main dependencies
+# above (§10.1's own concrete Storage/object_store wiring).
 duckspout-ctk = { workspace = true }
-# The drain coordinator PUTs sealed parts through an object_store; the
-# capture test roots a LocalFileSystem at the test lake's data path.
-object_store = { workspace = true }
 opentelemetry-proto = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["net"] }
-tokio-stream = { workspace = true }
-tonic = { workspace = true }
+# The full-daemon smoke test (`tests/e2e_boot.rs`) reads the drained lake
+# back with its own raw connection (Flight serving, issue #39/PR #151, is
+# not yet merged — this is the honest substitute query surface until then).
+duckdb = { workspace = true, features = ["appender-arrow"] }
 
 [lints]
 workspace = true
