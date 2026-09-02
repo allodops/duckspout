@@ -548,7 +548,9 @@ impl DuckLakeCommitter {
             ) = row.map_err(|e| backend(&e))?;
             let window_id = WindowId(u64::try_from(window_id).unwrap_or(u64::MAX));
             match manifests.last_mut() {
-                Some(last) if last.partition.as_str() == partition && last.window_id == window_id => {
+                Some(last)
+                    if last.partition.as_str() == partition && last.window_id == window_id =>
+                {
                     last.parts.push(PartName::new(part_name));
                 }
                 _ => {

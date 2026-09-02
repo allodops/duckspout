@@ -371,31 +371,9 @@ impl Daemon {
         let (committer, parts_store) = open_lake(config).await?;
 
         // --- Watermark ledger: reconstructed from the lake's manifest
-        // --- record, never booted empty (§6.8, ADR-0010; issue #153). A
-        // --- never-drained node's lake has no manifests, so this yields the
-        // --- same empty ledger v0.1 used to hardcode — this is a strict
-        // --- generalization, not a behavior change for that case. A node
-        // --- restarting with prior commits gets the true dense-next window
-        // --- per partition back, so `DrainCoordinator`'s pre-commit fence
-        // --- (`WindowAhead`) does not wrongly reject the real next window.
-        let manifests = committer.read_manifests()?;
-        let reconstruction = WatermarkLedger::reconstruct(manifests, &[], &[])?;
-        for stall in &reconstruction.stalls {
-            // Not fatal (module docs: temporary conservatism, never a false
-            // `complete`, R-9 disclosure) — the watermark simply stands
-            // below the stalled window until whatever it is waiting on
-            // resolves (a later window, a loss-ledger row at v0.2).
-            tracing::warn!(?stall, "watermark stalled below a recorded window at boot");
-        }
-        for manifest in &reconstruction.deferred {
-            tracing::warn!(
-                dataset = %manifest.dataset,
-                partition = %manifest.partition,
-                window = manifest.window_id.0,
-                "manifest deferred past a window-id gap at boot (orphan-reconcile candidate, §6.8)"
-            );
-        }
-        let ledger = Arc::new(SharedLedger::new(reconstruction.ledger));
+        // --- record, never booted empty (§6.8, ADR-0010; issue #153) — see
+        // --- `reconstruct_watermark_ledger`.
+        let ledger = Arc::new(SharedLedger::new(reconstruct_watermark_ledger(&committer)?));
 
         let scratch_storage: Arc<dyn Storage> =
             Arc::new(FsStorage::create(config.node.data_dir.clone())?);
@@ -686,6 +664,41 @@ fn note_closed_windows(stager: &Stager, seal_surface: &EngineSealSurface<FsStora
             seal_surface.note_closed(&window.dataset, &window.partition, window.window, now_ms);
         }
     }
+}
+
+/// Reconstructs the boot-time `WatermarkLedger` from the lake's manifest
+/// record (§6.8, ADR-0010; issue #153) — the module docs' "Watermark
+/// reconstruction at boot" bullet explains why this must run before the
+/// drain coordinator starts. A never-drained node's lake has no manifests,
+/// so this reduces to the empty ledger v0.1 used to hardcode — a strict
+/// generalization, not a behavior change for that case.
+///
+/// # Errors
+///
+/// [`BootError::Lake`] if the manifest read fails;
+/// [`BootError::WatermarkReconstruction`] if the lake's own record is
+/// corrupt — boot fails closed rather than guessing (R-3).
+fn reconstruct_watermark_ledger(
+    committer: &DuckLakeCommitter,
+) -> Result<WatermarkLedger, BootError> {
+    let manifests = committer.read_manifests()?;
+    let reconstruction = WatermarkLedger::reconstruct(manifests, &[], &[])?;
+    for stall in &reconstruction.stalls {
+        // Not fatal (module docs: temporary conservatism, never a false
+        // `complete`, R-9 disclosure) — the watermark simply stands below
+        // the stalled window until whatever it is waiting on resolves (a
+        // later window, a loss-ledger row at v0.2).
+        tracing::warn!(?stall, "watermark stalled below a recorded window at boot");
+    }
+    for manifest in &reconstruction.deferred {
+        tracing::warn!(
+            dataset = %manifest.dataset,
+            partition = %manifest.partition,
+            window = manifest.window_id.0,
+            "manifest deferred past a window-id gap at boot (orphan-reconcile candidate, §6.8)"
+        );
+    }
+    Ok(reconstruction.ledger)
 }
 
 /// Opens the lake committer and the parts object store (§6.1, §6.4,

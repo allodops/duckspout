@@ -36,6 +36,7 @@
 //! `SettableClock`), which this test does not need (it drives the real
 //! public API, not the ports directly).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -151,7 +152,11 @@ fn synthetic_request(n: u64, base_nanos: u64) -> ExportLogsServiceRequest {
 
 /// Sends one export request tagged for `tenant-a`, over an already-connected
 /// client.
-async fn export(client: &mut LogsServiceClient<tonic::transport::Channel>, n: u64, base_nanos: u64) {
+async fn export(
+    client: &mut LogsServiceClient<tonic::transport::Channel>,
+    n: u64,
+    base_nanos: u64,
+) {
     let mut request = tonic::Request::new(synthetic_request(n, base_nanos));
     request
         .metadata_mut()
@@ -170,6 +175,52 @@ async fn wait_ready(handle: &DaemonHandle) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("daemon did not report ready in time");
+}
+
+/// A booted, serving daemon under test: the shared boot/serve/wait-ready
+/// choreography, factored out so the test body reads as "boot A, do things,
+/// stop A, boot B against the same paths" without repeating the plumbing —
+/// and so daemon A's and daemon B's shutdown channels never appear as
+/// separate `_tx`/`_rx` locals in the test body (they'd otherwise collide
+/// with clippy's `similar_names`, which flags `shutdown_tx_a` against
+/// `shutdown_rx_a`).
+struct RunningDaemon {
+    handle: DaemonHandle,
+    otlp_addr: SocketAddr,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    served: tokio::task::JoinHandle<()>,
+}
+
+impl RunningDaemon {
+    /// Boots a daemon from `config_path`, spawns `serve`, and waits for
+    /// readiness.
+    async fn start(config_path: &std::path::Path) -> Self {
+        let config = duckspout_daemon::config::load(Some(config_path)).unwrap();
+        let daemon = Daemon::boot(&config, 0).await.expect("daemon boots");
+        let handle = daemon.handle();
+        let otlp_addr = daemon.otlp_addr();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(daemon.serve(async {
+            let _ = stop_rx.await;
+        }));
+        wait_ready(&handle).await;
+        Self {
+            handle,
+            otlp_addr,
+            stop_tx,
+            served,
+        }
+    }
+
+    /// Clean shutdown: releases every DuckDB-file handle (the hot engine's
+    /// and the `DuckLake` catalog's) — required before another daemon opens
+    /// the same paths, a DuckDB-file catalog is single-process
+    /// (`duckspout-lake-ducklake`'s module docs, issue #119).
+    async fn stop(self) {
+        let _ = self.stop_tx.send(());
+        self.served.await.unwrap();
+        drop(self.handle);
+    }
 }
 
 /// Row count of the drained `otlp_logs` table, read with a fresh `DuckDB`
@@ -197,27 +248,18 @@ async fn restarted_daemon_reconstructs_the_watermark_and_drains_the_true_next_wi
     let catalog_path = root.path().join("catalog.ducklake");
     let data_path = root.path().join("lake-data");
     let _ = tracing_subscriber::fmt::try_init();
+    let config_path = write_config(root.path());
 
     // ===================== Daemon A: ingest + drain window 0 =====================
-    let config_path = write_config(root.path());
-    let config_a = duckspout_daemon::config::load(Some(&config_path)).unwrap();
-    let daemon_a = Daemon::boot(&config_a, 0).await.expect("daemon A boots");
-    let handle_a = daemon_a.handle();
-    let otlp_addr_a = daemon_a.otlp_addr();
-    let (shutdown_tx_a, shutdown_rx_a) = tokio::sync::oneshot::channel::<()>();
-    let serve_task_a = tokio::spawn(daemon_a.serve(async {
-        let _ = shutdown_rx_a.await;
-    }));
-    wait_ready(&handle_a).await;
-
-    let mut client_a = LogsServiceClient::connect(format!("http://{otlp_addr_a}"))
+    let daemon_a = RunningDaemon::start(&config_path).await;
+    let mut client_a = LogsServiceClient::connect(format!("http://{}", daemon_a.otlp_addr))
         .await
         .expect("connect to daemon A's OTLP listener");
     let window0_base = now_unix_nanos();
     export(&mut client_a, 7, window0_base).await;
 
     // Window 0 is still open — nothing eligible yet.
-    let tick = handle_a.drain_once().await;
+    let tick = daemon_a.handle.drain_once().await;
     assert_eq!(tick.eligible, 0, "the open window is never offered");
 
     // Roll the window (hot.window = 1s): appending again after it elapses
@@ -225,12 +267,15 @@ async fn restarted_daemon_reconstructs_the_watermark_and_drains_the_true_next_wi
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     export(&mut client_a, 2, now_unix_nanos()).await;
 
-    let tick = handle_a.drain_once().await;
-    assert_eq!(tick.eligible, 1, "window 0 closed and its lateness hold is 0s");
+    let tick = daemon_a.handle.drain_once().await;
+    assert_eq!(
+        tick.eligible, 1,
+        "window 0 closed and its lateness hold is 0s"
+    );
     assert_eq!(tick.committed, 1, "window 0 committed");
     assert_eq!(tick.requeued, 0);
 
-    let status_a = handle_a.status();
+    let status_a = daemon_a.handle.status();
     assert_eq!(status_a.watermarks.len(), 1, "one partition drained");
     let watermark_after_a = status_a.watermarks[0].complete_through_ms;
     let partition_a = status_a.watermarks[0].partition.clone();
@@ -240,33 +285,17 @@ async fn restarted_daemon_reconstructs_the_watermark_and_drains_the_true_next_wi
         "watermark {watermark_after_a} should cover window 0's event time {expected_min_ms}"
     );
 
-    // --- Clean shutdown: release every DuckDB-file handle (the hot engine's
-    // --- and the DuckLake catalog's) before daemon B opens the same paths —
-    // --- required, a DuckDB-file catalog is single-process
-    // --- (`duckspout-lake-ducklake`'s module docs, issue #119).
-    shutdown_tx_a.send(()).unwrap();
-    serve_task_a.await.unwrap();
-    drop(handle_a);
+    daemon_a.stop().await;
 
     // ============ Daemon B: boot against the SAME hot/catalog/lake dirs ============
     // This is the "restart": a fresh process, a fresh in-memory
     // WatermarkLedger, the identical durable state on disk.
-    let config_b = duckspout_daemon::config::load(Some(&config_path)).unwrap();
-    let daemon_b = Daemon::boot(&config_b, 0)
-        .await
-        .expect("daemon B boots against the same lake and hot dir");
-    let handle_b = daemon_b.handle();
-    let otlp_addr_b = daemon_b.otlp_addr();
-    let (shutdown_tx_b, shutdown_rx_b) = tokio::sync::oneshot::channel::<()>();
-    let serve_task_b = tokio::spawn(daemon_b.serve(async {
-        let _ = shutdown_rx_b.await;
-    }));
-    wait_ready(&handle_b).await;
+    let daemon_b = RunningDaemon::start(&config_path).await;
 
     // --- (a) The watermark is back BEFORE B ever drains anything: pure
     // --- boot-time reconstruction from the lake's manifest record, not a
     // --- coincidence of a subsequent drain re-deriving the same number.
-    let status_b_at_boot = handle_b.status();
+    let status_b_at_boot = daemon_b.handle.status();
     assert_eq!(
         status_b_at_boot.watermarks.len(),
         1,
@@ -291,13 +320,13 @@ async fn restarted_daemon_reconstructs_the_watermark_and_drains_the_true_next_wi
     // --- stale before B's first append, so that append deterministically
     // --- rolls it closed instead of racing the boot choreography's own
     // --- elapsed time.
-    let mut client_b = LogsServiceClient::connect(format!("http://{otlp_addr_b}"))
+    let mut client_b = LogsServiceClient::connect(format!("http://{}", daemon_b.otlp_addr))
         .await
         .expect("connect to daemon B's OTLP listener");
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     export(&mut client_b, 4, now_unix_nanos()).await; // rolls window 1 closed, opens window 2
 
-    let tick = handle_b.drain_once().await;
+    let tick = daemon_b.handle.drain_once().await;
     assert_eq!(
         tick.eligible, 1,
         "window 1 — A's own still-open window at restart — is the dense-next \
@@ -315,20 +344,18 @@ async fn restarted_daemon_reconstructs_the_watermark_and_drains_the_true_next_wi
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     export(&mut client_b, 1, now_unix_nanos()).await; // rolls window 2 closed, opens window 3 (left undrained)
 
-    let tick = handle_b.drain_once().await;
+    let tick = daemon_b.handle.drain_once().await;
     assert_eq!(tick.eligible, 1, "window 2 is dense-next after window 1");
     assert_eq!(tick.committed, 1, "window 2 committed");
     assert_eq!(tick.requeued, 0);
 
-    let status_b_after_drain = handle_b.status();
+    let status_b_after_drain = daemon_b.handle.status();
     assert!(
         status_b_after_drain.watermarks[0].complete_through_ms >= watermark_after_a,
         "the watermark only advances from where A left it, never regresses"
     );
 
-    shutdown_tx_b.send(()).unwrap();
-    serve_task_b.await.unwrap();
-    drop(handle_b);
+    daemon_b.stop().await;
 
     // --- (c) No double registration: window 0's 7 rows (A) + window 1's 2
     // --- rows (A's leftover, drained by B) + window 2's 4 rows (B), each
