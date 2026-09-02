@@ -22,8 +22,31 @@ as a refinement pipeline:
    exhaustive, pinned state counts, armed broken variants (§8.1).
 2. **P model second**: an executable P model of the same protocol,
    validated with P's checker (deep prioritized schedules, liveness) and
-   **cross-checked against the TLA+ spec** — same protocol, two
-   formalisms; any divergence is itself a finding.
+   **cross-checked against the TLA+ spec mechanically** — P-checker-explored
+   executions, emitted in the §3.7 trace vocabulary, refinement-checked
+   against the TLA+ module (the same machinery step 5 uses for the Rust
+   traces), with witness reachability armed in both directions. Any
+   divergence is itself a finding.
+
+   This is deliberately **not** "an LLM reads both models and compares
+   them": that comparison is not independent evidence. Both models are
+   authored by the same class of agent reading the same design prose
+   (`specs/formal-core.md`), and the evidence for correlated failure is
+   direct — SysMoBench (Cheng et al., SIGOPS 2026,
+   sigops.org/2026/can-llms-model-real-world-systems-in-tla) finds that
+   LLM-authored TLA+ models diverge from real implementations almost
+   entirely through *protocol-understanding* errors (a data structure
+   modeled by its "textbook" shape rather than its actual behavior; two
+   sequential code steps fused into one atomic action) — not through
+   syntax or formalism unfamiliarity. An upstream misunderstanding of the
+   protocol is exactly the kind of error a second LLM transcription of
+   the *same* prose would inherit, not catch. DuckSpout has already lived
+   this: TN-31 (specs/TRANSCRIPTION-NOTES.md) was a design-prose formula
+   TLC falsified — a *mechanical* checker caught it; an LLM proofreading
+   the transcription against the prose it was transcribed from would not
+   have. The independent element in this step is the checker (TLC's
+   refinement semantics), not the second author. Restated: the P model
+   earns its trust by being *executed and refined*, not by being *read*.
 3. **Rust third, built from both**: the spec supplies the invariants; the
    P model supplies implementation-granularity protocol decisions,
    already made and reviewed before the borrow checker meets them.
@@ -50,6 +73,17 @@ Scoping and consequences:
   a dotnet/P toolchain surface in CI (gated + ledgered like everything
   else), and the sync discipline that step 5's dual conformance makes
   mechanical.
+
+**Fairness assumptions get the same discipline as invariants.** SysMoBench's
+sharpest quantitative finding is that LLM-authored liveness properties fail
+far more often than safety ones (41.9% vs. 8.3% of properties violated in
+its runs), almost entirely from fairness assumptions tuned broader or
+narrower than the implementation actually provides. Every `WF_vars`/`SF_vars`
+clause added to a module (TLA+ or P) must cite, in the same commit, the
+concrete implementation mechanism that supplies that fairness — and the
+corresponding broken variant (removing the fairness) must be armed and
+shown to break the liveness property it was added for. A fairness
+assumption with no cited mechanism is a #129-class gap, not a proof.
 
 ## Revisit when
 

@@ -63,3 +63,20 @@ pub const RETENTION_CLASS_CAP: u32 = 8;
 
 /// The system tenants' built-in short retention class, hours (§9.3.1).
 pub const SYSTEM_TENANT_RETENTION_HOURS: u64 = 72;
+
+/// The observation listener's default port (§9.3.2: "a dedicated listener,
+/// separate port from ingest, Flight, and peer traffic"). Not a §9.6.1
+/// setting — no divergent-workload justification exists for a knob here
+/// (R-12) — so it is a fixed constant, following `node.peer_listen`'s
+/// convention-port shape; `duckspoutctl status --addr` still lets an
+/// operator point at a non-default bind. Full `/healthz` `/readyz`
+/// `/metrics` per §9.3.2 land with the deploy-manifest work (v0.3, issue
+/// #61); v0.1 serves the `/status` disclosure this issue scopes (#38).
+pub const OBSERVATION_LISTEN_PORT_DEFAULT: u16 = 9095;
+
+/// How often the background drain loop checks for newly-eligible windows
+/// (§6.3). Not a knob (R-12): window eligibility is already gated by
+/// `hot.window` and `drain.allowed_lateness`; this is merely how promptly
+/// the daemon notices, bounded well under the lateness hold at every
+/// documented default.
+pub const DRAIN_TICK_INTERVAL_MS: u64 = 1_000;

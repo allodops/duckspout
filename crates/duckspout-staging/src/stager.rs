@@ -49,8 +49,8 @@ use std::sync::{Arc, Mutex};
 use arrow::ipc::reader::StreamReader;
 use duckspout_types::{
     BoxFuture, Clock, DatasetId, DecodedBatch, NodeStatus, OverloadStatus, PartitionId,
-    StageCommitter, StageError, StageOutcome, StagedCoverage, Storage, TenantId, WindowId,
-    throttle_retry_delay_ms,
+    StageCommitter, StageError, StageOutcome, StagedCoverage, Storage, TenantId, TraceEvent,
+    TraceSink, WindowId, throttle_retry_delay_ms,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -98,6 +98,11 @@ pub struct EngineStager<S: Storage, C: Clock> {
     /// window below the documented retry horizon. The operator surface
     /// (daemon) reads and warns on this; the ladder never does.
     dedup_cap_evictions: AtomicU64,
+    /// The §3.7 capture seam: `Accept`, `StageCommit`, and `DedupCheck`
+    /// journal here (docs/trace-mapping.md's attributions). `None` — the
+    /// production default until the `conformance` row arms — journals
+    /// nothing.
+    trace: Option<Arc<dyn TraceSink>>,
 }
 
 impl<S: Storage, C: Clock> EngineStager<S, C> {
@@ -112,7 +117,17 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
             config,
             open_windows: Mutex::new(HashMap::new()),
             dedup_cap_evictions: AtomicU64::new(0),
+            trace: None,
         }
+    }
+
+    /// Journals this stager's §3.3 events (`Accept`, `StageCommit`,
+    /// `DedupCheck`) through `sink` (§3.7; the trace-conformance harness's
+    /// capture side).
+    #[must_use]
+    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
+        self.trace = Some(sink);
+        self
     }
 
     /// The wrapped engine (the daemon reaches readers and the drain seam
@@ -126,20 +141,16 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
     /// orthogonal replication flag. `drain_stalled` is the drain's stall
     /// signal (v0.1: no drain exists, callers pass `false`);
     /// `replication_degraded` is replication's (v0.1: `false`).
-    ///
-    /// # Errors
-    ///
-    /// [`StageError::Backend`] if the engine's accounting is unreadable.
-    pub fn status(&self, drain_stalled: bool) -> Result<NodeStatus, StageError> {
-        let staged = self.engine.staged_bytes().map_err(|e| backend(&e))?;
-        Ok(NodeStatus {
+    #[must_use]
+    pub fn status(&self, drain_stalled: bool) -> NodeStatus {
+        NodeStatus {
             overload: OverloadStatus::from_measure(
-                staged,
+                self.engine.staged_bytes(),
                 self.config.hot_max_bytes,
                 drain_stalled,
             ),
             replication_degraded: false,
-        })
+        }
     }
 
     /// Count-cap dedup evictions so far (§4.4.1's below-horizon warning
@@ -182,6 +193,18 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
             return Ok(StageOutcome::Committed(Vec::new()));
         }
 
+        // §3.3 Accept: decoded and ADMITTED into volatile memory — the
+        // admission gate (`admit`, §4.5's rung check) passed and the batch
+        // is nonempty. Journaled here rather than in `duckspout-accept`
+        // because the model's Accept bundles the rung guard, which #146
+        // placed on this side of the port (docs/trace-mapping.md carries
+        // the same attribution); a throttled or refused request journals
+        // Throttle/Refuse INSTEAD of Accept, exactly as §3.3's ladder
+        // actions resolve an unsent request.
+        if let Some(trace) = &self.trace {
+            trace.record(TraceEvent::Accept);
+        }
+
         let dedup_key = dedup_key(batch);
         let window = self
             .current_window(&batch.dataset, &partition)
@@ -203,6 +226,12 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
             // did; commit releases it. Nothing was appended (R-2: never
             // replay blindly, never re-stage).
             txn.commit().map_err(|e| backend(&e))?;
+            // §3.7: the duplicate's resolution IS DedupCheck — both model
+            // branches (replay / in-flight) journal the same name, and no
+            // StageCommit or second ClientAck may follow it.
+            if let Some(trace) = &self.trace {
+                trace.record(TraceEvent::DedupCheck);
+            }
             return Ok(outcome);
         }
 
@@ -231,6 +260,12 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
             )
             .map_err(|e| backend(&e))?;
         let coverage = txn.commit().map_err(|e| backend(&e))?;
+        // §3.7: journal only on a SUCCESSFUL fsynced commit — a failed
+        // transaction staged nothing and journals nothing (the model has
+        // no failed-StageCommit action).
+        if let Some(trace) = &self.trace {
+            trace.record(TraceEvent::StageCommit);
+        }
         if cap_evicted > 0 {
             self.dedup_cap_evictions
                 .fetch_add(cap_evicted, Ordering::Relaxed);
@@ -242,7 +277,7 @@ impl<S: Storage, C: Clock> EngineStager<S, C> {
     /// checked before any work — and only here, so in-flight commits are
     /// never gated.
     fn admit(&self) -> Result<(), StageError> {
-        let staged = self.engine.staged_bytes().map_err(|e| backend(&e))?;
+        let staged = self.engine.staged_bytes();
         let max = self.config.hot_max_bytes;
         match OverloadStatus::from_measure(staged, max, false) {
             OverloadStatus::RefusingIngest => Err(StageError::RefusingIngest {
@@ -369,4 +404,76 @@ fn parse_outcome(outcome_json: &str) -> Result<Vec<StagedCoverage>, StagingError
 
 fn backend(error: &StagingError) -> StageError {
     StageError::Backend(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use duckspout_types::{DatasetId, DatasetKind, TenantId};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn batch(records: Vec<u8>, token: Option<String>) -> DecodedBatch {
+        DecodedBatch {
+            dataset: DatasetId::new("otlp_logs"),
+            kind: DatasetKind::Event,
+            tenant: TenantId::new("t"),
+            idempotency_key: token,
+            records: Bytes::from(records),
+        }
+    }
+
+    proptest! {
+        /// §8.5's dedup-determinism laws (issue #40) over the §4.4.1 key
+        /// derivation, as pure-function properties — the engine-level replay
+        /// behavior is exercised in `tests/stager.rs`; these pin the key
+        /// itself for ANY content and token:
+        ///
+        /// - equal `(content | token)` inputs derive equal keys, and the key
+        ///   reads NOTHING else (would catch a nonce, a timestamp, or batch
+        ///   metadata leaking into the key — every retry would then miss the
+        ///   window and duplicate);
+        /// - a token makes the key content-independent (§4.4.1 precedence —
+        ///   would catch content sneaking back in, where a client's retry
+        ///   with a re-encoded body would double-stage);
+        /// - token-derived and content-derived keys never collide, even for
+        ///   a token forged to look like a content hash (the `t:`/`h:`
+        ///   prefix discrimination — would catch the prefixes being
+        ///   dropped);
+        /// - distinct contents derive distinct keys (the content hash doing
+        ///   its job).
+        #[test]
+        fn dedup_key_is_a_pure_function_of_content_or_token(
+            content_a in prop::collection::vec(any::<u8>(), 0..64),
+            content_b in prop::collection::vec(any::<u8>(), 0..64),
+            token in ".{0,32}",
+        ) {
+            // Determinism + content-only dependence.
+            prop_assert_eq!(
+                dedup_key(&batch(content_a.clone(), None)),
+                dedup_key(&batch(content_a.clone(), None))
+            );
+            // Token precedence: content is invisible under a token.
+            prop_assert_eq!(
+                dedup_key(&batch(content_a.clone(), Some(token.clone()))),
+                dedup_key(&batch(content_b.clone(), Some(token.clone())))
+            );
+            // Prefix discrimination: a token can never collide with any
+            // content-derived key — including a token spelled exactly like
+            // one.
+            let content_key = dedup_key(&batch(content_a.clone(), None));
+            prop_assert_ne!(
+                dedup_key(&batch(content_b.clone(), Some(content_key.clone()))),
+                content_key
+            );
+            // Distinct contents → distinct keys.
+            if content_a != content_b {
+                prop_assert_ne!(
+                    dedup_key(&batch(content_a, None)),
+                    dedup_key(&batch(content_b, None))
+                );
+            }
+        }
+    }
 }

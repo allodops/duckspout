@@ -82,9 +82,16 @@ test:
 test-doc:
     cargo test --doc --workspace
 
-# Full test suite: nextest + doctests (ci.yml:test)
+# Loom interleaving exploration of the CTK's own sync primitives (§8.3);
+# the `loom` feature swaps in loom's checked types, so the models drive the
+# real code (crates/duckspout-ctk/tests/loom.rs)
 [group('test')]
-test-all: test test-doc
+test-loom:
+    cargo nextest run -p duckspout-ctk --features loom --test loom --retries 0
+
+# Full test suite: nextest + doctests + loom models (ci.yml:test)
+[group('test')]
+test-all: test test-doc test-loom
 
 # --- spec ---
 

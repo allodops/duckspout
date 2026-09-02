@@ -1,29 +1,18 @@
-//! The `DuckSpout` node daemon.
+//! The `DuckSpout` node daemon: the thin CLI wrapper (§10.4) over the
+//! `duckspout_daemon` library crate — config parsing, `--dump-config-manifest`,
+//! signal wiring, and calling [`duckspout_daemon::wiring::Daemon`]. Zero
+//! protocol logic of its own; see the library crate's docs (`src/lib.rs`)
+//! for why it is a library first, and `wiring`'s module docs for what is
+//! wired at v0.1 (issue #38) and what is deliberately deferred.
 //!
-//! A thin composition of the protocol crates (§10.4): wiring, signal
-//! handling, and the cadence loop that ticks drains and retention — zero
-//! protocol logic of its own. Anything the daemon can do, an embedder can do
-//! by depending on the crates directly.
-//!
-//! Complete at bootstrap: the full 32-setting configuration surface
-//! ([`config`], §9.6.1), the §9.6.3 fixed constants ([`constants`]), and
-//! `--dump-config-manifest` ([`manifest`]) — the golden-manifest mechanism
-//! `check-invariants.mjs` diffs against `floors/config-surface.toml`
-//! (SEED s§7). Ⓢ v0.1: the wiring itself and the status endpoint.
-//!
-//! Design home: `docs/operations.md` (lands at absorption; until then see
-//! `DUCKSPOUT.md` §9).
+//! Design home: `docs/operations.md` (§9).
 
 #![forbid(unsafe_code)]
-
-mod config;
-mod constants;
-mod manifest;
-mod wiring;
 
 use std::path::PathBuf;
 
 use clap::Parser;
+use duckspout_daemon::{config, constants, manifest, wiring};
 
 /// The `DuckSpout` node daemon (§9).
 #[derive(Debug, Parser)]
@@ -36,7 +25,8 @@ struct Cli {
     dump_config_manifest: bool,
 
     /// Path to the node's TOML configuration file (§9.6: one TOML file,
-    /// environment-variable overrides, secrets by file path).
+    /// environment-variable overrides, secrets by file path). Required
+    /// unless `--dump-config-manifest` is given.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -52,11 +42,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt::init();
 
-    if let Some(path) = cli.config.as_deref() {
-        let loaded = config::load(Some(path))?;
-        tracing::info!(data_dir = %loaded.node.data_dir.display(), "configuration loaded");
-    }
+    let Some(path) = cli.config.as_deref() else {
+        return Err("--config <path> is required to boot the daemon (or pass \
+                     --dump-config-manifest to print the setting surface and exit)"
+            .into());
+    };
+    let loaded = config::load(Some(path))?;
+    tracing::info!(
+        data_dir = %loaded.node.data_dir.display(),
+        otlp_listen = loaded.node.otlp_listen,
+        "configuration loaded"
+    );
 
-    tracing::info!("duckspout-daemon: {} — exiting", wiring::STATUS);
+    let daemon = wiring::Daemon::boot(&loaded, constants::OBSERVATION_LISTEN_PORT_DEFAULT).await?;
+    tracing::info!(
+        otlp_addr = %daemon.otlp_addr(),
+        status_addr = %daemon.status_addr(),
+        node_id = %daemon.handle().node_id(),
+        "daemon booted"
+    );
+
+    daemon.serve(shutdown_signal()).await;
     Ok(())
+}
+
+/// Resolves once the process receives SIGTERM (§9.1.2's shallow-drain
+/// choreography) or SIGINT (`Ctrl-C`, the same choreography — a convenient
+/// local-dev equivalent).
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("installing the SIGTERM handler");
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }

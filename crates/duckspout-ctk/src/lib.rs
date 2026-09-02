@@ -39,6 +39,8 @@ pub mod ledger;
 pub mod scheduler;
 pub mod storage;
 pub mod strategy;
+mod sync;
+pub mod trace_writer;
 pub mod transport;
 
 pub use clock::VirtualClock;
@@ -46,4 +48,5 @@ pub use ledger::{FaultCount, InjectorLedger};
 pub use scheduler::SeededScheduler;
 pub use storage::InMemStorage;
 pub use strategy::{ScheduleStrategy, SeededRandom};
+pub use trace_writer::NdjsonTraceWriter;
 pub use transport::{InMemNetwork, InMemTransport};

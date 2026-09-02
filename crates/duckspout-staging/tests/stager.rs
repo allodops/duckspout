@@ -430,7 +430,7 @@ fn ladder_throttles_at_95_and_refuses_at_100() {
         committed(stager.stage_blocking(&decoded("t", 100, 0)).unwrap());
         engine = Arc::clone(stager.engine());
     }
-    let staged = engine.staged_bytes().unwrap();
+    let staged = engine.staged_bytes();
     assert!(staged > 0, "accounting must see the staged batch");
 
     // A stager whose capacity puts the current fill at exactly 100%.
@@ -474,7 +474,7 @@ fn in_flight_work_completes_at_every_rung() {
         committed(stager.stage_blocking(&decoded("t", 10, 0)).unwrap());
         engine = Arc::clone(stager.engine());
     }
-    let staged = engine.staged_bytes().unwrap();
+    let staged = engine.staged_bytes();
 
     // An in-flight transaction (begun before the rung would gate it)
     // commits fine — the engine has no ladder, by design.
@@ -519,25 +519,25 @@ fn status_discloses_the_rung() {
         committed(stager.stage_blocking(&decoded("t", 100, 0)).unwrap());
         engine = Arc::clone(stager.engine());
     }
-    let staged = engine.staged_bytes().unwrap();
+    let staged = engine.staged_bytes();
 
     let (roomy, _, _) = stager_on(Arc::clone(&engine), config(staged * 100));
     assert_eq!(
-        roomy.status(false).unwrap().overload,
+        roomy.status(false).overload,
         duckspout_types::OverloadStatus::Normal
     );
     let (pressured, _, _) = stager_on(Arc::clone(&engine), config(staged * 100 / 90));
     assert_eq!(
-        pressured.status(false).unwrap().overload,
+        pressured.status(false).overload,
         duckspout_types::OverloadStatus::StagingPressure
     );
     assert_eq!(
-        pressured.status(true).unwrap().overload,
+        pressured.status(true).overload,
         duckspout_types::OverloadStatus::DrainStalled
     );
     let (full, _, _) = stager_on(engine, config(staged));
     assert_eq!(
-        full.status(false).unwrap().overload,
+        full.status(false).overload,
         duckspout_types::OverloadStatus::RefusingIngest
     );
 }
@@ -552,24 +552,97 @@ fn staged_bytes_track_commit_drop_and_reopen() {
     let after_commit;
     {
         let (stager, _, _) = stager_over(dir.path());
-        assert_eq!(stager.engine().staged_bytes().unwrap(), 0);
+        assert_eq!(stager.engine().staged_bytes(), 0);
         committed(stager.stage_blocking(&decoded("t", 100, 0)).unwrap());
-        after_commit = stager.engine().staged_bytes().unwrap();
+        after_commit = stager.engine().staged_bytes();
         assert!(after_commit > 0);
     }
     {
         let engine = open_engine(dir.path(), "node-a/1");
-        assert_eq!(
-            engine.staged_bytes().unwrap(),
-            after_commit,
-            "accounting is durable"
-        );
+        assert_eq!(engine.staged_bytes(), after_commit, "accounting is durable");
         assert!(
             engine
                 .drop_window(&dataset, &partition, WindowId(0))
                 .unwrap()
         );
-        assert_eq!(engine.staged_bytes().unwrap(), 0, "dropped bytes leave M");
+        assert_eq!(engine.staged_bytes(), 0, "dropped bytes leave M");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §8.5 law suite (issue #40): replay-returns-original under arbitrary retry
+// interleavings — exhaustive over every arrival order at a tiny scope
+// (§3.1's posture), not sampled.
+// ---------------------------------------------------------------------------
+
+/// For EVERY arrival order of {A, A-retried, B, C} (all 24 permutations —
+/// the 12 distinct multiset arrangements, each reached twice because the
+/// duplicate pair is content-identical), the retry replays exactly the
+/// original's committed
+/// coverage — wherever it lands in the interleaving — and the final staged
+/// state holds each batch exactly once with a dense sequence. The
+/// example-based tests above pin single orders; this quantifies the §4.4.1
+/// law they instantiate. Would catch: a dedup entry written after commit
+/// instead of inside it (an interleaving-dependent duplicate), a stored
+/// outcome that depends on when the retry arrives, or a replay that
+/// consumes sequence numbers.
+#[test]
+fn replay_returns_the_original_under_every_retry_interleaving() {
+    // 0 and 1 are the duplicate pair; 2 and 3 are distinct bystanders.
+    let batches = |i: usize| match i {
+        0 | 1 => decoded("t", 2, 1_000),
+        2 => decoded("t", 1, 2_000),
+        _ => decoded("t", 3, 3_000),
+    };
+    let mut orders: Vec<[usize; 4]> = Vec::new();
+    for a in 0..4 {
+        for b in 0..4 {
+            for c in 0..4 {
+                for d in 0..4 {
+                    let mut seen = [false; 4];
+                    for i in [a, b, c, d] {
+                        seen[i] = true;
+                    }
+                    if seen == [true; 4] {
+                        orders.push([a, b, c, d]);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(orders.len(), 24);
+
+    for order in orders {
+        let dir = tempfile::tempdir().unwrap();
+        let (stager, _, _) = stager_over(dir.path());
+        let mut original: Option<Vec<duckspout_types::StagedCoverage>> = None;
+        for index in order {
+            let outcome = stager.stage_blocking(&batches(index)).unwrap();
+            match (index, &original) {
+                // First arrival of the duplicate pair commits…
+                (0 | 1, None) => original = Some(committed(outcome)),
+                // …and the other one replays IDENTICAL coverage, whenever
+                // it arrives.
+                (0 | 1, Some(first)) => {
+                    assert_eq!(
+                        &replayed(outcome),
+                        first,
+                        "order {order:?}: the retry must replay the original's ack evidence"
+                    );
+                }
+                _ => {
+                    committed(outcome);
+                }
+            }
+        }
+        // Exactly one copy of the duplicate pair landed: 2 + 1 + 3 rows,
+        // densely sequenced.
+        let partition = PartitionId::from_tenant_shard(&duckspout_types::TenantId::new("t"), 0);
+        assert_eq!(
+            stager.engine().applied_seq(&partition).unwrap(),
+            Some(6),
+            "order {order:?}: duplicate rows leaked into staging"
+        );
     }
 }
 

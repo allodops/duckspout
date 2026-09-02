@@ -28,7 +28,7 @@ Vocabulary rules carried by this table (§3.7, §6.4, §3.3):
 
 | Variant | Emitting module | Spec action § | Notes |
 |---|---|---|---|
-| `Accept` | `duckspout-accept` | §3.3 Ingest | Admission into volatile memory; no promise. |
+| `Accept` | `duckspout-staging` | §3.3 Ingest | Admission into volatile memory; no promise. Attribution follows the §4.5 rung gate, which #146 placed on the staging side of the `StageCommitter` port: §3.3's Accept bundles that guard, so the tracepoint rides the gate — a throttled/refused request journals `Throttle`/`Refuse` instead of `Accept`. |
 | `DedupCheck` | `duckspout-staging` | §3.3 Ingest | Consults the per-node dedup ledger (§4.4); both branches (replay / throttled) journal the same name. |
 | `StageCommit` | `duckspout-staging` | §3.3 Ingest | The fsynced hot-store transaction (A1). |
 | `ClientAck` | `duckspout-accept` | §3.3 Ingest | Only after StageCommit + RF receipts (Keep Rule 1). |

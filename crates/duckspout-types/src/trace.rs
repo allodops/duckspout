@@ -153,9 +153,112 @@ impl TraceRecord {
     }
 }
 
+/// The §3.7 capture seam: a tracepoint hands each journaled event to a
+/// sink; the sink owns node identity, the dense per-node sequence, and the
+/// one-flushed-NDJSON-line-per-event discipline (D-6).
+///
+/// The trait lives HERE because the emitters are protocol crates, which
+/// depend on `duckspout-types` only (ADR-0008); the concrete NDJSON writer
+/// is I/O and lives with the harness (`duckspout-ctk`), keeping this crate
+/// I/O-free by charter. Tracepoints hold `Option<Arc<dyn TraceSink>>` —
+/// `None` journals nothing, which is the production default until the
+/// `conformance` ledger row arms (issue #44).
+pub trait TraceSink: Send + Sync {
+    /// Journals one event. Implementations must write and flush one NDJSON
+    /// line before returning (§3.7) — or fail loud: a tracepoint that
+    /// silently drops events certifies runs that never happened as
+    /// recorded (R-3).
+    fn record(&self, event: TraceEvent);
+}
+
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    /// Every [`TraceEvent`] variant, exactly once — the §3.3 vocabulary
+    /// (SEED Appendix B: 27 node-journaled + `ClientTimeout`). Kept beside
+    /// the enum; the invariant engine's `trace-mapping` rule pairs the enum
+    /// with `docs/trace-mapping.md`, and the vocabulary test below pairs the
+    /// serialized token with the variant name.
+    const ALL_EVENTS: [TraceEvent; 28] = [
+        TraceEvent::Accept,
+        TraceEvent::DedupCheck,
+        TraceEvent::StageCommit,
+        TraceEvent::ClientAck,
+        TraceEvent::Throttle,
+        TraceEvent::Refuse,
+        TraceEvent::Forward,
+        TraceEvent::PeerApply,
+        TraceEvent::Receipt,
+        TraceEvent::SealPart,
+        TraceEvent::PutPart,
+        TraceEvent::LakeCommitOk,
+        TraceEvent::LakeCommitAbort,
+        TraceEvent::LakeCommitIndeterminate,
+        TraceEvent::Reconcile,
+        TraceEvent::Expire,
+        TraceEvent::Demote,
+        TraceEvent::Evict,
+        TraceEvent::DropWindow,
+        TraceEvent::SnapshotSeal,
+        TraceEvent::ClaimAdvertise,
+        TraceEvent::Heartbeat,
+        TraceEvent::FenceBoot,
+        TraceEvent::DegradedBoot,
+        TraceEvent::TakeoverDrain,
+        TraceEvent::DeclareLoss,
+        TraceEvent::EvolveSchema,
+        TraceEvent::ClientTimeout,
+    ];
+
+    #[test]
+    fn every_event_serializes_as_its_verbatim_action_name() {
+        // §3.7: event names are the §3.3 action names, VERBATIM — a
+        // `#[serde(rename…)]` attribute or a renamed variant would silently
+        // break every recorded trace's refinement pairing; this catches it
+        // for all 28 variants (and both environment events) at once.
+        for event in ALL_EVENTS {
+            assert_eq!(
+                serde_json::to_value(event).expect("serialize"),
+                serde_json::Value::String(format!("{event:?}")),
+                "the serialized token must be the variant name"
+            );
+        }
+        for event in [EnvironmentEvent::CrashNode, EnvironmentEvent::CrashWipe] {
+            assert_eq!(
+                serde_json::to_value(event).expect("serialize"),
+                serde_json::Value::String(format!("{event:?}"))
+            );
+        }
+    }
+
+    proptest! {
+        /// §8.5's serialization-stability law for the trace vocabulary
+        /// (D-6): for ANY node id — including quotes, newlines, and
+        /// non-ASCII — any seq, and any event, the NDJSON line is one line
+        /// and decodes back losslessly. Would catch a hand-rolled encoder
+        /// (or a future "faster" one) that fails to escape an embedded
+        /// newline or quote: an unescaped `\n` in a node id would split one
+        /// journaled event into two corrupt lines and break every
+        /// downstream trace check.
+        #[test]
+        fn ndjson_round_trips_any_record(
+            node in ".{0,40}",
+            seq in any::<u64>(),
+            index in 0usize..ALL_EVENTS.len(),
+        ) {
+            let record = TraceRecord {
+                node: NodeId::new(node),
+                seq,
+                event: ALL_EVENTS[index],
+            };
+            let line = record.to_ndjson_line().expect("serialize");
+            prop_assert!(!line.contains('\n'), "NDJSON: one event, one line");
+            prop_assert_eq!(TraceRecord::from_ndjson_line(&line).expect("deserialize"), record);
+        }
+    }
 
     #[test]
     fn ndjson_round_trip_is_lossless_and_single_line() {
