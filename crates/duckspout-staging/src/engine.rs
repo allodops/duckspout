@@ -353,6 +353,23 @@ impl<S: Storage> StagingEngine<S> {
         Ok(true)
     }
 
+    /// Deletes the rows of `table` matching `predicate` in one durable
+    /// write-connection statement — the covered-rows half of the TN-32
+    /// coverage-guarded `DropWindow` (the seal surface builds the
+    /// predicate; both arguments are engine-generated, never caller
+    /// strings).
+    pub(crate) fn delete_covered_rows(
+        &self,
+        table: &str,
+        predicate: &str,
+    ) -> Result<(), StagingError> {
+        let writer = self.lock_writer()?;
+        writer
+            .conn
+            .execute_batch(&format!("DELETE FROM {table} WHERE {predicate}"))?;
+        Ok(())
+    }
+
     /// The live micro-window tables, sorted by (dataset, partition, window).
     ///
     /// # Errors
@@ -374,6 +391,28 @@ impl<S: Storage> StagingEngine<S> {
             (&a.dataset, &a.partition, a.window.0).cmp(&(&b.dataset, &b.partition, b.window.0))
         });
         Ok(windows)
+    }
+
+    /// The hot volume directory this engine was opened on.
+    #[must_use]
+    pub fn hot_dir(&self) -> &std::path::Path {
+        &self.hot_dir
+    }
+
+    /// The registered table name of one micro-window, or `None` if the
+    /// window is not live on this node.
+    ///
+    /// # Errors
+    ///
+    /// [`StagingError::WriterPoisoned`].
+    pub fn window_table(
+        &self,
+        dataset: &DatasetId,
+        partition: &PartitionId,
+        window: WindowId,
+    ) -> Result<Option<String>, StagingError> {
+        let key = (dataset.clone(), partition.clone(), window.0);
+        Ok(self.lock_writer()?.windows.get(&key).cloned())
     }
 
     /// The highest committed seq for `partition` under this engine's origin
@@ -649,6 +688,12 @@ pub struct StagingReader {
 }
 
 impl StagingReader {
+    /// The read connection, for sibling modules (the seal surface) that
+    /// compose their own read-only statements.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Runs `sql` and returns the engine's native Arrow output — the result
     /// schema plus record batches exactly as produced (the §7.4 serve seam:
     /// these feed arrow-flight's IPC encoder untouched).
@@ -786,7 +831,7 @@ fn staging_sql_type(datatype: &DataType) -> Option<&'static str> {
 }
 
 /// Quotes an arbitrary payload column name as a `DuckDB` identifier.
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
