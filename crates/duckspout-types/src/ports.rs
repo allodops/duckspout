@@ -253,10 +253,12 @@ pub trait AcceptAdapter: Send + Sync {
 
 /// Per-origin seq coverage of one committed partition — exactly what
 /// `ClientAck` evidence needs (§4.3) and what `Forward` ships (§4.2.3).
+/// Serializable because it is the dedup window's stored outcome (§4.4.1):
+/// a duplicate replays the original's ack evidence verbatim.
 ///
 /// Defined here (ADR-0008: it crosses the accept↔staging boundary inside
 /// [`StageCommitter`]'s signature); `duckspout-staging` re-exports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedCoverage {
     /// The partition the rows landed in.
     pub partition: PartitionId,
@@ -264,10 +266,10 @@ pub struct StagedCoverage {
     pub range: OriginSeqRange,
 }
 
-/// A staging failure as the accept path sees it (§4.3): every variant is a
-/// **not-acked** outcome — the batch may be retried, and a retry can land on
-/// a healthy node, so adapters map these onto the retryable wire vocabulary
-/// (`StorageFailure`, §4.1.2).
+/// A staging failure as the accept path sees it (§4.3, §4.5): every
+/// variant is a **not-staged, not-acked** outcome — no partial state
+/// exists. The ladder variants carry the §4.5 growing retry delay so
+/// adapters can attach the spec's `RetryInfo` without knowing the measure.
 #[derive(Debug, thiserror::Error)]
 pub enum StageError {
     /// The [`DecodedBatch::records`] bytes are not a decodable Arrow IPC
@@ -280,41 +282,75 @@ pub enum StageError {
     /// is acked (§4.3).
     #[error("staging backend: {0}")]
     Backend(String),
+    /// Overload-ladder rung 2 (§4.5, M ≥ 95%): admission gated; the batch
+    /// was not staged. Maps to `OtlpErrorClass::Throttled` — UNAVAILABLE
+    /// with the carried `RetryInfo` delay.
+    #[error("throttled: staging at rung 2, retry in {retry_after_ms} ms")]
+    Throttled {
+        /// §4.5's growing delay, a pure function of the measure.
+        retry_after_ms: u64,
+    },
+    /// Overload-ladder rung 3 (§4.5, M ≥ 100%): new writes refused. Maps to
+    /// `OtlpErrorClass::RefusingIngest` — still the retryable vocabulary.
+    #[error("refusing ingest: staging at rung 3, retry in {retry_after_ms} ms")]
+    RefusingIngest {
+        /// The retry delay carried on the wire (the §4.5 ceiling).
+        retry_after_ms: u64,
+    },
 }
 
-/// The staging port the accept path commits through (§4.3, ADR-0008): stage
-/// one decoded batch in one durable `StageCommit` transaction and return the
-/// per-partition coverage evidence `ClientAck` is built from.
+/// A successful `DedupCheck` + `StageCommit` resolution (§4.3, §4.4.1):
+/// every non-error port call lands on exactly one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// A fresh batch, staged durably in one transaction. The coverage is
+    /// the `ClientAck` evidence (§4.3).
+    Committed(Vec<StagedCoverage>),
+    /// `DedupCheck` hit an entry whose ack evidence is complete (the
+    /// acked-entry branch, and the `AtRF` branch once receipts reached RF —
+    /// §3.3, §4.4.1): the original outcome is replayed verbatim, nothing is
+    /// re-staged (R-2).
+    DuplicateAcked(Vec<StagedCoverage>),
+    /// `DedupCheck` hit an entry still short of RF (§4.4.1): the retrying
+    /// client gets the retryable signal (`OtlpErrorClass::DuplicateInFlight`)
+    /// and keeps retrying until receipts complete. Unreachable at RF = 1
+    /// (v0.1: an entry is ack-complete the moment its commit returns); the
+    /// branch exists because §3's `DedupCheck` has it, and replication (v0.2)
+    /// makes it live.
+    DuplicateInFlight,
+}
+
+/// The staging port the accept path commits through (§4.3–§4.5, ADR-0008):
+/// `DedupCheck` + `StageCommit` as one call, gated by the overload ladder.
 ///
 /// Contract, in §4.3's vocabulary:
 ///
-/// - `Ok` means `StageCommit` returned — the whole batch is fsynced-durable
-///   locally, atomically. The caller may ack once the replication floor is
-///   met (v0.1 single-node: RF = 1, so `Ok` **is** ack-worthy; the RF−1
-///   `Receipt` wait of §4.3 arrives with replication at v0.2 and slots
-///   between this call and the ack).
-/// - `Err` means nothing was staged and nothing may be acked. There is no
-///   partial outcome — a batch stages in its entirety or not at all (§4.1.2).
-/// - The dedup-window entry of §4.4.1 rides the same transaction; its
-///   client-visible semantics (replay, in-flight throttle) land with
-///   issue #33 on this same seam.
+/// - `Ok(Committed)` means `StageCommit` returned — the whole batch is
+///   fsynced-durable locally, atomically, with its dedup-window entry
+///   written in the same transaction (§4.4.1). The caller may ack once the
+///   replication floor is met (v0.1 single-node: RF = 1, so `Committed`
+///   **is** ack-worthy; the RF−1 `Receipt` wait of §4.3 arrives with
+///   replication at v0.2 and slots between this call and the ack).
+/// - `Ok(DuplicateAcked)` replays the original outcome without re-staging
+///   (R-2); `Ok(DuplicateInFlight)` is the pre-RF duplicate signal.
+/// - `Err` means nothing was staged and nothing may be acked — including
+///   the ladder's `Throttled`/`RefusingIngest` admission refusals (§4.5),
+///   which gate **admission only**: a `StageCommit` already begun always
+///   completes, whatever the rung ("the ladder gates admission, never
+///   promises made"). There is no partial outcome — a batch stages in its
+///   entirety or not at all (§4.1.2).
 ///
 /// Home crate: `duckspout-staging` (the WAL=hot engine implements this; the
 /// engine is blocking, so implementations may resolve the returned future
 /// synchronously — callers embed the port off their reactor, ADR-0003).
 pub trait StageCommitter: Send + Sync {
-    /// Stages `batch` in one durable transaction (§4.3 `StageCommit`).
-    ///
-    /// Returns the committed per-origin seq coverage, one entry per
-    /// partition touched, sorted by partition.
+    /// Resolves `batch` through `DedupCheck` and, when fresh, stages it in
+    /// one durable transaction (§4.3, §4.4.1).
     ///
     /// # Errors
     ///
     /// [`StageError`] — the batch is not staged and must not be acked.
-    fn stage_commit(
-        &self,
-        batch: DecodedBatch,
-    ) -> BoxFuture<'_, Result<Vec<StagedCoverage>, StageError>>;
+    fn stage_commit(&self, batch: DecodedBatch) -> BoxFuture<'_, Result<StageOutcome, StageError>>;
 }
 
 // ---------------------------------------------------------------------------

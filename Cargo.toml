@@ -25,6 +25,10 @@ arrow = "58"
 arrow-flight = "58"
 parquet = "58"
 tonic = "0.14"
+# tonic's own google.rpc details companion (RetryInfo riding UNAVAILABLE,
+# §4.5) — same project, same 0.14 line; no in-house candidate
+# (R-third-party-first).
+tonic-types = "0.14"
 prost = "0.14"
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic",
@@ -45,6 +49,10 @@ proptest = "1"
 proptest-state-machine = "0.8"
 loom = "0.7"
 crc32fast = "1"
+# §4.4.1's content-hash dedup key needs a collision-resistant hash (a 32-bit
+# checksum at 100k entries would collide constantly); sha2 is the boring
+# RustCrypto standard, no in-house candidate (R-third-party-first).
+sha2 = "0.10"
 # dev-only: unique on-disk fixtures for the staging engine's real-DuckDB
 # tests (issue #31); the de-facto standard, no in-house candidate
 # (R-third-party-first).

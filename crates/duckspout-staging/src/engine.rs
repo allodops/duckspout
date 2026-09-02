@@ -61,7 +61,7 @@ use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 use duckspout_types::{
     BoxFuture, DatasetId, NodeId, OriginSeqRange, PartitionId, StagedCoverage, Storage,
-    StoragePath, WindowId,
+    StoragePath, TenantId, WindowId,
 };
 
 use crate::naming::window_table_name;
@@ -122,6 +122,10 @@ pub enum StagingError {
     /// in-memory bookkeeping is suspect and the process should reopen it.
     #[error("staging writer poisoned: a thread panicked mid-transaction; reopen the engine")]
     WriterPoisoned,
+    /// Stored engine state failed to decode — fails closed, never guessed
+    /// around (§11).
+    #[error("corrupt engine state: {0}")]
+    Corrupt(String),
 }
 
 /// How to open a [`StagingEngine`].
@@ -134,6 +138,18 @@ pub struct StagingConfig {
     /// §5 — stamped on every staged row and every applied-watermark row
     /// (§4.2.3–§4.2.4).
     pub origin: NodeId,
+}
+
+/// One dedup-window entry, as `DedupCheck` reads it (§4.4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupEntry {
+    /// Whether the entry's ack evidence is complete (§4.4.1: an unacked
+    /// entry guards durable data still short of RF; it resolves through the
+    /// `AtRF` branch, never through re-staging).
+    pub acked: bool,
+    /// The stored outcome a duplicate replays — the serialized coverage
+    /// evidence, exactly as `ClientAck` computed it.
+    pub outcome_json: String,
 }
 
 /// One live micro-window table, from the engine's registry (§2.3).
@@ -159,13 +175,25 @@ struct WriterInner {
     applied: HashMap<PartitionId, u64>,
     /// Live micro-window tables — the in-memory mirror of
     /// `duckspout_windows`.
-    windows: HashMap<WindowKey, String>,
+    windows: HashMap<WindowKey, WindowMeta>,
     /// Highest window id ever created per (dataset, partition) — the
     /// in-memory mirror of `duckspout_window_hw`. Survives `DropWindow` and
     /// restart, which is what keeps allocated window ids dense and
     /// never-reused (§2.3: contiguity of the per-partition window sequence
     /// must stay decidable after windows drain away).
     window_hw: HashMap<(DatasetId, PartitionId), u64>,
+    /// Total staged bytes across live windows — the running mirror of
+    /// `sum(duckspout_windows.staged_bytes)`, the ladder's measure
+    /// numerator (§4.5).
+    staged_bytes: u64,
+}
+
+/// One live window's registry mirror: its table name plus its accounted
+/// staged bytes.
+#[derive(Debug, Clone)]
+struct WindowMeta {
+    table: String,
+    bytes: u64,
 }
 
 /// The staging engine: WAL=hot over one persistent `DuckDB` database. See
@@ -215,11 +243,19 @@ impl<S: Storage> StagingEngine<S> {
                  applied_seq UBIGINT NOT NULL,
                  PRIMARY KEY (partition, origin));
              CREATE TABLE IF NOT EXISTS duckspout_windows (
-                 dataset    VARCHAR NOT NULL,
-                 partition  VARCHAR NOT NULL,
-                 window_id  UBIGINT NOT NULL,
-                 table_name VARCHAR NOT NULL,
+                 dataset      VARCHAR NOT NULL,
+                 partition    VARCHAR NOT NULL,
+                 window_id    UBIGINT NOT NULL,
+                 table_name   VARCHAR NOT NULL,
+                 staged_bytes UBIGINT NOT NULL DEFAULT 0,
                  PRIMARY KEY (dataset, partition, window_id));
+             CREATE TABLE IF NOT EXISTS duckspout_dedup (
+                 tenant          VARCHAR NOT NULL,
+                 dedup_key       VARCHAR NOT NULL,
+                 acked           BOOLEAN NOT NULL,
+                 outcome         VARCHAR NOT NULL,
+                 created_wall_ms BIGINT  NOT NULL,
+                 PRIMARY KEY (tenant, dedup_key));
              CREATE TABLE IF NOT EXISTS duckspout_window_hw (
                  dataset   VARCHAR NOT NULL,
                  partition VARCHAR NOT NULL,
@@ -233,6 +269,7 @@ impl<S: Storage> StagingEngine<S> {
         let applied = load_applied(&conn, &config.origin)?;
         let windows = load_windows(&conn)?;
         let window_hw = load_window_hw(&conn)?;
+        let staged_bytes = windows.values().map(|meta| meta.bytes).sum();
 
         // Name durability for hot.db and hot.db.wal (module docs; ADR-0003).
         block_on(storage.fsync_dir(StoragePath::new("")))?;
@@ -243,6 +280,7 @@ impl<S: Storage> StagingEngine<S> {
                 applied,
                 windows,
                 window_hw,
+                staged_bytes,
             }),
             storage,
             origin: config.origin,
@@ -279,6 +317,7 @@ impl<S: Storage> StagingEngine<S> {
             origin: self.origin.clone(),
             pending_applied: BTreeMap::new(),
             pending_windows: Vec::new(),
+            pending_bytes: BTreeMap::new(),
             finished: false,
         })
     }
@@ -342,14 +381,17 @@ impl<S: Storage> StagingEngine<S> {
     ) -> Result<bool, StagingError> {
         let mut writer = self.lock_writer()?;
         let key = (dataset.clone(), partition.clone(), window.0);
-        let Some(table) = writer.windows.get(&key).cloned() else {
+        let Some(meta) = writer.windows.get(&key).cloned() else {
             return Ok(false);
         };
-        if let Err(error) = drop_window_txn(&writer.conn, &table, dataset, partition, window) {
+        if let Err(error) = drop_window_txn(&writer.conn, &meta.table, dataset, partition, window) {
             let _ = writer.conn.execute_batch("ROLLBACK");
             return Err(error.into());
         }
         writer.windows.remove(&key);
+        // The dropped window's bytes leave the ladder measure with it
+        // (§4.5: staged_bytes sums over LIVE staging tables).
+        writer.staged_bytes = writer.staged_bytes.saturating_sub(meta.bytes);
         Ok(true)
     }
 
@@ -370,6 +412,20 @@ impl<S: Storage> StagingEngine<S> {
         Ok(())
     }
 
+    /// Total accounted staged bytes across live windows — the overload
+    /// ladder's measure numerator, `M = staged_bytes / hot.max_bytes`
+    /// (§4.5). The accounting unit is the in-memory Arrow size of each
+    /// appended payload batch, summed per window in the same transaction as
+    /// the rows (exact over what was appended; a proxy for on-disk bytes,
+    /// which the engine's own compression makes unknowable per window).
+    ///
+    /// # Errors
+    ///
+    /// [`StagingError::WriterPoisoned`].
+    pub fn staged_bytes(&self) -> Result<u64, StagingError> {
+        Ok(self.lock_writer()?.staged_bytes)
+    }
+
     /// The live micro-window tables, sorted by (dataset, partition, window).
     ///
     /// # Errors
@@ -380,11 +436,11 @@ impl<S: Storage> StagingEngine<S> {
         let mut windows: Vec<WindowRef> = writer
             .windows
             .iter()
-            .map(|((dataset, partition, window), table_name)| WindowRef {
+            .map(|((dataset, partition, window), meta)| WindowRef {
                 dataset: dataset.clone(),
                 partition: partition.clone(),
                 window: WindowId(*window),
-                table_name: table_name.clone(),
+                table_name: meta.table.clone(),
             })
             .collect();
         windows.sort_by(|a, b| {
@@ -412,7 +468,11 @@ impl<S: Storage> StagingEngine<S> {
         window: WindowId,
     ) -> Result<Option<String>, StagingError> {
         let key = (dataset.clone(), partition.clone(), window.0);
-        Ok(self.lock_writer()?.windows.get(&key).cloned())
+        Ok(self
+            .lock_writer()?
+            .windows
+            .get(&key)
+            .map(|meta| meta.table.clone()))
     }
 
     /// The highest committed seq for `partition` under this engine's origin
@@ -482,6 +542,9 @@ pub struct StageTxn<'engine> {
     /// Windows created inside this transaction (their `CREATE TABLE` rolls
     /// back with it — `DuckDB` DDL is transactional).
     pending_windows: Vec<(WindowKey, String)>,
+    /// Bytes appended per window inside this transaction, merged into the
+    /// engine's staged-bytes accounting only on commit (§4.5).
+    pending_bytes: BTreeMap<WindowKey, u64>,
     finished: bool,
 }
 
@@ -543,6 +606,18 @@ impl StageTxn<'_> {
         appender.flush()?;
         drop(appender);
 
+        // Staged-bytes accounting (§4.5): the payload's in-memory Arrow
+        // size, recorded on the window's registry row in this same
+        // transaction — the measure and the data commit or vanish together.
+        let bytes = batch.get_array_memory_size() as u64;
+        self.writer.conn.execute(
+            "UPDATE duckspout_windows SET staged_bytes = staged_bytes + ?
+             WHERE dataset = ? AND partition = ? AND window_id = ?",
+            duckdb::params![bytes, dataset.as_str(), partition.as_str(), window.0],
+        )?;
+        let key: WindowKey = (dataset.clone(), partition.clone(), window.0);
+        *self.pending_bytes.entry(key).or_insert(0) += bytes;
+
         self.pending_applied
             .entry(partition.clone())
             .and_modify(|(_, pending_last)| *pending_last = last)
@@ -580,21 +655,173 @@ impl StageTxn<'_> {
                 .entry((dataset, partition))
                 .and_modify(|hw| *hw = (*hw).max(window))
                 .or_insert(window);
-            self.writer.windows.insert(key, table);
+            self.writer
+                .windows
+                .insert(key, WindowMeta { table, bytes: 0 });
         }
-        let mut coverage = Vec::with_capacity(self.pending_applied.len());
-        for (partition, (first, last)) in &self.pending_applied {
+        let pending_bytes = std::mem::take(&mut self.pending_bytes);
+        for (key, bytes) in pending_bytes {
+            if let Some(meta) = self.writer.windows.get_mut(&key) {
+                meta.bytes += bytes;
+            }
+            self.writer.staged_bytes += bytes;
+        }
+        let coverage = self.pending_coverage();
+        for (partition, (_, last)) in &self.pending_applied {
             self.writer.applied.insert(partition.clone(), *last);
-            coverage.push(StagedCoverage {
+        }
+        Ok(coverage)
+    }
+
+    /// The coverage this transaction will return from [`Self::commit`] —
+    /// knowable before `COMMIT` because seqs are assigned at append (§4.3).
+    /// The dedup entry's stored outcome is serialized from this inside the
+    /// same transaction (§4.4.1), so replay and original are one value by
+    /// construction.
+    #[must_use]
+    pub fn pending_coverage(&self) -> Vec<StagedCoverage> {
+        self.pending_applied
+            .iter()
+            .map(|(partition, (first, last))| StagedCoverage {
                 partition: partition.clone(),
                 range: OriginSeqRange {
                     origin: self.origin.clone(),
                     first_seq: *first,
                     last_seq: *last,
                 },
-            });
+            })
+            .collect()
+    }
+
+    /// `DedupCheck`'s window-table lookup (§4.4.1), inside this transaction
+    /// — serialized with every other dedup write by the single-writer
+    /// discipline, so check-then-insert cannot race. An entry created
+    /// before `min_created_wall_ms` is expired and reads as absent — the
+    /// TTL binds at lookup, not merely at the garbage-collecting eviction,
+    /// so the documented window bound is exact.
+    ///
+    /// # Errors
+    ///
+    /// [`StagingError::Engine`].
+    pub fn dedup_lookup(
+        &mut self,
+        tenant: &TenantId,
+        dedup_key: &str,
+        min_created_wall_ms: i64,
+    ) -> Result<Option<DedupEntry>, StagingError> {
+        let mut stmt = self.writer.conn.prepare(
+            "SELECT acked, outcome FROM duckspout_dedup
+             WHERE tenant = ? AND dedup_key = ? AND created_wall_ms >= ?",
+        )?;
+        let mut rows = stmt.query(duckdb::params![
+            tenant.as_str(),
+            dedup_key,
+            min_created_wall_ms
+        ])?;
+        match rows.next()? {
+            None => Ok(None),
+            Some(row) => Ok(Some(DedupEntry {
+                acked: row.get(0)?,
+                outcome_json: row.get(1)?,
+            })),
         }
-        Ok(coverage)
+    }
+
+    /// Writes the dedup-window entry guarding this transaction's data — in
+    /// the **same transaction** as the rows, so a crash cannot record one
+    /// without the other (§4.4.1). `outcome_json` is the stored outcome a
+    /// duplicate replays; `acked` is the ClientAck-evidence-complete flag
+    /// (at RF = 1 the commit itself completes the evidence, so v0.1 writes
+    /// it `true` here — the pre-RF `false` state arrives with replication).
+    ///
+    /// # Errors
+    ///
+    /// [`StagingError::Engine`].
+    pub fn dedup_insert(
+        &mut self,
+        tenant: &TenantId,
+        dedup_key: &str,
+        acked: bool,
+        outcome_json: &str,
+        created_wall_ms: i64,
+    ) -> Result<(), StagingError> {
+        self.writer.conn.execute(
+            // Upsert: the only way a row can exist here is TTL-expired (a
+            // live one would have resolved at `dedup_lookup`, which this
+            // transaction ran first) — an expired entry is replaced, never
+            // a constraint violation.
+            "INSERT INTO duckspout_dedup (tenant, dedup_key, acked, outcome, created_wall_ms)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (tenant, dedup_key) DO UPDATE SET
+                 acked = excluded.acked,
+                 outcome = excluded.outcome,
+                 created_wall_ms = excluded.created_wall_ms",
+            duckdb::params![
+                tenant.as_str(),
+                dedup_key,
+                acked,
+                outcome_json,
+                created_wall_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Marks an entry's ack evidence complete — `DedupCheck`'s `AtRF`
+    /// resolution (§3.3, §4.4.1): a stage-then-unacked entry becomes
+    /// replayable-as-acked the moment its receipts reach RF.
+    ///
+    /// # Errors
+    ///
+    /// [`StagingError::Engine`].
+    pub fn dedup_mark_acked(
+        &mut self,
+        tenant: &TenantId,
+        dedup_key: &str,
+    ) -> Result<(), StagingError> {
+        self.writer.conn.execute(
+            "UPDATE duckspout_dedup SET acked = true WHERE tenant = ? AND dedup_key = ?",
+            duckdb::params![tenant.as_str(), dedup_key],
+        )?;
+        Ok(())
+    }
+
+    /// Applies the §4.4.1 window bounds inside this transaction: entries
+    /// older than `ttl_ms` are dropped, then the oldest entries beyond
+    /// `max_entries` are dropped. Returns how many the **count cap** (not
+    /// the TTL) evicted — each one shortened the effective window below the
+    /// documented retry horizon, which the operator surface warns on
+    /// (§4.4.1).
+    ///
+    /// # Errors
+    ///
+    /// [`StagingError::Engine`].
+    pub fn dedup_evict(
+        &mut self,
+        wall_now_ms: i64,
+        ttl_ms: i64,
+        max_entries: u64,
+    ) -> Result<u64, StagingError> {
+        let cutoff = wall_now_ms.saturating_sub(ttl_ms);
+        self.writer.conn.execute(
+            "DELETE FROM duckspout_dedup WHERE created_wall_ms < ?",
+            duckdb::params![cutoff],
+        )?;
+        let count: u64 =
+            self.writer
+                .conn
+                .query_row("SELECT count(*) FROM duckspout_dedup", [], |row| row.get(0))?;
+        if count <= max_entries {
+            return Ok(0);
+        }
+        let excess = count - max_entries;
+        let evicted = self.writer.conn.execute(
+            "DELETE FROM duckspout_dedup WHERE (tenant, dedup_key) IN (
+                 SELECT tenant, dedup_key FROM duckspout_dedup
+                 ORDER BY created_wall_ms ASC LIMIT ?)",
+            duckdb::params![excess],
+        )?;
+        Ok(evicted as u64)
     }
 
     /// Rolls the transaction back explicitly (dropping does the same,
@@ -621,7 +848,7 @@ impl StageTxn<'_> {
     ) -> Result<String, StagingError> {
         let key: WindowKey = (dataset.clone(), partition.clone(), window.0);
         if let Some(existing) = self.writer.windows.get(&key) {
-            return Ok(existing.clone());
+            return Ok(existing.table.clone());
         }
         if let Some((_, pending)) = self.pending_windows.iter().find(|(k, _)| *k == key) {
             return Ok(pending.clone());
@@ -785,23 +1012,25 @@ fn load_window_hw(
     Ok(window_hw)
 }
 
-fn load_windows(conn: &Connection) -> Result<HashMap<WindowKey, String>, StagingError> {
-    let mut stmt =
-        conn.prepare("SELECT dataset, partition, window_id, table_name FROM duckspout_windows")?;
+fn load_windows(conn: &Connection) -> Result<HashMap<WindowKey, WindowMeta>, StagingError> {
+    let mut stmt = conn.prepare(
+        "SELECT dataset, partition, window_id, table_name, staged_bytes FROM duckspout_windows",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, u64>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, u64>(4)?,
         ))
     })?;
     let mut windows = HashMap::new();
     for row in rows {
-        let (dataset, partition, window, table) = row?;
+        let (dataset, partition, window, table, bytes) = row?;
         windows.insert(
             (DatasetId::new(dataset), PartitionId::new(partition), window),
-            table,
+            WindowMeta { table, bytes },
         );
     }
     Ok(windows)

@@ -2,21 +2,23 @@
 //! derivation. A constant graduates to a knob only through the §9.6.4
 //! ratchet (divergent-workload justification, golden-manifest diff).
 
-// Justification for the allow: §9.6.3 is transcribed complete at bootstrap
+// Justification for the allows: §9.6.3 is transcribed complete at bootstrap
 // (SEED s§4); consumers arrive with the wiring (v0.1), and dropping unread
-// constants would un-transcribe the table.
+// constants — or the re-exported ladder rows below — would un-transcribe
+// the table.
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
-/// Overload ladder: disclose at 80% of `hot.max_bytes` of **staged** bytes
-/// (§4.5 rung 1 — also the only capacity alert, §9.2).
-pub const LADDER_DISCLOSE_FRACTION: f64 = 0.80;
-
-/// Overload ladder: throttle at 95% (§4.5 rung 2).
-pub const LADDER_THROTTLE_FRACTION: f64 = 0.95;
-
-/// Overload ladder: refuse at 100% — `hot.max_bytes` itself (§4.5 rung 3,
-/// the top rung).
-pub const LADDER_REFUSE_FRACTION: f64 = 1.00;
+/// Overload ladder thresholds (§4.5): disclose 80% / throttle 95% / refuse
+/// 100% of `hot.max_bytes` of **staged** bytes. Defined next to their
+/// implementation — [`duckspout_types::status::OverloadStatus::from_measure`]
+/// — and re-exported here so the §9.6.3 constants table stays complete
+/// with one source of truth (issue #33 moved them out of this file's
+/// bootstrap transcription).
+pub use duckspout_types::status::{
+    LADDER_DISCLOSE_PERCENT, LADDER_REFUSE_PERCENT, LADDER_THROTTLE_PERCENT, THROTTLE_RETRY_MAX_MS,
+    THROTTLE_RETRY_MIN_MS,
+};
 
 /// Heartbeat cadence, seconds (§5.6).
 pub const HEARTBEAT_CADENCE_SECS: u64 = 5;

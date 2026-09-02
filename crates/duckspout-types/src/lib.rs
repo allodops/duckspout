@@ -44,9 +44,9 @@ pub use ports::{
     AcceptAdapter, AcceptError, AttachInfo, BoxFuture, Clock, ColumnSpec, CommitOutcome,
     DecodedBatch, DrainableWindow, DropOutcome, LakeCommitter, LakeError, LedgerRejection,
     Scheduler, SchemaEvolution, SealError, SealRequest, SealSurface, SealedPart, StageCommitter,
-    StageError, StagedCoverage, Storage, StorageError, StoragePath, Transport, TransportError,
-    WatermarkBookkeeping, WireError, WireRequest,
+    StageError, StageOutcome, StagedCoverage, Storage, StorageError, StoragePath, Transport,
+    TransportError, WatermarkBookkeeping, WireError, WireRequest,
 };
-pub use status::{NodeStatus, OverloadStatus};
+pub use status::{NodeStatus, OverloadStatus, throttle_retry_delay_ms};
 pub use trace::{EnvironmentEvent, TraceEvent, TraceRecord};
 pub use watermark::{AppliedWatermarkRow, DimensionWatermarkRow, WatermarkRow};

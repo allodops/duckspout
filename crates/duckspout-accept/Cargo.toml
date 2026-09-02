@@ -21,6 +21,8 @@ prost = { workspace = true }
 # columns (§4.8's fixed mapping).
 serde_json = { workspace = true }
 tonic = { workspace = true }
+# google.rpc RetryInfo details on the UNAVAILABLE responses (§4.5, §4.6).
+tonic-types = { workspace = true }
 
 [dev-dependencies]
 # The in-process gRPC tests bind an ephemeral loopback listener and stream
