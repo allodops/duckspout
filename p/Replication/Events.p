@@ -12,10 +12,17 @@ enum tRole {
 event eWriteReq: tWriteReq;
 event eWriteAck: tWriteAck;
 
-// Owner -> Replica: forward a staged record for replication.
-event eForward: (key: int, sq: int, origin: Node);
+// Owner -> Replica: forward a staged record for replication. `originId` is
+// the sender's *logical* node identity (stable across a reboot -- see
+// eFenceBoot below), distinct from `origin`, the sender's current machine
+// reference (needed to route the eReceipt reply). `inc` is the sender's
+// incarnation at send time (§5.7: "every message ... carries (node_id,
+// incarnation)").
+event eForward: (key: int, sq: int, origin: Node, originId: int, inc: int);
 // Replica -> Owner: receipt once the forwarded record is durably applied.
-event eReceipt: (key: int, sq: int, holder: Node);
+// `holderId`/`inc` mirror `eForward`'s `originId`/`inc` -- same rationale,
+// other direction.
+event eReceipt: (key: int, sq: int, holder: Node, holderId: int, inc: int);
 
 // Environment: the owner dies. Broken (never sent) is NOT how a real
 // crash is observed -- CrashSignal is delivered to the surviving replica
@@ -28,6 +35,26 @@ event eCrashSignal: (dead: Node);
 // crash semantics) rather than just being talked about by others.
 event eDie;
 
+// §5.7 (Incarnation fencing): "every process boot executes FenceBoot: the
+// node draws a fresh incarnation ... and persists it locally." `nodeId` is
+// the persistent logical identity (stable across a reboot); `incarnation`
+// becomes `priorIncarnation + 1` -- strictly higher than whatever this
+// logical node last had, never true global uniqueness (this scenario does
+// not need that, only per-node monotonicity across reboots, per the task
+// this model was built against).
+//
+// A real boot reads its own prior incarnation from local persisted state;
+// a P machine that has `raise halt`ed cannot come back and read anything
+// -- P has no notion of a process identity surviving a restart. A "reboot"
+// is therefore modeled as a brand-new `Node` machine instance, and the
+// environment (the test driver, standing in for the persisted-local-state
+// the real node would read for itself) tells it both who it is (`nodeId`,
+// matching the crashed instance's own) and what incarnation it is
+// superseding (`priorIncarnation`). This is a deliberate, documented
+// modeling choice for a gap P has no native concept for -- see the PR
+// description for the alternatives considered.
+event eFenceBoot: (nodeId: int, priorIncarnation: int);
+
 // A node reports it has durably staged a key (accepted for replication) --
 // what NoAckedLoss actually tracks: not the client's raw request (which
 // may never even be accepted if its target node dies first), but the
@@ -36,6 +63,19 @@ event eAccepted: (key: int, sq: int);
 
 // A replica claims an orphaned key and drains (commits) it.
 event eTakeoverDrain: (key: int, sq: int, newOwner: Node);
+
+// §5.7: announced by `Node.p`'s `eForward`/`eReceipt` handlers every time
+// they evaluate the incarnation fence against a message, whether the
+// message is accepted or rejected. This is scaffolding purpose-built for
+// `FencedZombie` (`Spec.p`) exactly the way `eForwardHandled`/
+// `eCrashSignalHandled` are scaffolding for `NoAckedLoss`: `eForward` and
+// `eReceipt` themselves are point-to-point `send`s, not `announce`s, so a
+// `spec` machine (which can only `observe` announced events) has no other
+// way to see them. `senderId` is the sender's logical node identity (see
+// `eFenceBoot`), not its current machine reference -- the whole point is
+// to recognize the *same logical sender* across a reboot, which a machine
+// reference cannot do (a rebooted node is a different machine instance).
+event eFenceDecision: (receiver: Node, senderId: int, inc: int, accepted: bool);
 
 // §5.5: "published as a side effect of PeerApply -- the first apply for a
 // partition the node has no claim row for triggers the insert." Announced
