@@ -101,6 +101,54 @@ event eFenceBoot: (nodeId: int, priorIncarnation: int);
 event eCatalogOutage;
 event eCatalogRestored;
 
+// `specs/DuckSpoutCore.tla`'s `CrashWipe(n)`, the *other* fault -- "the
+// disk dies too": `staged`/`cache`/`dedup` are all cleared, not merely
+// `inflight` (`CrashNode`'s own, milder effect -- see `eDie` below).
+// Sent to the node that dies via wipe, alongside the existing `eDie` --
+// deliberately a SEPARATE event, not a reused `eDie`, even though
+// `Node.p`'s handler for it is behaviorally identical (`raise halt`):
+// see that handler's own comment for why bothering to clear fields would
+// be dead code, and why the real distinguishing behavior lives entirely
+// in what identity the environment gives the eventual replacement, not
+// in the dying instance's own handler.
+//
+// IMPORTANT correspondence caveat (see docs/design/p-tla-correspondence.md
+// for the full write-up): TLA+'s `CrashWipe(n)` guard (`wiped' = wiped
+// \cup {n}`) is checked by both `FenceBoot(n)` and `DegradedBoot(n)`
+// (`n \notin wiped`) forever after -- the comment on `CrashWipe` in
+// `specs/DuckSpoutCore.tla` says plainly "a wiped node never re-enters."
+// TLA+'s `Nodes` is a fixed set with no dynamic-membership concept, so a
+// wiped node's identity is retired *permanently*, not reissued to a
+// "replacement." What follows this event in `TestNewNodeBoot`
+// (`TestDriver.p`) -- a brand-new `Node` instance with a *different*
+// `nodeId`, never the wiped one -- is therefore NOT a P model of TLA+'s
+// `CrashWipe` recovering; there is no such thing to model, because TLA+
+// forbids it by construction. It is a P model of `docs/design/
+// replication.md` §7's own separate prose ("a genuinely new node -- no
+// persisted incarnation -- waits, in a typed startup state"), which has
+// **no TLA+ action at all** to correspond to: TLA+'s `Init` already
+// assumes every node's first-ever boot succeeded (`alive = [n \in Nodes
+// |-> TRUE]`, `inc = [n \in Nodes |-> 0]`), so a fresh node hitting
+// trouble on its very first boot is not a reachable `Next` transition in
+// `DuckSpoutCore.tla` at all -- see `eFenceBoot`'s and the `Waiting`
+// state's comments in `Node.p` for how this scenario models it instead.
+event eCrashWipe;
+
+// §7 (docs/design/replication.md): announced by `Node.p` whenever a
+// node's "awaiting its very first fence" status changes -- true the
+// moment a genuinely new node's (`priorIncarnation = 0`) first
+// `eFenceBoot` attempt cannot complete because the catalog is down (it
+// "has no identity to be safely partial with," per §7 -- unlike
+// `DegradedBoot`'s persisted-incarnation case, there is nothing to fall
+// back to), false once `eCatalogRestored` lets that first fence finally
+// complete. Purpose-built scaffolding for `NoIdentityWhileWaiting`
+// (Spec.p), the same independent-ground-truth convention
+// `eDegradedChanged`/`eFenceDecision` already establish in this file --
+// see `FencedZombie`'s header comment (Spec.p) for why the spec needs
+// this rather than reading `Node.p`'s own `waitingForFence` field
+// directly. `node` identifies which `Node` this transition belongs to.
+event eWaitingChanged: (node: Node, waiting: bool);
+
 // A node reports it has durably staged a key (accepted for replication) --
 // what NoAckedLoss actually tracks: not the client's raw request (which
 // may never even be accepted if its target node dies first), but the

@@ -62,6 +62,17 @@ machine Node {
   // action (no takeover-drain) -- `sweepOrphanedKeys` below is the single
   // enforcement point.
   var degraded: bool;
+  // §7 (docs/design/replication.md): true from the moment a genuinely
+  // new node's (`priorIncarnation = 0`) very first `eFenceBoot` attempt
+  // cannot complete because the catalog is down, until `eCatalogRestored`
+  // lets it complete. Unlike `degraded`, a node in this state has drawn
+  // NO incarnation at all yet -- see the `Waiting` state below, the
+  // "typed startup state" §7 itself names.
+  var waitingForFence: bool;
+  // The `nodeId` a still-waiting node was told to become, stashed at the
+  // blocked `eFenceBoot` attempt and applied once `eCatalogRestored`
+  // finally lets that fence complete (see `Waiting` below).
+  var pendingNodeId: int;
 
   start state Active {
     entry {
@@ -81,6 +92,20 @@ machine Node {
     // all this scenario needs (simple per-node monotonicity), not true
     // global uniqueness.
     on eFenceBoot do (fb: (nodeId: int, priorIncarnation: int)) {
+      // §7: a genuinely new node (`priorIncarnation = 0` -- nothing
+      // persisted to bump) that hits a catalog outage on this, its very
+      // first fence attempt, cannot complete FenceBoot at all right now
+      // -- draw nothing, wait instead. This is the "typed startup state"
+      // §7 itself names ("It has no identity to be safely partial
+      // with"), materially different from the `priorIncarnation > 0`
+      // branch below: that node already has *something* to fall back to
+      // (DegradedBoot's replica-only mode) and never needs to fully stop.
+      if (fb.priorIncarnation == 0 && catalogOutage) {
+        pendingNodeId = fb.nodeId;
+        waitingForFence = true;
+        announce eWaitingChanged, (node = this, waiting = true);
+        goto Waiting;
+      }
       nodeId = fb.nodeId;
       incarnation = fb.priorIncarnation + 1;
       // §7 DegradedBoot: a node with a *persisted* incarnation
@@ -90,13 +115,23 @@ machine Node {
       // promotion. A genuinely new node (`priorIncarnation = 0`) never
       // goes degraded here: §7 is explicit it "has no identity to be
       // safely partial with" and instead waits in a typed startup state --
-      // a different boot path this model does not represent (see
-      // docs/design/p-tla-correspondence.md's DegradedBoot section for
-      // the precise boundary).
+      // see the `if` above and the `Waiting` state below for that path.
       if (fb.priorIncarnation > 0 && catalogOutage) {
         degraded = true;
         announce eDegradedChanged, (node = this, degraded = true);
       }
+    }
+
+    // `specs/DuckSpoutCore.tla`'s `CrashWipe(n)`: the disk dies too, not
+    // just the volatile process state `eDie`/`CrashNode` lose. Halts
+    // exactly like `eDie` -- see this event's own comment in Events.p
+    // for why clearing `staged`/`committed`/etc. here first would be
+    // dead code (nothing ever reads a halted instance's fields again in
+    // this model; the entire behavioral difference from `eDie` lives in
+    // what identity, if any, the environment gives the eventual
+    // replacement -- see `TestNewNodeBoot`, TestDriver.p).
+    on eCrashWipe do {
+      raise halt;
     }
 
     on eCatalogOutage do {
@@ -275,6 +310,67 @@ machine Node {
         announce eCrashSignalHandled;
       }
     }
+  }
+
+  // §7 (docs/design/replication.md): "Only a genuinely new node -- no
+  // persisted incarnation -- waits, in a typed startup state. It has no
+  // identity to be safely partial with." This IS that typed startup
+  // state -- entered from `Active`'s own `eFenceBoot` handler above,
+  // exactly when a node's very first fence attempt (`priorIncarnation =
+  // 0`) cannot complete because the catalog is down. `nodeId`/
+  // `incarnation` stay at their P zero-default the entire time this
+  // state is active (this node genuinely has neither yet), and every
+  // handler below either drops the inbound message outright (`ignore`)
+  // or does nothing observable -- no claim advertisement, no receipt, no
+  // takeover-drain can fire while waiting. `NoIdentityWhileWaiting`
+  // (Spec.p) is what confirms that is genuinely enforced, not merely
+  // unexercised by these scenarios (see its own header and the scratch
+  // broken variant in the PR description).
+  //
+  // Deliberately NOT the same mechanism as §5.7 incarnation fencing
+  // (`highestSeen`, `eFenceDecision`): fencing compares an INCOMING
+  // incarnation against a sender's own history and is itself an identity
+  // op a fenced node performs; a node with no identity at all yet has
+  // nothing to fence against, so messages are dropped here for a
+  // completely different reason and `eFenceDecision` is deliberately
+  // never announced from this state -- conflating the two would be
+  // wrong, not just redundant.
+  state Waiting {
+    on eLink do (p: Node) {
+      peer = p;
+    }
+
+    // Redundant/idempotent while the outage is already known -- harmless
+    // to observe again.
+    ignore eCatalogOutage;
+
+    // §7: "promotes itself when the catalog returns and FenceBoot
+    // completes" -- for a genuinely new node, THIS is the moment
+    // FenceBoot finally completes; it could not complete earlier (see
+    // `Active`'s `eFenceBoot` handler above). `priorIncarnation` was 0 by
+    // construction (that is what routed this node here in the first
+    // place), so the fresh incarnation is simply 1, matching
+    // `eFenceBoot`'s own `priorIncarnation + 1` formula in `Active`.
+    on eCatalogRestored do {
+      catalogOutage = false;
+      nodeId = pendingNodeId;
+      incarnation = 1;
+      waitingForFence = false;
+      announce eWaitingChanged, (node = this, waiting = false);
+      goto Active;
+    }
+
+    // A peer that has not yet learned this node has no identity yet may
+    // still send it replication traffic while it waits -- §7's whole
+    // point is that this node "has no identity to be safely partial
+    // with," so every one of these is dropped outright, not processed:
+    // no apply, no claim, no receipt, no takeover, no fence decision.
+    // This is the exact surface `NoIdentityWhileWaiting` (Spec.p)
+    // checks; the scratch broken variant (PR description) instead
+    // processes `eForward` here the way `Active` does, confirming this
+    // dropped-message path is genuinely reachable and load-bearing, not
+    // dead code that happens to never be exercised.
+    ignore eForward, eReceipt, eCrashSignal, eHeartbeat, eTick;
   }
 
   // Shared by `eCrashSignal`'s oracle path, `eTick`'s heartbeat-TTL path,
