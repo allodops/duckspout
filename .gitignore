@@ -9,6 +9,12 @@ states/
 # TLA+ tooling jars, fetched by `just tla-install` (scripts/tla.mjs)
 specs/.tools/
 
+# P tool, fetched by `just p-install` (scripts/p.mjs, #131); build output
+# from `p compile`/`p check`, generated anywhere under p/
+p/.tools/
+PGenerated/
+PCheckerOutput/
+
 # Bun
 node_modules/
 
