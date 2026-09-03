@@ -79,9 +79,32 @@ machine TestFenceBootZombie {
       send replica, eLink, owner;
 
       // owner accepts and forwards key 1 under incarnation 1, then dies
-      // for real -- same shape as TestTakeoverDrain's opening.
+      // for real -- same shape as TestTakeoverDrain's opening, including
+      // telling replica out-of-band (this scenario's own oversight, caught
+      // once a genuine hot-state liveness monitor -- NoAckedLossLive,
+      // Spec.p -- was wired in: without this send, replica's
+      // `crashHandled` flag for owner never flips, so the pre-existing
+      // direct-assert `NoAckedLoss` was silently vacuous for key 1 in this
+      // scenario the whole time -- its check body never ran, reporting a
+      // spuriously clean "0 bugs").
+      //
+      // Fixing that vacuity surfaced a second, real, deeper finding
+      // (#190, not fixed here): `owner`'s own `eForward` for key 1 can
+      // still be queued behind its not-yet-dequeued `eDie` (P delivers a
+      // machine's own earlier-queued messages before a later one, even
+      // one that will halt it), so in some explored orderings `owner`
+      // sends its Forward *after* `newOwner` has already advanced
+      // `replica`'s fencing past incarnation 1 -- a legitimately-accepted
+      // write gets correctly fenced out as stale, with no timeout/ring-
+      // walk retry modeled anywhere in this P model to recover it
+      // (docs/design/replication.md §1's real mechanism for exactly this
+      // case). NoAckedLoss/NoAckedLossLive are deliberately NOT asserted
+      // against this scenario (TestDecl.p) because of that -- it isn't a
+      // vacuous-check problem this time, it's real, unmodeled scope; see
+      // #190.
       new Client((owner = owner, key = 1, sq = 1));
       send owner, eDie;
+      send replica, eCrashSignal, (dead = owner,);
 
       // Reboot: a fresh machine instance for the SAME logical node
       // (nodeId 1), fenced to a strictly higher incarnation (2).
