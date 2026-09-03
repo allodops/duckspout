@@ -45,6 +45,10 @@ CONSTANTS
   InitClaims,   \* initial advisory claim rows (TN-4)
   MaxHb,        \* bound on Heartbeat (0 in v0.1: advisory, nothing reads it)
   DrainOn,      \* module projection toggle: drain pipeline on/off (TN-7)
+  TakeoverOn,   \* module projection toggle: takeover dynamics on/off (v0.2,
+                \* #55); FALSE in every v0.1 config -- TakeoverDrain contributes
+                \* no reachable transition there, so pinned state counts are
+                \* unaffected by its addition
   None,         \* model value
   \* -- broken-variant switches (3.6); all FALSE in clean configs ----------
   BrkAckBeforeReceipt,     \* ClientAck drops the >= RF receipt conjunct
@@ -681,6 +685,22 @@ ClaimAdvertise(n, p) ==  \* advisory registry row (TN-4: fields trimmed to
   /\ UNCHANGED ingVars /\ UNCHANGED repVars /\ UNCHANGED memVars
   /\ UNCHANGED schVars
 
+TakeoverDrain(n, p) ==  \* v0.2: a live node claims an orphaned partition when
+  /\ TakeoverOn        \* its current holder(s) are all dead (5.6). WHICH
+  /\ alive[n] /\ n \notin degraded   \* live node acquires it is a Rust-level
+  /\ <<n, p>> \notin claims           \* placement detail (HRW, ADR-0004);
+  /\ ~\E n1 \in Nodes :               \* modeling it as ANY live node proves
+       alive[n1] /\ HoldsClaim(n1, p) \* safety for whichever one HRW picks.
+                                       \* A dead holder's stale claim is left
+                                       \* in place (claims are advisory, TN-4
+                                       \* -- real safety is SingleDrainCommit
+                                       \* at the catalog, not claim upkeep).
+  /\ claims' = claims \cup {<<n, p>>}
+  /\ UNCHANGED <<sealedParts, objects, lake, expired, wm, lossLedger,
+                 pendingCommit, closed>>
+  /\ UNCHANGED ingVars /\ UNCHANGED repVars /\ UNCHANGED memVars
+  /\ UNCHANGED schVars
+
 Heartbeat(n) ==
   /\ alive[n] /\ hb[n] < MaxHb
   /\ hb' = [hb EXCEPT ![n] = @ + 1]
@@ -829,7 +849,8 @@ Next ==
   \/ \E n \in Nodes : Reconcile(n)
   \/ \E pt \in lake : Expire(pt)
   \/ \E n \in Nodes : \E t \in cache[n] : Evict(n, t)
-  \/ \E n \in Nodes, p \in Partitions : SnapshotSeal(n, p) \/ ClaimAdvertise(n, p)
+  \/ \E n \in Nodes, p \in Partitions :
+       SnapshotSeal(n, p) \/ ClaimAdvertise(n, p) \/ TakeoverDrain(n, p)
   \/ \E n \in Nodes :
        Heartbeat(n) \/ CrashNode(n) \/ CrashWipe(n)
          \/ FenceBoot(n) \/ DegradedBoot(n)
@@ -1067,5 +1088,13 @@ NoWitness_CrashBetweenCommitAndDemote ==   \* the crash window is reached
        /\ x.kind = "window"                \* demoting node has since outgrown,
        /\ x.sealer = n                     \* so a FenceBoot fell strictly
        /\ x.inc < inc[n]                   \* between LakeCommitOk and Demote
+
+NoWitness_TakeoverDrains ==   \* a node with no pre-seeded claim on the
+  ~\E x \in lake :             \* partition still sealed and committed a
+     /\ x.kind = "window"      \* window part for it end-to-end -- since
+     /\ <<x.sealer, x.part>> \notin InitClaims   \* ClaimAdvertise is itself
+                               \* restricted to InitClaims pairs (TN-4), the
+                               \* only action that can grow a node's claim
+                               \* beyond the pre-seeded set is TakeoverDrain
 
 =============================================================================
