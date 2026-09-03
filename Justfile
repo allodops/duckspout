@@ -115,6 +115,16 @@ tla-sim *args:
 tla-tv *trace:
     bun scripts/tla.mjs tv {{trace}}
 
+# Install the pinned P tool into p/.tools/ (#131; local-only, not global)
+[group('spec')]
+p-install:
+    bun scripts/p.mjs install
+
+# Compile + check a P model: p/<Model>/*.p (#131; local-only, staged)
+[group('spec')]
+p-check model:
+    bun scripts/p.mjs check {{model}}
+
 # Trace-conformance driver: fixtures + live harness + real backends (Ⓜ v0.1)
 [group('spec')]
 conformance:

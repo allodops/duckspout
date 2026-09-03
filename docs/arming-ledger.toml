@@ -203,6 +203,15 @@ spec = "§8 (ADR-0009)"
 
 # --- staged, cadence = "pr" (future ci.yml jobs; s§6.1 lower table) ---
 
+[[gate]]
+id = "p-replication"
+status = "staged"
+cadence = "pr"
+recipe = "p-check"
+workflow_job = ""
+milestone = "v0.2"
+issue = 131
+spec = "§8.1"
 
 # --- staged, cadence = "nightly" (future nightly.yml jobs; s§6.3) ---
 
