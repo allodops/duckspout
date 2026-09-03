@@ -3,3 +3,4 @@ test FenceBootZombie [main = TestFenceBootZombie]: assert ClaimAdvertiseOnce, Fe
 test HeartbeatDetection [main = TestHeartbeatDetection]: assert NoAckedLoss, NoAckedLossLive, ClaimAdvertiseOnce in { TestHeartbeatDetection, Node, Client };
 test DegradedBoot [main = TestDegradedBoot]: assert NoAckedLoss, NoAckedLossLive, ClaimAdvertiseOnce, FencedZombie, NoOwnershipWhileDegraded in { TestDegradedBoot, Node, Client };
 test NewNodeBoot [main = TestNewNodeBoot]: assert ClaimAdvertiseOnce, FencedZombie, NoIdentityWhileWaiting in { TestNewNodeBoot, Node, Client };
+test GapFreedom [main = TestGapFreedom]: assert GapFreedom in { TestGapFreedom, Node, Client };

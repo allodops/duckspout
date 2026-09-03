@@ -58,8 +58,13 @@
 // shape as the earlier `eForwardHandled`-alone false positive above: the
 // monitor's bookkeeping, not the modeled system, was wrong.
 //
-// Mirrors DuckSpoutCore.tla's NoAckedLoss/GapFreedom in spirit, not text
-// -- this is a hand-written P analog, not a transliteration.
+// Mirrors DuckSpoutCore.tla's NoAckedLoss in spirit, not text -- this is a
+// hand-written P analog, not a transliteration. (Previously this header
+// also claimed to mirror GapFreedom "in spirit" -- true only for as long
+// as GapFreedom had no dedicated P analog of its own; now that it does
+// (`GapFreedom`, below), that claim here would double-count the same
+// property under two different spec names, so it is retired from this
+// header.)
 spec NoAckedLoss observes eAccepted, eTakeoverDrain, eForwardHandled, eCrashSignalHandled {
   var accepted: set[int];
   var drained: set[int];
@@ -308,6 +313,66 @@ spec NoOwnershipWhileDegraded observes eDegradedChanged, eTakeoverDrain {
 // convention for a per-event safety check on a bounded scenario -- see
 // `NoAckedLoss`'s header above for why `hot state` liveness is the wrong
 // shape here.
+// GapFreedom (§5.4, docs/design/replication.md §4; matches
+// `specs/DuckSpoutCore.tla`'s own invariant name for the same property,
+// not its text -- the TLA+ analog is a STATE invariant recomputed from
+// `staged`/`DrainedSeqs` (`AppliedThru`'s `PrefixLen`, checked at every
+// reachable state by construction); the P analog below recomputes the
+// same contiguity independently from `Node.p`'s `eGapDecision`
+// announcements, checked as each new watermark advance is observed.
+// #132's own DoD names this as the third safety property to mirror
+// alongside `NoAckedLoss` and `FencedZombie`, and it is the one
+// docs/design/p-tla-correspondence.md previously flagged as having "no P
+// counterpart" (see that file's `eForward`/`PeerApply` row).
+//
+// The property: a node's applied `seq` prefix, per sender, is always
+// contiguous -- no `seq` is ever genuinely accepted (i.e. applied,
+// advancing that sender's watermark at this receiver) out of order.
+// Checked by recomputing, purely from the `eGapDecision` event stream
+// `Node.p` announces, an independent ground truth of "the highest `seq`
+// this receiver has legitimately accepted from this sender so far" --
+// the SAME non-tautological, non-gamed-test convention `FencedZombie`
+// above already establishes for this file (see its header comment for
+// why): the spec does not read `Node.p`'s own internal `appliedThru` map
+// (that would just be checking the implementation against itself,
+// tautologically green whether or not the gap-refusal guard is actually
+// wired correctly). A broken `Node.p` that drops the gap-refusal guard
+// entirely -- applying every Forward unconditionally, matching this
+// model's behavior before this guard existed -- but still announces
+// `eGapDecision` honestly is still caught: the spec's own yardstick, built
+// from nothing but the announced accept/refuse record, still has the true
+// contiguous watermark on file, and the assert fires on the wrongly
+// "accepted" out-of-order seq itself (see the scratch broken variant in
+// the PR this spec shipped with).
+//
+// A direct `assert`, not `hot state`, matching this file's established
+// convention for a per-event safety check on a bounded scenario -- see
+// `NoAckedLoss`'s header above for why `hot state` liveness is the wrong
+// shape here.
+spec GapFreedom observes eGapDecision {
+  // Highest originSeq genuinely accepted (watermark-advancing) so far, per
+  // (receiver, sender) pair. Absent key means 0 -- nothing accepted yet,
+  // matching `Node.p`'s own `appliedThru` default convention.
+  var highestAccepted: map[(receiver: Node, sender: int), int];
+
+  start state Watching {
+    on eGapDecision do (gd: (receiver: Node, senderId: int, originSeq: int, accepted: bool)) {
+      var k: (receiver: Node, sender: int);
+      var seen: int;
+      if (gd.accepted) {
+        k = (receiver = gd.receiver, sender = gd.senderId);
+        seen = 0;
+        if (k in highestAccepted) {
+          seen = highestAccepted[k];
+        }
+        assert gd.originSeq == seen + 1,
+          "GapFreedom violated: a seq was accepted that did not contiguously extend the applied prefix";
+        highestAccepted[k] = gd.originSeq;
+      }
+    }
+  }
+}
+
 spec NoIdentityWhileWaiting observes eWaitingChanged, eClaimAdvertise, eTakeoverDrain {
   var waitingNodes: set[Node];
 

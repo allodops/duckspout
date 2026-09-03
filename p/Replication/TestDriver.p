@@ -13,18 +13,20 @@ machine TestTakeoverDrain {
       replica = new Node();
       send owner, eLink, replica;
       send replica, eLink, owner;
-      new Client((owner = owner, key = 1, sq = 1));
+      new Client((owner = owner, key = 1, sq = 1, originSeq = 1));
       send owner, eDie;
       send replica, eCrashSignal, (dead = owner,);
-      // Simulate a retransmitted eForward for the same (key, sq, origin) --
-      // real networks retry, and docs/design/replication.md §4 (PeerApply)
-      // requires a duplicate/retried apply be acknowledged without
-      // re-applying. Sent directly from the environment rather than routed
-      // through `owner`'s own eWriteReq handling, since owner may already
-      // be dead (eDie above) by the time a real retry would fire -- matches
-      // how eCrashSignal above is also delivered directly by the
-      // environment rather than through the peer's own logic.
-      send replica, eForward, (key = 1, sq = 1, origin = owner, originId = 0, inc = 0);
+      // Simulate a retransmitted eForward for the same (key, sq, seq,
+      // origin) -- real networks retry, and docs/design/replication.md §4
+      // (PeerApply) requires a duplicate/retried apply be acknowledged
+      // without re-applying (the same `seq` as the original, since this is
+      // the SAME record retried, not a new one). Sent directly from the
+      // environment rather than routed through `owner`'s own eWriteReq
+      // handling, since owner may already be dead (eDie above) by the time
+      // a real retry would fire -- matches how eCrashSignal above is also
+      // delivered directly by the environment rather than through the
+      // peer's own logic.
+      send replica, eForward, (key = 1, sq = 1, originSeq = 1, origin = owner, originId = 0, inc = 0);
     }
   }
 }
@@ -101,8 +103,8 @@ machine TestFenceBootZombie {
       // case). NoAckedLoss/NoAckedLossLive are deliberately NOT asserted
       // against this scenario (TestDecl.p) because of that -- it isn't a
       // vacuous-check problem this time, it's real, unmodeled scope; see
-      // #190.
-      new Client((owner = owner, key = 1, sq = 1));
+      // #190. seq = 1: nodeId 1's first-ever forward.
+      new Client((owner = owner, key = 1, sq = 1, originSeq = 1));
       send owner, eDie;
       send replica, eCrashSignal, (dead = owner,);
 
@@ -115,11 +117,20 @@ machine TestFenceBootZombie {
 
       // The rebooted owner accepts a genuine second write (key 2) under
       // its new incarnation and forwards it through its own eWriteReq
-      // handler, same as owner's key-1 write above.
-      new Client((owner = newOwner, key = 2, sq = 2));
+      // handler, same as owner's key-1 write above. seq = 2, NOT 1: this
+      // is nodeId 1's SECOND-ever forward -- a real node's own
+      // per-(origin, partition) `nextSeq` (§4) is durably persisted (the
+      // hot staging table itself, "the table is the log") and survives
+      // the reboot in between, unlike its volatile P machine instance, so
+      // the environment (standing in for that persisted counter, the same
+      // convention `eFenceBoot`'s `priorIncarnation` already establishes)
+      // continues the count rather than restarting it at 1.
+      new Client((owner = newOwner, key = 2, sq = 2, originSeq = 2));
 
-      // The zombie (see header comment above).
-      send replica, eForward, (key = 3, sq = 1, origin = owner, originId = 1, inc = 1);
+      // The zombie (see header comment above) -- seq = 1, matching that
+      // this stands in for a stale retransmit of the OLD owner instance's
+      // one-and-only real forward above (also seq 1), not a new record.
+      send replica, eForward, (key = 3, sq = 1, originSeq = 1, origin = owner, originId = 1, inc = 1);
     }
   }
 }
@@ -176,7 +187,7 @@ machine TestHeartbeatDetection {
       send owner, eLink, replica;
       send replica, eLink, owner;
 
-      new Client((owner = owner, key = 1, sq = 1));
+      new Client((owner = owner, key = 1, sq = 1, originSeq = 1));
 
       // owner's one round-1 heartbeat, then it actually dies.
       send replica, eHeartbeat, (from = owner, round = 1);
@@ -277,7 +288,8 @@ machine TestDegradedBoot {
 
       // replica accepts a genuine write (key 1) and forwards it to
       // newOwner -- newOwner stages key 1 as a replica while degraded.
-      new Client((owner = replica, key = 1, sq = 1));
+      // seq = 1: replica's (nodeId 2) first-ever forward.
+      new Client((owner = replica, key = 1, sq = 1, originSeq = 1));
 
       // replica itself now dies. newOwner is (or will be) holding
       // replica's staged key 1, uncommitted -- ordinarily exactly the
@@ -349,8 +361,9 @@ machine TestNewNodeBoot {
 
       // owner accepts and forwards key 1 under incarnation 1, then
       // suffers a wipe, not merely a crash -- see eCrashWipe's header
-      // comment (Events.p) for the eDie/eCrashWipe distinction.
-      new Client((owner = owner, key = 1, sq = 1));
+      // comment (Events.p) for the eDie/eCrashWipe distinction. seq = 1:
+      // nodeId 1's first-ever forward.
+      new Client((owner = owner, key = 1, sq = 1, originSeq = 1));
       send owner, eCrashWipe;
 
       // The replacement: a genuinely new node (fresh nodeId 3, NOT
@@ -364,15 +377,112 @@ machine TestNewNodeBoot {
       send replica, eLink, newOwner;
 
       // A peer forward races the still-waiting newOwner (see header
-      // comment above).
-      new Client((owner = replica, key = 2, sq = 2));
+      // comment above). seq = 1: replica's (nodeId 2) first-ever forward
+      // (distinct from `sq = 2`, the client's own unrelated request
+      // counter).
+      new Client((owner = replica, key = 2, sq = 2, originSeq = 1));
 
       // The catalog returns: newOwner completes its first-ever fence and
       // leaves the waiting state.
       send newOwner, eCatalogRestored;
 
-      // Positive path: newOwner can now genuinely participate.
-      new Client((owner = newOwner, key = 3, sq = 1));
+      // Positive path: newOwner can now genuinely participate. seq = 1:
+      // newOwner's (nodeId 3) own first-ever forward.
+      new Client((owner = newOwner, key = 3, sq = 1, originSeq = 1));
+    }
+  }
+}
+
+// Scenario: §5.4's PeerApply gap-refusal (docs/design/replication.md §4;
+// `specs/DuckSpoutCore.tla`'s `GapFreedom`, `PeerApply`'s `g.rec.seq =
+// AppliedThru(...) + 1` guard) -- the third named safety property #132's
+// own DoD calls out alongside NoAckedLoss and FencedZombie, and the one
+// docs/design/p-tla-correspondence.md previously named as having "no P
+// counterpart" (see that file's `eForward`/`PeerApply` row, corrected
+// alongside this scenario).
+//
+// `sender1`, `sender2`, and `receiver` never call `eFenceBoot` --
+// nodeId/incarnation stay at their shared P zero-default, the same
+// harmless-shared-default convention `TestTakeoverDrain`/
+// `TestHeartbeatDetection` already use for a scenario that never
+// exercises §5.7 fencing. This scenario isolates GapFreedom the same way
+// `TestDegradedBoot` isolates DegradedBoot from mechanisms it does not
+// need ("simpler is also correct here").
+//
+// The race: TWO DIFFERENT `Node` machine instances, `sender1` and
+// `sender2`, share the SAME logical origin identity (nodeId 0, the
+// shared default above) without any reboot involved -- the same "two
+// different senders, so their relative arrival order at the receiver is
+// unconstrained" trick `TestFenceBootZombie`'s reboot mechanism already
+// establishes for racing two forwards from one logical origin, used here
+// with neither `eFenceBoot` nor incarnation dynamics at all. `sender1`
+// accepts and forwards the FIRST write (key 1, seq 1); `sender2` accepts
+// and forwards the SECOND (key 2, seq 2) -- each through its OWN real
+// `eWriteReq` handler, not a direct injection, so each sender's own
+// `holders`/`pendingClient` bookkeeping is populated before its own
+// Receipt can come back to it. This is deliberate, not incidental:
+// `TestFenceBootZombie`'s header comment records that an earlier version
+// of THAT scenario injected its second write directly and crashed with a
+// `KeyNotFoundException` on `holders[key]`, because a directly-injected
+// Forward has no corresponding `eWriteReq` to have initialized the
+// sender's own bookkeeping for that key -- the identical crash reappeared
+// here during authoring (an alive `sender` receiving a Receipt for a key
+// it never locally accepted) until this scenario adopted the same
+// two-real-senders shape instead. Because `sender1` and `sender2` are
+// different machines, P's per-(sender, receiver) channel FIFO does not
+// constrain their relative arrival order at `receiver` -- the checker
+// explores both.
+//
+// A third message -- a retransmit of `sender2`'s write, claiming `origin
+// = sender2` -- stands in for the origin's own retry once its
+// receipt-timeout (§4) expires without an ack, or the catch-up query
+// (§4, "the table is the log") re-sending it -- the same "sent directly
+// from the environment, standing in for the peer's own send" convention
+// `TestTakeoverDrain`'s retransmitted Forward already uses. Safe to
+// inject directly here, unlike a brand-new key, because it names
+// `sender2` as its origin, and `sender2`'s own real `eWriteReq` above
+// already initialized the bookkeeping any Receipt it earns will need.
+// Also environment-injected, so its arrival is unconstrained relative to
+// BOTH real writes. The checker explores every relative order of
+// {`sender2`'s real Forward, this retransmit, `sender1`'s real Forward}
+// it can produce:
+//   - either delivery of `sender2`'s write (key 2, seq 2) arrives at
+//     `receiver` before `sender1`'s (key 1, seq 1): GapFreedom's gate
+//     refuses it (appliedThru is still 0, so seq 2 != 0 + 1) -- no apply,
+//     no claim advertisement, no receipt. Once `sender1`'s write then
+//     arrives, it is accepted normally (appliedThru: 0 -> 1). Whichever
+//     delivery of `sender2`'s write lands after that is now accepted too
+//     (appliedThru: 1 -> 2) -- both writes applied, in the now-correct
+//     order, exactly the recovery this scenario is built to demonstrate.
+//   - BOTH deliveries of `sender2`'s write race ahead of `sender1`'s:
+//     both are refused, and key 2 never applies within this bounded
+//     scenario. This is safe, not a bug -- GapFreedom is a safety
+//     property (no seq is ever accepted out of order), not a liveness
+//     guarantee that a refused write is eventually retried successfully
+//     within a fixed, bounded scenario.
+//   - `sender1`'s write arrives before either delivery of `sender2`'s: no
+//     gap ever occurs; both keys apply in order, appliedThru: 0 -> 1 -> 2.
+machine TestGapFreedom {
+  start state Init {
+    entry {
+      var sender1: Node;
+      var sender2: Node;
+      var receiver: Node;
+
+      sender1 = new Node();
+      sender2 = new Node();
+      receiver = new Node();
+      send sender1, eLink, receiver;
+      send sender2, eLink, receiver;
+
+      // sender1's genuine first write and sender2's genuine second write
+      // -- see header comment above for why both are routed through
+      // their own real eWriteReq handlers.
+      new Client((owner = sender1, key = 1, sq = 1, originSeq = 1));
+      new Client((owner = sender2, key = 2, sq = 2, originSeq = 2));
+
+      // Retransmit of sender2's write (see header comment above).
+      send receiver, eForward, (key = 2, sq = 2, originSeq = 2, origin = sender2, originId = 0, inc = 0);
     }
   }
 }
