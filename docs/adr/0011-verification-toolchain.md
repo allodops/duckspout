@@ -52,11 +52,12 @@ model to keep in sync; every bug found is a bug in shipping code.
   duplicated-seam argument that excluded turmoil and madsim (D-2). The CTK
   forgoes the polished checker to test the real code directly.
 - **shuttle (AWS) / stateright — MISSED in this ADR's first pass, added
-  by owner-review amendment (2026-09-01)**: Rust-native tools that run
-  P-class systematic exploration on REAL Rust code — shuttle implements
-  PCT scheduling (used on s2n-quic) with no third model to sync;
-  stateright model-checks Rust actor systems. shuttle remains the
-  candidate backend for the CTK's ScheduleStrategy (#124).
+  by owner-review amendment (2026-09-01); evaluation closed below**:
+  Rust-native tools that run P-class systematic exploration on REAL
+  Rust code — shuttle implements PCT scheduling (used on s2n-quic) with
+  no third model to sync; stateright model-checks Rust actor systems.
+  Both lost as a `ScheduleStrategy` backend on concrete architectural-fit
+  grounds; see the #124-closing amendment.
 - **Apalache / TLAPS (added with the owner-review amendments)** — the
   rungs above TLC on the assurance ladder. Apalache (symbolic, SMT):
   handles larger state spaces and can prove *inductive* safety
@@ -105,6 +106,40 @@ qualitatively. Recorded so the gap stays visible:
   pipeline, with the P model gated by dual trace conformance); this
   ADR's evidence-triggered posture remains the fallback.
 
+## #124 closed: shuttle / stateright lose on architectural fit, PCT hand-rolled
+
+R-third-party-first evaluation of shuttle and stateright as the CTK's
+`ScheduleStrategy` backend (`duckspout-ctk::strategy::ScheduleStrategy`,
+one method: `next_index(&mut self, pending: usize) -> usize`, plugged into
+the existing `SeededScheduler` — DuckSpout's own single-threaded,
+port-level deterministic executor, D-2):
+
+- **stateright**: wrong category. It model-checks abstract `Model` trait
+  implementations you write separately — it does not execute or schedule
+  real program code, and exposes no interleaving-scheduler interface at
+  all. There is nothing here that could implement `ScheduleStrategy`;
+  adopting it would mean writing and maintaining a third model, exactly
+  the duplicated-seam problem D-2 already rejected for turmoil/madsim.
+- **shuttle**: right category (it does schedule real async Rust), but its
+  `Scheduler` trait — and `PctScheduler`, its PCT implementation — operate
+  on shuttle's own `Task`/`TaskId` runtime bookkeeping, not a standalone,
+  extractable algorithm. shuttle's PCT scheduler is not usable as a
+  drop-in `ScheduleStrategy` without adopting shuttle's whole
+  thread/`Mutex`-replacement runtime in place of `SeededScheduler` — a
+  full executor swap, not a pluggable policy, and itself the same
+  duplicated-seam / whole-runtime-patching shape D-2 rejected turmoil and
+  madsim for.
+- **Decision**: hand-roll PCT as a new `ScheduleStrategy` implementation
+  against the existing trait, informed by shuttle's published PCT
+  algorithm (priority assignment + bounded priority-change points) as a
+  reference for the *algorithm*, not as a dependency. This keeps
+  `SeededScheduler` unchanged, adds no new runtime, and the judge's
+  seeded-violation replays (§8.4) gate it under both strategies per #124.
+- **Revisit trigger**: if shuttle (or a successor) ever exposes its
+  scheduling policies as a runtime-agnostic library — decoupled from its
+  own `Task`/`TaskId` types and thread/`Mutex` shims — revisit adopting
+  it in place of the hand-rolled strategy.
+
 ## Revisit when
 
 - PChecker (or a successor) gains exhaustive small-scope enumeration with
@@ -114,3 +149,6 @@ qualitatively. Recorded so the gap stays visible:
   root causes) — revisit adopting P/Coyote for the testing tier.
 - Trace refinement proves too costly in practice (conformance-gate wall
   clock dominating CI) — revisit the binding between tiers.
+- shuttle exposes its scheduling policies as a standalone library
+  independent of its own runtime — revisit adopting it for #124's seam
+  instead of the hand-rolled PCT strategy.
