@@ -49,10 +49,10 @@ use std::sync::Arc;
 
 use duckspout_lake_contract::LakeCommitter;
 use duckspout_types::{
-    Clock, CommitOutcome, DatasetId, DrainableWindow, DropOutcome, LakeError, LedgerRejection,
-    PartitionId, SealError, SealRequest, SealSurface, SealedPart, Storage, StorageError,
-    StoragePath, TraceEvent, TraceSink, WatermarkBookkeeping, WatermarkRow, WindowId,
-    WindowManifest,
+    Clock, CommitOutcome, DatasetDeclaration, DatasetId, DatasetKind, DrainableWindow, DropOutcome,
+    LakeError, LedgerRejection, PartitionId, SealError, SealRequest, SealSurface, SealedPart,
+    Storage, StorageError, StoragePath, TraceEvent, TraceSink, WatermarkBookkeeping, WatermarkRow,
+    WindowId, WindowManifest,
 };
 use object_store::ObjectStoreExt as _;
 
@@ -161,6 +161,41 @@ pub struct DatasetDrainPlan {
     pub event_time_column: String,
     /// Drain-time dedup key; `None` seals every row (§6.2).
     pub dedup_key: Option<Vec<String>>,
+}
+
+impl DatasetDrainPlan {
+    /// Derive a plan from a dataset's declaration (§2.1) plus its schema's
+    /// event-time column (§2.1's `key_cols`/`sort_key` are the declaration's
+    /// closed attribute set; `event_time_column` is schema-level — e.g.
+    /// `otlp_logs`' fixed `ts` — not one of the three, so it is supplied by
+    /// the caller rather than read off `decl`).
+    ///
+    /// Implements drain.md §2's per-kind defaults verbatim: `event` sorts by
+    /// the event-time column with no dedup; `changelog` sorts
+    /// `(key_cols, origin, seq)` key-clustered and dedups keep-latest on
+    /// `key_cols`. An explicit `sort_key` overrides the default order for
+    /// either kind; dedup stays kind-determined (only `changelog` declares a
+    /// key to dedup on).
+    pub fn from_declaration(
+        decl: &DatasetDeclaration,
+        event_time_column: impl Into<String>,
+    ) -> Self {
+        let event_time_column = event_time_column.into();
+        let (default_order_by, dedup_key) = match decl.kind {
+            DatasetKind::Event => (vec![event_time_column.clone()], None),
+            DatasetKind::Changelog => {
+                let mut order_by = decl.key_cols.clone();
+                order_by.push("origin".to_owned());
+                order_by.push("seq".to_owned());
+                (order_by, Some(decl.key_cols.clone()))
+            }
+        };
+        DatasetDrainPlan {
+            order_by: decl.sort_key.clone().unwrap_or(default_order_by),
+            event_time_column,
+            dedup_key,
+        }
+    }
 }
 
 /// The per-node drain driver: schedules eligible windows and runs the
@@ -538,4 +573,63 @@ impl DrainCoordinator {
 enum Unsettled {
     Aborted,
     Indeterminate,
+}
+
+#[cfg(test)]
+mod drain_plan_tests {
+    use super::*;
+
+    fn event_decl() -> DatasetDeclaration {
+        DatasetDeclaration {
+            dataset: DatasetId::new("otlp_logs"),
+            kind: DatasetKind::Event,
+            key_cols: Vec::new(),
+            sort_key: None,
+        }
+    }
+
+    fn changelog_decl() -> DatasetDeclaration {
+        DatasetDeclaration {
+            dataset: DatasetId::new("accounts"),
+            kind: DatasetKind::Changelog,
+            key_cols: vec!["account_id".to_owned()],
+            sort_key: None,
+        }
+    }
+
+    #[test]
+    fn event_default_sorts_by_event_time_and_never_dedups() {
+        let plan = DatasetDrainPlan::from_declaration(&event_decl(), "ts");
+        assert_eq!(plan.order_by, vec!["ts".to_owned()]);
+        assert_eq!(plan.event_time_column, "ts");
+        assert_eq!(plan.dedup_key, None);
+    }
+
+    #[test]
+    fn changelog_default_sorts_key_clustered_and_dedups_on_key_cols() {
+        let plan = DatasetDrainPlan::from_declaration(&changelog_decl(), "updated_at");
+        assert_eq!(
+            plan.order_by,
+            vec![
+                "account_id".to_owned(),
+                "origin".to_owned(),
+                "seq".to_owned()
+            ]
+        );
+        assert_eq!(plan.event_time_column, "updated_at");
+        assert_eq!(plan.dedup_key, Some(vec!["account_id".to_owned()]));
+    }
+
+    #[test]
+    fn explicit_sort_key_overrides_the_kind_default_for_either_kind() {
+        let mut decl = changelog_decl();
+        decl.sort_key = Some(vec!["region".to_owned(), "account_id".to_owned()]);
+        let plan = DatasetDrainPlan::from_declaration(&decl, "updated_at");
+        assert_eq!(
+            plan.order_by,
+            vec!["region".to_owned(), "account_id".to_owned()]
+        );
+        // Dedup stays kind-determined even when sort_key is overridden.
+        assert_eq!(plan.dedup_key, Some(vec!["account_id".to_owned()]));
+    }
 }

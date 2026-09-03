@@ -76,8 +76,8 @@ use duckspout_staging::{
     EngineSealSurface, EngineStager, StagerConfig, StagingConfig, StagingEngine,
 };
 use duckspout_types::{
-    BoxFuture, Clock, DatasetId, DecodedBatch, LakeCommitter, NodeId, SealSurface, StageCommitter,
-    StageError, StageOutcome, Storage,
+    BoxFuture, Clock, DatasetDeclaration, DatasetId, DatasetKind, DecodedBatch, LakeCommitter,
+    NodeId, SealSurface, StageCommitter, StageError, StageOutcome, Storage,
 };
 use duckspout_watermark::{SharedLedger, WatermarkLedger};
 use tokio::net::TcpListener;
@@ -626,19 +626,26 @@ fn arrow_logical_type(data_type: &arrow::datatypes::DataType) -> Result<&'static
 }
 
 /// The [`DatasetDrainPlan`] for v0.1's one built-in dataset (module docs).
+/// Routed through [`DatasetDrainPlan::from_declaration`] (#93) so the
+/// kind-based branching it implements is exercised by real wiring, not only
+/// by its own unit tests — v0.1 still declares exactly one dataset, so
+/// there is no declaration ledger to read a second one from yet.
 fn drain_plan_for(dataset: &DatasetId) -> Option<DatasetDrainPlan> {
     (dataset.as_str() == OTLP_LOGS_DATASET).then(otlp_logs_drain_plan)
 }
 
-/// `otlp_logs`' drain plan: the event-time default sort/statistics column
-/// (`ts`, `duckspout-accept/src/otlp.rs`'s fixed schema) and no drain-time
-/// dedup key — an `event`-kind dataset seals every row (§6.2).
+/// `otlp_logs`' declaration (`event`-kind, no dedup key) and its
+/// event-time/statistics column (`ts`, `duckspout-accept/src/otlp.rs`'s
+/// fixed schema — schema-level, so it is supplied here rather than read off
+/// the declaration; see [`DatasetDrainPlan::from_declaration`]).
 fn otlp_logs_drain_plan() -> DatasetDrainPlan {
-    DatasetDrainPlan {
-        order_by: vec!["ts".to_owned()],
-        event_time_column: "ts".to_owned(),
-        dedup_key: None,
-    }
+    let declaration = DatasetDeclaration {
+        dataset: DatasetId::new(OTLP_LOGS_DATASET),
+        kind: DatasetKind::Event,
+        key_cols: Vec::new(),
+        sort_key: None,
+    };
+    DatasetDrainPlan::from_declaration(&declaration, "ts")
 }
 
 /// The ingest roller's obligation (`duckspout-staging/src/seal.rs` module
