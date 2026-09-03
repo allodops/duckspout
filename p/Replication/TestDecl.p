@@ -1,1 +1,1 @@
-test Replication [main = TestTakeoverDrain]: assert NoAckedLoss in { TestTakeoverDrain, Node, Client };
+test Replication [main = TestTakeoverDrain]: assert NoAckedLoss, ClaimAdvertiseOnce in { TestTakeoverDrain, Node, Client };
