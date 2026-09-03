@@ -1,0 +1,11 @@
+<Project>
+  <ProjectName>Replication</ProjectName>
+  <InputFiles>
+    <PFile>Events.p</PFile>
+    <PFile>Client.p</PFile>
+    <PFile>Node.p</PFile>
+    <PFile>Spec.p</PFile>
+    <PFile>TestDriver.p</PFile>
+    <PFile>TestDecl.p</PFile>
+  </InputFiles>
+</Project>
