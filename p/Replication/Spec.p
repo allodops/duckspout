@@ -113,3 +113,58 @@ spec ClaimAdvertiseOnce observes eClaimAdvertise {
     }
   }
 }
+
+// FencedZombie (§5.7 -- matches DuckSpoutCore.tla's own invariant name for
+// the same property, not its text; the TLA+ analog is `staleApplied = {}`
+// checked against PeerApply's `g.inc >= highestSeen[m][origin]` guard --
+// see `specs/DuckSpoutCore.tla` lines ~304-316, ~988). Hand-written P
+// analog, same convention `NoAckedLoss` and `ClaimAdvertiseOnce` above
+// already establish for this file: never a transliteration.
+//
+// The property: no node ever accepts a message carrying an incarnation
+// strictly lower than the highest incarnation it has already accepted
+// from that same logical sender. Checked by recomputing, purely from the
+// `eFenceDecision` event stream `Node.p` announces, an independent
+// ground truth of "the highest incarnation this receiver has legitimately
+// accepted from this sender so far" -- and asserting every *accepted*
+// decision is consistent with it. This is deliberate: the spec does not
+// read `Node.p`'s own internal `highestSeen` map (that would just be
+// checking the implementation against itself, tautologically green
+// whether or not the implementation's fencing logic is actually correct
+// -- the "gamed test" failure mode). Recomputing the yardstick from the
+// announced record of decisions is what lets this catch a broken `Node.p`
+// that stops enforcing the fence but keeps announcing `eFenceDecision`
+// honestly (see the scratch broken variant in the PR this spec shipped
+// with): if `Node.p` wrongly accepts a stale message, the *spec's own*
+// bookkeeping -- built from nothing but the accept/reject record -- still
+// has the true highest incarnation on file for that (receiver, sender)
+// pair, and the assert fires on the wrongly-accepted message itself.
+//
+// A direct `assert`, not `hot state`, for the same reason as `NoAckedLoss`
+// above: this is a per-event safety check on a bounded scenario, not an
+// eventually-property, and P's default bugfinding checker does not treat
+// "terminated while hot" as a violation the way TLA+'s fairness-driven
+// `~>` checking does (#132 finding, see `NoAckedLoss`'s header).
+spec FencedZombie observes eFenceDecision {
+  // Highest incarnation accepted so far, per (receiver, sender) pair.
+  var highestAccepted: map[(receiver: Node, sender: int), int];
+
+  start state Watching {
+    on eFenceDecision do (fd: (receiver: Node, senderId: int, inc: int, accepted: bool)) {
+      var k: (receiver: Node, sender: int);
+      var seen: int;
+      if (fd.accepted) {
+        k = (receiver = fd.receiver, sender = fd.senderId);
+        seen = 0;
+        if (k in highestAccepted) {
+          seen = highestAccepted[k];
+        }
+        assert fd.inc >= seen,
+          "FencedZombie violated: a node accepted a message whose incarnation was strictly lower than the highest incarnation already accepted from that sender";
+        if (fd.inc > seen) {
+          highestAccepted[k] = fd.inc;
+        }
+      }
+    }
+  }
+}

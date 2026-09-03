@@ -91,7 +91,7 @@ there). The rest:
 | `ClaimAdvertise(n, p)` | None | P has no `claims` registry / `InitClaims` concept at all. The sole authorization for P's takeover is the local boolean `peerDead`; TLA+'s `TakeoverDrain` guard instead reads a global `claims` set and every node's `alive[]`. Quiescent in `Replication.cfg` too (`InitClaims` pre-seeds `n1` directly), so this is a wash for *this* scenario, not a live gap. |
 | `Heartbeat(n)` | None | `Replication.cfg` sets `MaxHb = 0` ("advisory, nothing reads it") — neither model gives this teeth here, so not a divergence for this scope. |
 | `CrashWipe(n)` | None | `WipeBudget = 0` in `Replication.cfg` — unreachable in TLA+'s own clean config too. |
-| `RecoverNode(n)` / `FenceBoot(n)` / `DegradedBoot(n)` | None | **Not** a wash — see §4.2. The crashed owner never returns in the P scenario; `TestDriver.p` sends `owner` exactly `eDie` and nothing else. |
+| `RecoverNode(n)` / `FenceBoot(n)` / `DegradedBoot(n)` | `eFenceBoot` handler (`Node.p`), `TestFenceBootZombie` (`TestDriver.p`) | **Partial**, added by the `FencedZombie` P scenario — see §4.2 (updated). `FenceBoot`'s incarnation-draw-and-persist has a P analog; `RecoverNode`'s and `DegradedBoot`'s surrounding machinery (the catalog-outage boot split, replica-only degraded mode) does not — see §4.2 for the precise boundary of what is and is not covered. |
 
 ## 4. Known gaps and divergences
 
@@ -112,7 +112,13 @@ paradigm difference, standing in for a detection mechanism (heartbeat TTL)
 that is genuinely unmodeled — its timing, false-positive rate, and TTL value
 — in *both* models today.
 
-### 4.2 P never models `FenceBoot`/recovery — `FencedZombie` has no P counterpart
+### 4.2 P now models `FenceBoot`/recovery and checks `FencedZombie` — narrower than TLA+'s, not absent
+
+*Updated: a second P test scenario, `TestFenceBootZombie`
+(`p/Replication/TestDriver.p`), closes the gap this section used to
+describe as unrepresented. What follows is the corrected boundary of what
+P covers here, not the original finding — see the PR that added
+`eFenceBoot`/`FencedZombie` for the verification evidence.*
 
 `Replication.tla`'s own header is explicit that the recovery path matters
 to this exact scenario: "`FenceBoot`'s recovery path is reachable too...
@@ -123,21 +129,45 @@ exactly this scope's story." `Replication.cfg` checks `FencedZombie` (along
 with the other nine state invariants) as a real, non-vacuous check in this
 same crash/takeover narrative.
 
-`p/Replication/TestDriver.p` never sends the crashed `owner` a reboot event
-— the halted machine is simply gone for the rest of the scenario. P's
-`Node.p` has no `inc`/incarnation field, no fencing token, no
-"stale-write-rejected" branch of any kind. This means the entire zombie
-class of bug — a recovered node re-committing or re-claiming after a
-takeover has already happened — is **unrepresented** in the P model, not
-weakly represented. `NoAckedLoss.p` passing tells you nothing about it.
+`p/Replication/TestFenceBootZombie` now sends the crashed `owner` a reboot
+too, modeled as a **brand-new `Node` machine instance** (`newOwner`) —  P
+machines cannot un-halt, so there is no way to resume the halted `owner`
+itself; recovery is a fresh instance seeded via a new `eFenceBoot` event
+with the old node's persistent logical identity (`nodeId`, a field
+`Node.p` carries specifically so a rebooted instance and its crashed
+predecessor can be recognized as "the same sender" despite being different
+machine references) and a strictly higher `incarnation` than the crashed
+instance had. Every `eForward`/`eReceipt` now carries `(originId/holderId,
+inc)`, and the receiving `Node.p` handler tracks `highestSeen: map[int,
+int]` per logical sender and refuses (no apply, no claim advertisement, no
+receipt, no takeover) anything below what it has already seen — mirroring
+§5.7's "peers... track the highest incarnation seen per node and reject
+anything older." The new `FencedZombie` spec (`Spec.p`) asserts this
+directly: no node ever accepts a message whose incarnation is strictly
+below the highest it has already accepted from that same logical sender,
+checked by recomputing an independent ground truth from the announced
+`eFenceDecision` stream rather than reading `Node.p`'s own bookkeeping (so
+a broken fence in `Node.p` cannot pass by construction). `just p-check
+Replication` plus a direct `p check -tc FenceBootZombie` run both show 0
+bugs across 5000 explored schedules on the honest model; a scratch,
+uncommitted variant that disables the fence (`accept = true` in both
+handlers) is caught in 7 schedules with a genuine zombie-acceptance trace
+— see the PR for the exact trace excerpt.
 
-This is a genuine, concrete scope gap (not hypothetical): P currently
-cannot find, and cannot rule out, a `FencedZombie`-class bug, because
-nothing in the model can produce the state that bug lives in. **Candidate
-follow-up**: a second P test scenario (e.g. `TestFenceBootZombie`) that
-reboots the crashed node after takeover and attempts a stale write or
-commit through it, with an assert mirroring `FencedZombie`. Out of scope
-for this documentation task — flagged here per instructions, not fixed.
+What P still does **not** cover, so this remains a real, narrower scope
+gap rather than a closed one: `RecoverNode`'s and `DegradedBoot`'s
+surrounding machinery — the catalog-outage boot split (§5.7's two boot
+cases: a node with a persisted incarnation booting into replica-only
+degraded mode versus a genuinely new node waiting), Heartbeat-driven
+detection (still `eCrashSignal`'s stated abstraction, §4.1), and — the
+same gap §4.3 describes in more detail — any of TLA+'s discrete
+claim/seal/commit-guard steps that `FencedZombie` also polices on the
+drain-commit side (`CommitGuardsHold`'s `pt.inc = inc[pt.sealer]`).
+`TestFenceBootZombie`'s reboot is a bare identity-and-incarnation reset
+with no boot-mode branch at all; it exercises the message-fencing half of
+§5.7, not the boot-mode half. **Candidate follow-up**, unchanged from the
+original finding: widen P's takeover handling into discrete claim/seal/
+commit steps with guards (tracked the same way as §4.3's).
 
 ### 4.3 `eTakeoverDrain` fuses claim-acquisition with commit; TLA+ keeps them apart
 
@@ -164,18 +194,27 @@ even states the fusion outright: "A replica claims an orphaned key and
 drains (commits) it" — one event, both meanings.
 
 Consequence: P's `NoAckedLoss` check, however useful for what it does
-check, cannot exercise or catch anything in the double-drain or
-incarnation-fencing hazard family that `SingleDrainCommit`/`FencedZombie`/
-`CommitGuardsHold` exist to prevent — that hazard surface currently has
+check, cannot exercise or catch anything in the double-drain hazard family
+that `SingleDrainCommit`/`CommitGuardsHold` exist to prevent — that
+specific hazard surface (drain-commit uniqueness/disjointness) still has
 **zero** P coverage, only TLA+ coverage (and TLA+ only reaches it because
 `Replication.tla` turns `TakeoverOn = TRUE` over the full shared `Next`,
-which includes `Drain.tla`'s actions). This is the same underlying gap as
-§4.2 (no recovery path), viewed from the commit-guard side rather than the
-recovery side, and has the same disposition: a candidate follow-up issue
-to widen the P model's takeover handling into discrete claim/seal/commit
-steps with guards, not a fix made in this PR.
+which includes `Drain.tla`'s actions). §4.2's update narrows this: P's
+`FencedZombie` now covers the *message-fencing* half of the incarnation
+hazard family (a stale-incarnation Forward/Receipt from a rebooted node's
+former self) but not the *commit-guard* half (`pt.inc = inc[pt.sealer]` at
+`LakeCommitOk`, gated on a seal/put/commit sequence P's `eTakeoverDrain`
+still fuses into one boolean flip, as above). This is the same underlying
+gap as §4.2 (no discrete claim/seal/commit steps), viewed from the
+commit-guard side rather than the recovery side, and has the same
+disposition: a candidate follow-up issue to widen the P model's takeover
+handling into discrete claim/seal/commit steps with guards, not a fix made
+in the PR that added `FencedZombie`'s message-fencing coverage.
 
-### 4.4 Property coverage: TLA+ checks ten invariants and two properties here; P checks one, and it is an explicit "analog," not a transliteration
+### 4.4 Property coverage: TLA+ checks ten invariants and two properties here; P checks three, none a transliteration
+
+*Updated alongside §4.2: `FencedZombie` (`Spec.p`) is a new third P
+property, added by the same PR that closed §4.2's original gap.*
 
 `Replication.cfg` checks all ten of `DuckSpoutCore.tla`'s state invariants
 (`DurableAck`, `NoAckedLoss`, `WatermarkHonesty`, `CacheTransparency`,
@@ -187,18 +226,38 @@ confirmed as a permanently-red finding
 (`specs/broken/Finding_TakeoverOrphanedSeal.cfg`), not a silently-dropped
 check.
 
-`p/Replication/NoAckedLoss.p` checks exactly one property, and its own
-header says what kind of correspondence it is: "Mirrors
-`DuckSpoutCore.tla`'s `NoAckedLoss`/`GapFreedom` in spirit, not text — this
-is a hand-written P analog, not a transliteration." So P's one checked
-property is itself a hybrid, informal analog of *two* of TLA+'s twelve
-checked properties, not a 1:1 rendering of either. The other ten
-(`DurableAck`, `WatermarkHonesty`, `CacheTransparency`, `SingleDrainCommit`,
-`FencedZombie`, `LossLedgerTruthful`, `SnapshotCovered`, `LatestViewCorrect`,
-`LadderMonotone`, `EveryRequestResolves`) have no P counterpart of any kind
-today. This is consistent with the P model's own commit history describing
-it as an explicitly scoped-down slice, and this map should not be read as
-implying broader property coverage than that one hand-written assert.
+`p/Replication/*.p` checks three properties today, none a 1:1
+transliteration of a TLA+ invariant:
+
+- `NoAckedLoss.p`'s own header says what kind of correspondence it is:
+  "Mirrors `DuckSpoutCore.tla`'s `NoAckedLoss`/`GapFreedom` in spirit, not
+  text — this is a hand-written P analog, not a transliteration." It is a
+  hybrid, informal analog of *two* of TLA+'s twelve checked properties, not
+  a 1:1 rendering of either.
+- `ClaimAdvertiseOnce` (`Spec.p`) has no directly-named TLA+ invariant twin
+  at all: `DuckSpoutCore.tla`'s `ClaimAdvertise(n, p)` action's own guard
+  prevents redundant advertisement structurally, but nothing in
+  `Replication.cfg`'s checked-invariant list separately asserts that the
+  way `NoAckedLoss`/`FencedZombie`/etc. are asserted. P's version makes
+  that implicit structural guarantee an explicit, independently-checked
+  safety property TLA+ does not separately check for.
+- `FencedZombie` (`Spec.p`) **is** a named analog of
+  `DuckSpoutCore.tla`'s `FencedZombie` invariant (`staleApplied = {}`,
+  guarded by `PeerApply`'s `g.inc >= highestSeen[m][origin]`) — matching
+  name, matching intent, per §4.2's convention of naming P analogs after
+  their TLA+ counterpart without transliterating the text. Its scope is
+  narrower than TLA+'s: message-level Forward/Receipt fencing only, not
+  the commit-guard half (`CommitGuardsHold`'s `pt.inc = inc[pt.sealer]`) —
+  see §4.2 and §4.3 for the exact boundary.
+
+The other nine (`DurableAck`, `WatermarkHonesty`, `CacheTransparency`,
+`SingleDrainCommit`, `LossLedgerTruthful`, `SnapshotCovered`,
+`LatestViewCorrect`, `LadderMonotone`, `EveryRequestResolves`) have no P
+counterpart of any kind today. This is consistent with the P model's own
+commit history describing it as an explicitly scoped-down slice, and this
+map should not be read as implying broader property coverage than these
+three checks — one of which (`FencedZombie`) is itself narrower than its
+TLA+ namesake, per §4.2.
 
 ## 5. Divergence protocol
 
@@ -215,9 +274,12 @@ section makes that concrete for replication.
    armed `broken/` variant confirms a specific finding, e.g.
    `Finding_TakeoverOrphanedSeal`) that the P model's checker structurally
    cannot produce or distinguish, because the P model has no variables or
-   transitions in that area. Also §4.2/§4.3: P cannot find, or rule out,
-   the `FencedZombie`/double-drain hazard class because it has no
-   representation of the mechanism those invariants guard.
+   transitions in that area. Also §4.3: P cannot find, or rule out, the
+   `SingleDrainCommit`/`CommitGuardsHold` double-drain hazard class,
+   because it has no representation of the discrete claim/seal/commit
+   steps those invariants guard — narrower now than it reads in §4.2's
+   history, since P's own `FencedZombie` does cover that invariant's
+   message-fencing half (§4.2).
 3. **Genuine disagreement** — one model's guard permits a transition the
    other's guard forbids, in an area both models *do* represent (not a
    scope gap). None found in this reading; would be the most serious class
@@ -237,9 +299,11 @@ implementation-granularity decisions that have *already* been reconciled,
 not from two silently-diverging sources of truth:
 
 - **Class 1 (scope-parity)** is not a pipeline blocker by itself. It is
-  filed as a tracked issue (this document names two candidates: §4.2's
-  `TestFenceBootZombie`, §4.3's claim/seal/commit widening) and left as
-  backlog, because ADR-0012's own framing is that the P model "earns its
+  filed as a tracked issue (this document now names one remaining
+  candidate: §4.2/§4.3's claim/seal/commit widening — §4.2's original
+  `TestFenceBootZombie` candidate is done, landed alongside this update)
+  and left as backlog, because ADR-0012's own framing is that the P model
+  "earns its
   trust by being executed and refined" over time, not by being complete on
   day one. It **does** become relevant the moment step 3 (Rust) needs to
   rely on a guarantee only in the gap — at that point the gap must close
