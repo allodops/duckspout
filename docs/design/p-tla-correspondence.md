@@ -1,0 +1,281 @@
+# P ↔ TLA+ Correspondence Map: Replication
+
+> **Provenance:** new analysis document, issue #133 (ADR-0012 step 2 groundwork)
+> — **not** absorbed from `DUCKSPOUT.md`; there is no §n home for it. Built by
+> close reading of `specs/DuckSpoutCore.tla`, `specs/Replication.tla`,
+> `specs/Replication.cfg`, and `p/Replication/*.p` as they stand today.
+> **Owning crate:** none — this is a specs/models cross-reference, not
+> implementation-owned. Re-derive it (or at least re-check its tables) any
+> time either `specs/Replication.tla` or `p/Replication/*.p` changes; nothing
+> currently enforces that mechanically (§4).
+
+## 1. What this document is, and is not
+
+ADR-0012 (`docs/adr/0012-layered-refinement-pipeline.md`) makes the P model
+a *gated* artifact: step 2 of the pipeline calls for P's checker-explored
+executions to be "cross-checked against the TLA+ spec **mechanically**"
+(trace refinement, the same machinery step 5 uses for Rust traces), and it
+is explicit that an LLM reading both models and comparing them by eye "is
+not independent evidence" of correspondence — the two models are authored
+by the same class of agent reading the same design prose, so a second
+transcription does not catch what the first one got wrong about the
+protocol.
+
+This document is exactly that kind of reading. It is useful as a reference
+for anyone (human or agent) touching either model — a place to look up "what
+does this P event mean in TLA+ terms" — and it is where a concrete,
+non-hypothetical scope gap between the two models surfaces (§4.3). It is
+**not** the mechanical refinement check ADR-0012 step 2 calls for; that
+machinery does not exist yet (#130 is the tracked v0.2 execution plan for
+building it). Treat every claim below as "as read," not as "as proven
+equivalent."
+
+Scope: replication only — `specs/Replication.tla` (which `EXTENDS
+DuckSpoutCore` and instantiates its full shared `Next`) against
+`p/Replication/*.p`. Other checked TLA+ modules (`Ingest.tla`, `Drain.tla`,
+`Schema.tla`) have no P counterpart at all yet; this map does not attempt
+to cover them.
+
+## 2. The scenario each model checks
+
+Both models check the **same narrative**: `docs/design/replication.md`
+§5.6, "Node death, end to end" — an owner accepts and stages a write,
+forwards it to its one replica, then dies; the replica either already has
+the forwarded record (receipted) or does not, and either way must take over
+the orphaned partition and (eventually) drain what it holds. Both explore
+every relative ordering of forward-vs-crash the respective checker can
+produce, in the smallest scope where takeover is not vacuous: 2 nodes,
+RF = 2, one request.
+
+- TLA+: `specs/Replication.tla`'s clean config (`Replication.cfg`) — `n1`
+  (owner, `Crashable = {n1}`) accepts and stages `q1`, replicates to `n2`,
+  crashes; `n2` observes no live claimant and takes over.
+- P: `p/Replication/TestDriver.p`'s `TestTakeoverDrain` — `owner` accepts a
+  write from a `Client`, forwards to `replica`; `owner` is sent `eDie`
+  (halts for real) and `replica` is sent `eCrashSignal` (told out-of-band)
+  in the same `entry`, and the checker explores every scheduling of
+  Forward / Receipt / Die / CrashSignal.
+
+The topology match is close and deliberate. What each model does with that
+topology once takeover fires is not (§4.3).
+
+## 3. Correspondence map
+
+### 3.1 P events/handlers → TLA+ actions
+
+| P event / handler (`p/Replication/*.p`) | TLA+ counterpart (`specs/DuckSpoutCore.tla` unless noted) | Correspondence |
+|---|---|---|
+| `eLink` (`Events.p`, wiring) | — | No TLA+ counterpart. Pure P scaffolding: P machines need an explicit peer reference because spawn order is circular; TLA+ nodes are just elements of the `Nodes` set and `RingPeers(p, n) == Nodes \ {n}` needs no wiring step. |
+| `eWriteReq` handler (`Node.p`: `staged += key`, `holders[key] = 1`, `announce eAccepted`, `send peer, eForward`) | `Accept(n, q)` **+** `StageCommit(n, q)` **+** the origin's own `Forward(n, m, r)`, fused | TLA+ keeps admission (`Accept`, gated on `Rung(n) < 2`, `WindowClosed`), durable write (`StageCommit`), and the replication send (`Forward`) as three separately-interleavable actions, with `DedupCheck(n, q)` able to intervene between them (replay or throttle a duplicate). P's single scenario has one client, one key, so it collapses all of this into one atomic handler and has **no `DedupCheck` analog at all** — there is no dedup-key concept in the P model. There is also no ladder (`SoftLim`/`ThrottleLim`/`HardLim`/`Rung`) and no `WindowClosed` gating; every P write is unconditionally admitted. |
+| `eForward` handler (`Node.p`: `staged += key`, `send origin, eReceipt`, conditionally `committed += key` + `announce eTakeoverDrain`, `announce eForwardHandled`) | `PeerApply(m, g)` **+** `Receipt(m, r)`, fused (plus the late-arrival branch of `TakeoverDrain`, see §3.2) | `PeerApply`'s guards — fencing (`g.inc >= highestSeen[m][g.rec.origin]`), gap-refusal (`g.rec.seq = AppliedThru(...) + 1`), `SchemaKnown`, the hard-rung refusal — have **no P counterpart**. P applies every forwarded record unconditionally. `Receipt` in TLA+ is a separately-schedulable action (a peer can hold an applied record for a while before receipting it); in P, receipting happens inline in the same handler that applies the record — no interleaving between "applied" and "receipted" is representable. |
+| `eReceipt` handler (`Node.p`: `holders[key] += 1`; if `holders[key] >= 2` and pending, `send eWriteAck`) | `ClientAck(n, q)` (`Cardinality(H) >= RF`) | Faithful in spirit: P's `>= 2` is `Replication.cfg`'s `RF = 2` baked in as a literal rather than carried as a parameter. Granularity differs slightly — TLA+'s `ClientAck` is a distinct action that re-evaluates the guard whenever scheduled (it can be enabled without immediately firing); P re-checks and acts within the same handler invocation that received the triggering receipt. |
+| `eCrashSignal` handler (`Node.p`: `peerDead = true`; sweep `staged \ committed`, `committed += k`, `announce eTakeoverDrain` per key; `announce eCrashSignalHandled`) | **No TLA+ action.** Explicitly an abstraction — see §4.1. | — |
+| `eDie` handler (`Node.p`: `raise halt`) | `CrashNode(n)` (`alive' = FALSE`, `inflight' = {}`, `crashBudget' - 1`; staged/dedup/cache survive — "fsynced state survives (A1)") | Good match for the dying node's own transition. P's halted machine simply stops processing (its `staged`/`committed`/`holders` fields are inert, matching "fsynced state survives" — nothing in this scenario reads a dead node's state again). `Replication.cfg`'s `WipeBudget = 0` means `CrashWipe(n)` is unreachable there too, so P having no `CrashWipe` analog is not a scope gap *for this config*. |
+| `eAccepted` (announced inside `eWriteReq` handling) | The moment `StageCommit(n, q)` adds `r` to `staged[n]` | **Naming trap**: P's event is called `eAccepted`, which echoes TLA+'s `Accept` action by name, but its own doc comment (`Events.p` lines 25-28) says what it actually tracks is "the point past which the system has made a durability commitment" — that is TLA+'s `StageCommit` moment (what `NoAckedLoss`'s own `staged[n]` disjunct anchors on), not `Accept`'s admission moment. Read `eAccepted` as "staged," not "accepted," when comparing to TLA+. |
+| `eTakeoverDrain` (announced from both the late-Forward branch and the `eCrashSignal` sweep) | `TakeoverDrain(n, p)` **by name**, but see §4.3 for scope | Same name, materially different amount of work — flagged as a genuine divergence below, not glossed over here. |
+| `eForwardHandled`, `eCrashSignalHandled` (`Events.p`, marker events for `NoAckedLoss.p`'s assert) | — | No TLA+ counterpart. Pure P scaffolding, invented so the hand-written `NoAckedLoss` spec machine (`p/Replication/NoAckedLoss.p`) has a well-defined point to assert at in a *bounded* scenario. Its own header explains why: an earlier `hot state`-liveness formulation of the same check never fired (#132 finding) because P's default bugfinding checker does not treat "terminated while hot" as a violation the way TLA+'s fairness-driven `~>` checking does. TLA+ needs no equivalent marker because TLC checks invariants at *every* reachable state by construction. |
+| `eWriteAck` (Node → Client) | Client-visible effect of `resolved[q] = "acked"` becoming true | The `Client` machine (`Client.p`) only prints on receipt; TLA+ has no analogous "client machine," `resolved`/`ackEvidence` are just state components any spec can read directly. |
+| `TestDriver.p` / `Spec.p` / `TestDecl.p` (scenario wiring, `test Replication [main = TestTakeoverDrain]: assert NoAckedLoss in {...}`) | `Replication.tla`'s `Init`/`Spec` + `Replication.cfg`'s constant assignment (`ReplicationAcceptorOf`, `ReplicationInitClaims`, `Crashable = {n1}`, `MaxCrashes = 1`) | Structural match for the scenario topology (§2). One instantiation vs. TLC's exhaustive walk over the whole reachable space from that same `Init` is the expected difference in kind between a P test and a TLC config, not a divergence. |
+
+### 3.2 TLA+ actions with no P counterpart at all
+
+`specs/README.md`'s module-ownership table lists `Replication.tla`'s owned
+actions as: `Forward, PeerApply, Receipt, ClaimAdvertise, Heartbeat,
+TakeoverDrain, CrashNode, CrashWipe, RecoverNode, FenceBoot, DegradedBoot`.
+Of these, only `Forward`/`PeerApply`/`Receipt`/`TakeoverDrain`/`CrashNode`
+have any P representation (§3.1, with the fusions and guard-drops noted
+there). The rest:
+
+| TLA+ action | P representation | Note |
+|---|---|---|
+| `ClaimAdvertise(n, p)` | None | P has no `claims` registry / `InitClaims` concept at all. The sole authorization for P's takeover is the local boolean `peerDead`; TLA+'s `TakeoverDrain` guard instead reads a global `claims` set and every node's `alive[]`. Quiescent in `Replication.cfg` too (`InitClaims` pre-seeds `n1` directly), so this is a wash for *this* scenario, not a live gap. |
+| `Heartbeat(n)` | None | `Replication.cfg` sets `MaxHb = 0` ("advisory, nothing reads it") — neither model gives this teeth here, so not a divergence for this scope. |
+| `CrashWipe(n)` | None | `WipeBudget = 0` in `Replication.cfg` — unreachable in TLA+'s own clean config too. |
+| `RecoverNode(n)` / `FenceBoot(n)` / `DegradedBoot(n)` | None | **Not** a wash — see §4.2. The crashed owner never returns in the P scenario; `TestDriver.p` sends `owner` exactly `eDie` and nothing else. |
+
+## 4. Known gaps and divergences
+
+### 4.1 `eCrashSignal` is a stated abstraction, not a stand-in for a missing TLA+ action
+
+`Events.p` (lines 14-18) already says this plainly: `eCrashSignal` "stand[s]
+in for heartbeat-TTL expiry (the mechanism is out of this slice's scope;
+the fact that the replica eventually learns the owner is dead is what this
+model needs)." The important point for this map is *why* TLA+ has nothing
+resembling it: TLA+'s actions read `alive[n]` as shared state, synchronously,
+with no notion of one node learning about another's death — `TakeoverDrain`'s
+guard (`~\E n1 \in Nodes : alive[n1] /\ HoldsClaim(n1, p)`) simply reads the
+global `alive` function. P's actors do not share state; they only learn
+things via messages. So `eCrashSignal` is not a P analog of an
+under-specified TLA+ mechanism — it is P's message-passing model inventing a
+discrete step to bridge a gap that only exists because of the modeling
+paradigm difference, standing in for a detection mechanism (heartbeat TTL)
+that is genuinely unmodeled — its timing, false-positive rate, and TTL value
+— in *both* models today.
+
+### 4.2 P never models `FenceBoot`/recovery — `FencedZombie` has no P counterpart
+
+`Replication.tla`'s own header is explicit that the recovery path matters
+to this exact scenario: "`FenceBoot`'s recovery path is reachable too...
+n1 can `FenceBoot` after n2's takeover and must be fenced out of
+re-claiming or re-committing anything — `FencedZombie` is checked here for
+real, not vacuously, because the crash that makes it interesting... is
+exactly this scope's story." `Replication.cfg` checks `FencedZombie` (along
+with the other nine state invariants) as a real, non-vacuous check in this
+same crash/takeover narrative.
+
+`p/Replication/TestDriver.p` never sends the crashed `owner` a reboot event
+— the halted machine is simply gone for the rest of the scenario. P's
+`Node.p` has no `inc`/incarnation field, no fencing token, no
+"stale-write-rejected" branch of any kind. This means the entire zombie
+class of bug — a recovered node re-committing or re-claiming after a
+takeover has already happened — is **unrepresented** in the P model, not
+weakly represented. `NoAckedLoss.p` passing tells you nothing about it.
+
+This is a genuine, concrete scope gap (not hypothetical): P currently
+cannot find, and cannot rule out, a `FencedZombie`-class bug, because
+nothing in the model can produce the state that bug lives in. **Candidate
+follow-up**: a second P test scenario (e.g. `TestFenceBootZombie`) that
+reboots the crashed node after takeover and attempts a stale write or
+commit through it, with an assert mirroring `FencedZombie`. Out of scope
+for this documentation task — flagged here per instructions, not fixed.
+
+### 4.3 `eTakeoverDrain` fuses claim-acquisition with commit; TLA+ keeps them apart
+
+This is the sharpest same-name/different-meaning gap in the whole map.
+
+In TLA+, `TakeoverDrain(n, p)` does exactly one thing: it adds `<<n, p>>`
+to the advisory `claims` registry, gated on no live node currently holding
+that claim. It does **not** seal, put, or commit anything. Actually
+draining the window is a separate sequence of `Drain.tla`-owned actions —
+`SealPart` (gated on `HoldsClaim(n, p)` and `WindowClosed`), `PutPart`, and
+`LakeCommitOk` (gated on `CommitGuardsHold`: `pt.inc = inc[pt.sealer]`
+matching the catalog's minted incarnation, `UniqueOk` — one window part per
+window ever, spanning `lake \cup expired` — and `DisjointOk` for
+supplements) — each independently interleavable, each with its own guard.
+`SingleDrainCommit` and `FencedZombie` are invariants precisely *about*
+those guards holding.
+
+`p/Replication/Node.p`'s `eForward` and `eCrashSignal` handlers do the
+whole thing in one line: `committed += (k); announce eTakeoverDrain, ...`.
+There is no seal, no put, no commit-guard, no incarnation check, no
+uniqueness check — "committed" in the P model is a bare boolean flip on
+detecting an orphaned key. `eTakeoverDrain`'s own doc comment in `Events.p`
+even states the fusion outright: "A replica claims an orphaned key and
+drains (commits) it" — one event, both meanings.
+
+Consequence: P's `NoAckedLoss` check, however useful for what it does
+check, cannot exercise or catch anything in the double-drain or
+incarnation-fencing hazard family that `SingleDrainCommit`/`FencedZombie`/
+`CommitGuardsHold` exist to prevent — that hazard surface currently has
+**zero** P coverage, only TLA+ coverage (and TLA+ only reaches it because
+`Replication.tla` turns `TakeoverOn = TRUE` over the full shared `Next`,
+which includes `Drain.tla`'s actions). This is the same underlying gap as
+§4.2 (no recovery path), viewed from the commit-guard side rather than the
+recovery side, and has the same disposition: a candidate follow-up issue
+to widen the P model's takeover handling into discrete claim/seal/commit
+steps with guards, not a fix made in this PR.
+
+### 4.4 Property coverage: TLA+ checks ten invariants and two properties here; P checks one, and it is an explicit "analog," not a transliteration
+
+`Replication.cfg` checks all ten of `DuckSpoutCore.tla`'s state invariants
+(`DurableAck`, `NoAckedLoss`, `WatermarkHonesty`, `CacheTransparency`,
+`GapFreedom`, `SingleDrainCommit`, `FencedZombie`, `LossLedgerTruthful`,
+`SnapshotCovered`, `LatestViewCorrect`) plus the two properties
+`LadderMonotone` and `EveryRequestResolves`. It explicitly does **not**
+check `WatermarkEventuallyAdvances` in this scope — TLC falsifies it here,
+confirmed as a permanently-red finding
+(`specs/broken/Finding_TakeoverOrphanedSeal.cfg`), not a silently-dropped
+check.
+
+`p/Replication/NoAckedLoss.p` checks exactly one property, and its own
+header says what kind of correspondence it is: "Mirrors
+`DuckSpoutCore.tla`'s `NoAckedLoss`/`GapFreedom` in spirit, not text — this
+is a hand-written P analog, not a transliteration." So P's one checked
+property is itself a hybrid, informal analog of *two* of TLA+'s twelve
+checked properties, not a 1:1 rendering of either. The other ten
+(`DurableAck`, `WatermarkHonesty`, `CacheTransparency`, `SingleDrainCommit`,
+`FencedZombie`, `LossLedgerTruthful`, `SnapshotCovered`, `LatestViewCorrect`,
+`LadderMonotone`, `EveryRequestResolves`) have no P counterpart of any kind
+today. This is consistent with the P model's own commit history describing
+it as an explicitly scoped-down slice, and this map should not be read as
+implying broader property coverage than that one hand-written assert.
+
+## 5. Divergence protocol
+
+ADR-0012 step 2 says plainly: "Any divergence is itself a finding." This
+section makes that concrete for replication.
+
+**What "divergence" means here**, in increasing order of severity:
+
+1. **Scope-parity gap** — one model represents a mechanism or checks a
+   property the other doesn't yet, but neither *contradicts* the other
+   where they overlap. §4.2, §4.3, and §4.4 above are all of this kind
+   today: P is behind TLA+ in what it represents, not disagreeing with it.
+2. **Checker-vocabulary gap** — TLC explores a reachable state (or an
+   armed `broken/` variant confirms a specific finding, e.g.
+   `Finding_TakeoverOrphanedSeal`) that the P model's checker structurally
+   cannot produce or distinguish, because the P model has no variables or
+   transitions in that area. Also §4.2/§4.3: P cannot find, or rule out,
+   the `FencedZombie`/double-drain hazard class because it has no
+   representation of the mechanism those invariants guard.
+3. **Genuine disagreement** — one model's guard permits a transition the
+   other's guard forbids, in an area both models *do* represent (not a
+   scope gap). None found in this reading; would be the most serious class
+   were one found, since it would mean the two models encode different
+   beliefs about the same protocol step.
+4. **Mechanical cross-check failure** — once ADR-0012 step 2's actual
+   refinement machinery exists (#130), P's checker-explored executions
+   fail to refine against TLA+'s state graph, or vice versa, in a way this
+   hand-read correspondence map didn't anticipate. This is the failure
+   mode ADR-0012's own "Revisit when" section names as grounds to fall
+   back to ADR-0011's evidence-triggered posture if it "proves impractical."
+
+**What happens when one is found**, grounded in ADR-0012's actual
+purpose — verify *before* implementing, so that "Rust third, built from
+both" (step 3) starts from spec-supplied invariants and P-supplied
+implementation-granularity decisions that have *already* been reconciled,
+not from two silently-diverging sources of truth:
+
+- **Class 1 (scope-parity)** is not a pipeline blocker by itself. It is
+  filed as a tracked issue (this document names two candidates: §4.2's
+  `TestFenceBootZombie`, §4.3's claim/seal/commit widening) and left as
+  backlog, because ADR-0012's own framing is that the P model "earns its
+  trust by being executed and refined" over time, not by being complete on
+  day one. It **does** become relevant the moment step 3 (Rust) needs to
+  rely on a guarantee only in the gap — at that point the gap must close
+  before that slice of Rust is built "from both," per the pipeline's
+  ordering (each layer starts once the layer below it is validated).
+- **Class 2** is filed the same way as Class 1 when it traces back to a
+  scope gap (as both instances found here do); it escalates toward Class 3
+  treatment if closing the gap surfaces an actual disagreement rather than
+  just missing machinery.
+- **Class 3 (genuine disagreement)** blocks: per the pipeline's own
+  ordering, step 3 does not start (or, if already started, does not merge)
+  for the affected protocol slice until one model is corrected to match
+  the other's finding, with the correction and its reasoning recorded (a
+  `TRANSCRIPTION-NOTES.md`-style note for a TLA+ fix, or an ADR amendment
+  via the s§9.6 procedure if the disagreement touches a settled decision).
+  Neither model is presumptively right — ADR-0012's whole argument for
+  wanting a second, checker-executed model is that an LLM's read of the
+  design prose can be wrong in the same way twice, so a genuine
+  disagreement is exactly the signal the pipeline exists to surface, and
+  resolving it requires going back to the design prose (`specs/formal-core.md`
+  / `docs/design/replication.md`) and the mechanism in question, not
+  picking whichever model was authored first.
+- **Class 4 (mechanical cross-check failure)** is the condition ADR-0012's
+  "Revisit when" section already names explicitly: if step 5's P-side
+  conformance proves impractical, the pipeline's honesty depends on it, and
+  the fallback is ADR-0011's evidence-triggered posture — this is a
+  methodology-level decision (owner ruling), not something a single PR
+  resolves.
+- **Fairness-assumption divergences** (`WF_vars`/`SF_vars` clauses) get
+  ADR-0012's own named discipline regardless of which class they fall
+  under: every fairness clause must cite the concrete implementation
+  mechanism that supplies it, and its armed `broken/` variant (fairness
+  removed) must be shown to break the liveness property it was added for.
+  `CoreFairness`/`FairnessBase` in `DuckSpoutCore.tla` are the current
+  citations on the TLA+ side; P's bugfinding-checker posture (§4's
+  `eForwardHandled`/`eCrashSignalHandled` scaffolding, chosen specifically
+  because P's default checker does not do fairness-style liveness the way
+  TLC's `~>` does) means P currently makes no fairness claims of its own to
+  reconcile against TLA+'s.
