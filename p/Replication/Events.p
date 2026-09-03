@@ -89,6 +89,18 @@ event eDie;
 // description for the alternatives considered.
 event eFenceBoot: (nodeId: int, priorIncarnation: int);
 
+// §7 (docs/design/replication.md, DegradedBoot): a boot-time catalog-DB
+// outage/restore. Sent directly to the node by the environment -- the
+// same "stand in for a real signal" convention this file already uses
+// for eCrashSignal/eHeartbeat -- rather than modeling an actual catalog
+// service. `catalogOutage` defaults to P's zero-value `false` (catalog
+// reachable), so no scenario that never sends either event is affected:
+// `TestTakeoverDrain`, `TestFenceBootZombie`, and `TestHeartbeatDetection`
+// all boot with the catalog implicitly up, matching their behavior before
+// this pair of events existed.
+event eCatalogOutage;
+event eCatalogRestored;
+
 // A node reports it has durably staged a key (accepted for replication) --
 // what NoAckedLoss actually tracks: not the client's raw request (which
 // may never even be accepted if its target node dies first), but the
@@ -116,6 +128,19 @@ event eFenceDecision: (receiver: Node, senderId: int, inc: int, accepted: bool);
 // once per (key, node) -- a second apply for the same key must NOT
 // re-advertise (ClaimAdvertiseOnce, Spec.p).
 event eClaimAdvertise: (key: int, node: Node, role: tRole);
+
+// §7 DegradedBoot: announced by `Node.p` whenever its own `degraded` flag
+// changes -- true at `eFenceBoot` time when a persisted incarnation
+// (`priorIncarnation > 0`) boots into a catalog outage, false at
+// promotion once the catalog returns. Purpose-built scaffolding for
+// `NoOwnershipWhileDegraded` (Spec.p), the same way `eFenceDecision` is
+// scaffolding for `FencedZombie`: the spec needs an independently
+// recomputed ground truth of "is this node degraded right now" built from
+// the announced record, not from reading `Node.p`'s own `degraded` field
+// directly -- see `FencedZombie`'s header comment (Spec.p) for why that
+// would just check the implementation against itself. `node` identifies
+// which `Node` this transition belongs to.
+event eDegradedChanged: (node: Node, degraded: bool);
 
 // Announced once a node finishes handling a Forward -- the last
 // state-changing event for that key in this bounded scenario (Init sends

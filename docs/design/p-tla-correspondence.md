@@ -91,7 +91,7 @@ there). The rest:
 | `ClaimAdvertise(n, p)` | None | P has no `claims` registry / `InitClaims` concept at all. The sole authorization for P's takeover is the local boolean `peerDead`; TLA+'s `TakeoverDrain` guard instead reads a global `claims` set and every node's `alive[]`. Quiescent in `Replication.cfg` too (`InitClaims` pre-seeds `n1` directly), so this is a wash for *this* scenario, not a live gap. |
 | `Heartbeat(n)` | `eHeartbeat`/`eTick` handlers (`Node.p`), `TestHeartbeatDetection` (`TestDriver.p`) | **Partial, and now ahead of TLA+ here** — see §4.1 (updated). `Replication.cfg` still sets `MaxHb = 0` ("advisory, nothing reads it"), so TLA+ itself gives `Heartbeat` no teeth in this scope; P's round-counted TTL-lapse detection is real but narrower than §5.5/§6.1's full mechanism (no false-positive/flapping modeling, no takeover-suppression window, no interaction with incarnation fencing — §4.1). |
 | `CrashWipe(n)` | None | `WipeBudget = 0` in `Replication.cfg` — unreachable in TLA+'s own clean config too. |
-| `RecoverNode(n)` / `FenceBoot(n)` / `DegradedBoot(n)` | `eFenceBoot` handler (`Node.p`), `TestFenceBootZombie` (`TestDriver.p`) | **Partial**, added by the `FencedZombie` P scenario — see §4.2 (updated). `FenceBoot`'s incarnation-draw-and-persist has a P analog; `RecoverNode`'s and `DegradedBoot`'s surrounding machinery (the catalog-outage boot split, replica-only degraded mode) does not — see §4.2 for the precise boundary of what is and is not covered. |
+| `RecoverNode(n)` / `FenceBoot(n)` / `DegradedBoot(n)` | `eFenceBoot`/`eCatalogOutage`/`eCatalogRestored` handlers (`Node.p`), `TestFenceBootZombie` + `TestDegradedBoot` (`TestDriver.p`) | **Partial, and now wider** — see §4.2 (updated). `FenceBoot`'s incarnation-draw-and-persist has a P analog (`TestFenceBootZombie`); `DegradedBoot`'s catalog-outage boot split now has one too (`TestDegradedBoot`: a persisted incarnation booting into a catalog outage suppresses ownership actions until promotion, checked by `NoOwnershipWhileDegraded`). `RecoverNode`'s remaining surrounding machinery does not — see §4.2 for the precise boundary of what is and is not covered. |
 
 ## 4. Known gaps and divergences
 
@@ -150,13 +150,16 @@ observing that peer reboot under a fenced incarnation). None of these
 have a TLA+ analog to be behind *or* ahead of — they are simply open
 scope on both sides.
 
-### 4.2 P now models `FenceBoot`/recovery and checks `FencedZombie` — narrower than TLA+'s, not absent
+### 4.2 P now models `FenceBoot`/recovery, `DegradedBoot`, and checks `FencedZombie`/`NoOwnershipWhileDegraded` — narrower than TLA+'s, not absent
 
 *Updated: a second P test scenario, `TestFenceBootZombie`
-(`p/Replication/TestDriver.p`), closes the gap this section used to
-describe as unrepresented. What follows is the corrected boundary of what
-P covers here, not the original finding — see the PR that added
-`eFenceBoot`/`FencedZombie` for the verification evidence.*
+(`p/Replication/TestDriver.p`), closed the gap this section used to
+describe as unrepresented for `FenceBoot`/`RecoverNode`. A fourth scenario,
+`TestDegradedBoot`, now closes the `DegradedBoot` half of it too — see the
+PR that added `eCatalogOutage`/`eCatalogRestored`/`NoOwnershipWhileDegraded`
+for the verification evidence, and the PR before it (`eFenceBoot`/
+`FencedZombie`) for the `FenceBoot` half. What follows is the corrected
+boundary of what P covers here, not either original finding.*
 
 `Replication.tla`'s own header is explicit that the recovery path matters
 to this exact scenario: "`FenceBoot`'s recovery path is reachable too...
@@ -192,24 +195,56 @@ uncommitted variant that disables the fence (`accept = true` in both
 handlers) is caught in 7 schedules with a genuine zombie-acceptance trace
 — see the PR for the exact trace excerpt.
 
-What P still does **not** cover, so this remains a real, narrower scope
-gap rather than a closed one: `RecoverNode`'s and `DegradedBoot`'s
-surrounding machinery — the catalog-outage boot split (§5.7's two boot
-cases: a node with a persisted incarnation booting into replica-only
-degraded mode versus a genuinely new node waiting); the *combination* of
-heartbeat-TTL detection with incarnation fencing/reboot — `eHeartbeat`/
-`eTick` now give P a real death-detection mechanism (§4.1, updated), but
-`TestHeartbeatDetection` and `TestFenceBootZombie` are two separate
-scenarios, so nothing exercises a node deriving its own peer's death from
-a heartbeat gap and *then* observing that peer reboot under a fenced
-incarnation; and — the same gap §4.3 describes in more detail — any of
-TLA+'s discrete claim/seal/commit-guard steps that `FencedZombie` also polices on the
-drain-commit side (`CommitGuardsHold`'s `pt.inc = inc[pt.sealer]`).
-`TestFenceBootZombie`'s reboot is a bare identity-and-incarnation reset
-with no boot-mode branch at all; it exercises the message-fencing half of
-§5.7, not the boot-mode half. **Candidate follow-up**, unchanged from the
-original finding: widen P's takeover handling into discrete claim/seal/
-commit steps with guards (tracked the same way as §4.3's).
+**`DegradedBoot`, now modeled (`TestDegradedBoot`):** §5.7's boot-time
+catalog-outage split reads "a node with a persisted incarnation boots into
+replica-only degraded mode: it applies and receipts replication under its
+existing incarnation but takes no ownership actions... [and] promotes
+itself when the catalog returns and FenceBoot completes." `Node.p` now
+carries a `degraded: bool` set at `eFenceBoot` time when a persisted
+incarnation (`priorIncarnation > 0`) coincides with a catalog outage
+(`eCatalogOutage`/`eCatalogRestored`, sent directly by the environment —
+see below for what this deliberately does not model), and every
+takeover-drain call site (`sweepOrphanedKeys`'s shared helper, plus
+`eForward`'s own inline late-arrival check) is gated on `!degraded`. On
+promotion (`eCatalogRestored`), the node re-checks for orphaned keys right
+then — any takeover suppressed while degraded becomes eligible at that
+moment, not merely for future triggers, matching "promotes itself... and
+FenceBoot completes." `NoOwnershipWhileDegraded` (`Spec.p`) asserts this
+directly: no node ever announces `eTakeoverDrain` while degraded, checked
+by recomputing each node's degraded status from the announced
+`eDegradedChanged` stream rather than reading `Node.p`'s own `degraded`
+field — the same independent-ground-truth convention `FencedZombie`
+already established (see its header comment for why). `just p-check
+Replication` plus direct `p check -tc FenceBootZombie`, `-tc
+HeartbeatDetection`, and `-tc DegradedBoot` runs all show 0 bugs (1000
+schedules each; `DegradedBoot` also clean at 5000) on the honest model; a
+scratch, uncommitted variant that drops the `!degraded` guard from
+`sweepOrphanedKeys` is caught in 5 schedules with a genuine
+still-degraded-takeover trace — see that PR for the exact excerpt.
+
+What this deliberately does **not** model, so it is a narrower
+representation of §5.7 rather than the real thing: there is no modeled
+catalog service at all, only a boolean reachability flag the environment
+flips directly (`eCatalogOutage`/`eCatalogRestored`) — no request/timeout
+shape, no partial-reachability, nothing resembling an actual catalog-DB
+client. §5.7's *other* boot case — "a genuinely new node[,] no persisted
+incarnation[,] waits, in a typed startup state" — has no P representation
+at all; `TestDegradedBoot` only exercises the persisted-incarnation branch
+(`Node.p`'s `eFenceBoot` handler never lets `priorIncarnation = 0` produce
+`degraded = true`, matching the spec text, but nothing models the waiting
+new-node path itself). And the *combination* of heartbeat-TTL detection
+with `DegradedBoot` remains open: `TestDegradedBoot` deliberately reuses
+`eCrashSignal`'s oracle (matching `TestFenceBootZombie`'s and
+`TestTakeoverDrain`'s convention) rather than `TestHeartbeatDetection`'s
+`eTick` path, so nothing exercises a degraded node deriving its own peer's
+death from a heartbeat gap while still suppressing ownership actions. Also
+still open, unchanged from the original finding: `RecoverNode`'s remaining
+surrounding machinery, and — the same gap §4.3 describes in more detail —
+any of TLA+'s discrete claim/seal/commit-guard steps that `FencedZombie`
+also polices on the drain-commit side (`CommitGuardsHold`'s `pt.inc =
+inc[pt.sealer]`). **Candidate follow-up**, unchanged from the original
+finding: widen P's takeover handling into discrete claim/seal/commit steps
+with guards (tracked the same way as §4.3's).
 
 ### 4.3 `eTakeoverDrain` fuses claim-acquisition with commit; TLA+ keeps them apart
 

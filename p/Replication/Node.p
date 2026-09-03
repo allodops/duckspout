@@ -48,6 +48,20 @@ machine Node {
   // configurable value threaded in from the environment.
   var lastHeartbeatRound: int;
   var heartbeatTTL: int;
+  // §7 DegradedBoot (docs/design/replication.md): whether the catalog DB
+  // is currently reachable, per the environment's `eCatalogOutage`/
+  // `eCatalogRestored` signals. Defaults to P's zero-value `false` --
+  // i.e. reachable -- deliberately: a scenario that never sends either
+  // event (TestTakeoverDrain, TestFenceBootZombie, TestHeartbeatDetection)
+  // must see no change in behavior from this field's mere existence.
+  var catalogOutage: bool;
+  // Set true at `eFenceBoot` time when a persisted incarnation boots into
+  // a catalog outage (see that handler below); set false at promotion
+  // once the catalog returns. While true, this node applies and receipts
+  // replication under its incarnation as normal but takes no ownership
+  // action (no takeover-drain) -- `sweepOrphanedKeys` below is the single
+  // enforcement point.
+  var degraded: bool;
 
   start state Active {
     entry {
@@ -69,6 +83,49 @@ machine Node {
     on eFenceBoot do (fb: (nodeId: int, priorIncarnation: int)) {
       nodeId = fb.nodeId;
       incarnation = fb.priorIncarnation + 1;
+      // §7 DegradedBoot: a node with a *persisted* incarnation
+      // (`priorIncarnation > 0`) booting into a catalog outage comes up
+      // replica-only degraded -- it keeps applying and receipting under
+      // its new incarnation (below), but takes no ownership action until
+      // promotion. A genuinely new node (`priorIncarnation = 0`) never
+      // goes degraded here: §7 is explicit it "has no identity to be
+      // safely partial with" and instead waits in a typed startup state --
+      // a different boot path this model does not represent (see
+      // docs/design/p-tla-correspondence.md's DegradedBoot section for
+      // the precise boundary).
+      if (fb.priorIncarnation > 0 && catalogOutage) {
+        degraded = true;
+        announce eDegradedChanged, (node = this, degraded = true);
+      }
+    }
+
+    on eCatalogOutage do {
+      catalogOutage = true;
+    }
+
+    // §7: "promotes itself when the catalog returns and FenceBoot
+    // completes." This model represents "FenceBoot completes" as simply
+    // exiting degraded mode the moment the catalog signal arrives -- the
+    // node never lost its incarnation while degraded, so there is no
+    // further boot ceremony left for it to redo. Exiting degraded also
+    // re-checks staged-but-uncommitted keys for orphans right now, not
+    // merely from here on: any takeover suppressed while degraded becomes
+    // eligible at the moment of promotion, not only for future triggers.
+    on eCatalogRestored do {
+      catalogOutage = false;
+      if (degraded) {
+        degraded = false;
+        announce eDegradedChanged, (node = this, degraded = false);
+        sweepOrphanedKeys();
+        // `eCrashSignal`/`eTick` withhold `eCrashSignalHandled` while
+        // degraded (see both below) precisely because promotion can still
+        // drain a key they could not -- so if a death was already known
+        // (`peerDead`) when the catalog returned, promotion is the true
+        // last chance, and this is where that marker belongs instead.
+        if (peerDead) {
+          announce eCrashSignalHandled;
+        }
+      }
     }
 
     // A real crash: stop entirely, right now. Any event already in this
@@ -117,7 +174,11 @@ machine Node {
           announce eClaimAdvertise, (key = fwd.key, node = this, role = REPLICA);
         }
         send fwd.origin, eReceipt, (key = fwd.key, sq = fwd.sq, holder = this, holderId = nodeId, inc = incarnation);
-        if (peerDead && !(fwd.key in committed)) {
+        // This inline immediate-takeover check (a late Forward arriving
+        // after the peer is already known dead) does not route through
+        // `sweepOrphanedKeys` -- it needs its own §7 DegradedBoot guard
+        // for the same reason: no ownership action while `degraded`.
+        if (peerDead && !degraded && !(fwd.key in committed)) {
           committed += (fwd.key);
           announce eTakeoverDrain, (key = fwd.key, sq = fwd.sq, newOwner = this);
         }
@@ -153,7 +214,15 @@ machine Node {
     on eCrashSignal do (sig: (dead: Node)) {
       peerDead = true;
       sweepOrphanedKeys();
-      announce eCrashSignalHandled;
+      // §7 DegradedBoot: withhold this "last chance to drain" marker
+      // while degraded -- promotion (`eCatalogRestored` above) is the
+      // genuine last chance in that case, and announces the marker itself
+      // once it re-sweeps. Announcing it here regardless would tell
+      // `NoAckedLoss` no further trigger can drain this key, which is
+      // false while degraded.
+      if (!degraded) {
+        announce eCrashSignalHandled;
+      }
     }
 
     // §5.5/§6.1: a live peer's own heartbeat, renewing our record of when
@@ -199,20 +268,36 @@ machine Node {
         peerDead = true;
         sweepOrphanedKeys();
       }
-      announce eCrashSignalHandled;
+      // §7 DegradedBoot: same withholding as `eCrashSignal` above, same
+      // reason -- promotion, not this tick, is the last chance to drain
+      // while degraded.
+      if (!degraded) {
+        announce eCrashSignalHandled;
+      }
     }
   }
 
-  // Shared by `eCrashSignal`'s oracle path and `eTick`'s heartbeat-TTL
-  // path (see both above): any key this node already has staged but not
-  // yet committed is orphaned once its peer is known dead -- take over
-  // and drain it. Callers are responsible for setting `peerDead` and
-  // announcing `eCrashSignalHandled` themselves, since each caller's
-  // surrounding guard/idempotence needs differ (`eCrashSignal` fires
-  // exactly once per scenario; `eTick` must not re-fire once `peerDead`
-  // is already true).
+  // Shared by `eCrashSignal`'s oracle path, `eTick`'s heartbeat-TTL path,
+  // and `eCatalogRestored`'s promotion re-check (see all three above):
+  // any key this node already has staged but not yet committed is
+  // orphaned once its peer is known dead -- take over and drain it.
+  // Callers are responsible for setting `peerDead` and announcing
+  // `eCrashSignalHandled` themselves, since each caller's surrounding
+  // guard/idempotence needs differ (`eCrashSignal` fires exactly once per
+  // scenario; `eTick` must not re-fire once `peerDead` is already true;
+  // `eCatalogRestored` only calls this once, at promotion).
   fun sweepOrphanedKeys() {
     var k: int;
+    // §7 DegradedBoot: no ownership action while degraded -- this is the
+    // single enforcement point `NoOwnershipWhileDegraded` (Spec.p)
+    // polices. Centralized here, rather than duplicated at each call
+    // site above, so every current and future trigger route gets it for
+    // free (the one call site that bypasses this helper -- `eForward`'s
+    // own inline immediate-takeover check -- carries the equivalent
+    // `!degraded` guard directly, see that handler).
+    if (degraded) {
+      return;
+    }
     foreach (k in staged) {
       if (!(k in committed)) {
         committed += (k);
