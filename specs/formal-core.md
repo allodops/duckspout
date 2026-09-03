@@ -691,25 +691,34 @@ removes tables from this lemma's quantifier domain and can never violate
 row-identity; eviction interleavings stress the read-path equivalence,
 which is §8.4's job, not this formula's.
 
-**GapFreedom** — per-(partition, origin) holdings tile a contiguous prefix.
+**GapFreedom** — per-(partition, origin) *holdings* tile a contiguous prefix.
 ```tla
 DrainedSeqs(p, o) == {s \in Nat : \E x \in lake \cup expired :
                         <<p, o, s>> \in x.coverage}
-GapFreedom ==
+GapFreedom ==   \* quantified over HOLDERS: windows commit in any order, so a
+                \* node holding nothing for (p, o) can see a non-prefix D --
+                \* a legal state the original formula miscounted (TN-31)
   \A n \in Nodes, p \in Partitions, o \in Nodes :
     LET S == {r.seq : r \in {r \in staged[n] : r.part = p /\ r.origin = o}}
         D == DrainedSeqs(p, o)
-    IN  S \cup D = 1..Cardinality(S \cup D)
+    IN  S # {} => S \cup D = 1..Cardinality(S \cup D)
 ```
 The direct consequence of `PeerApply`'s gap refusal plus `StageCommit`'s
 atomic 1-based sequence assignment (`nextSeq` initializes to 1, pinned
-in Init). The union with drained coverage is what makes the invariant
-survive the drain: after `DropWindow` removes window 1's records, the
-staged residue alone is no prefix — staged ∪ committed still is, and
-that is exactly the property §7.5's hot∪cold tiling rests on. Everything
-cheap about DuckSpout's replication — one-number coverage,
-reconciliation-free takeover, supplement-disjointness proofs — depends
-on this.
+in Init) — but only for a node that actually *holds* something for
+`(p, o)`. TLC found the unguarded form false: windows commit to the lake
+in any order, so a node with an empty `S` for `(p, o)` can observe a `D`
+that is not itself a prefix (some later window drained before an earlier
+one), which is a legal state, not a violation — the invariant has nothing
+to say about non-holders. The `S # {}` guard restricts the claim to nodes
+that hold at least one record for the pair, which is what `PeerApply`'s
+gap refusal and `StageCommit`'s sequencing actually constrain. The union
+with drained coverage is still what makes the invariant survive the
+drain: after `DropWindow` removes window 1's records, the staged residue
+alone is no prefix — staged ∪ committed still is, and that is exactly the
+property §7.5's hot∪cold tiling rests on. Everything cheap about
+DuckSpout's replication — one-number coverage, reconciliation-free
+takeover, supplement-disjointness proofs — depends on this.
 
 **SingleDrainCommit** — at most one committed part per fence key; supplements disjoint.
 ```tla
