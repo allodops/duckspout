@@ -12,6 +12,9 @@ machine Node {
   // How many holders (self + receipts) each key currently has.
   var holders: map[int, int];
   var pendingClient: map[int, Client];
+  // §5.5: keys this node has published a claim row for (side effect of the
+  // first apply). Guards eClaimAdvertise from firing more than once per key.
+  var claims: map[int, tRole];
   // Set once this node learns its peer is dead (eCrashSignal); once true,
   // any key that lands here afterward (a late Forward) is orphaned on
   // arrival, not just what was already staged at signal time.
@@ -38,12 +41,20 @@ machine Node {
       staged += (req.key);
       holders[req.key] = 1;
       pendingClient[req.key] = req.client;
+      if (!(req.key in claims)) {
+        claims[req.key] = OWNER;
+        announce eClaimAdvertise, (key = req.key, node = this, role = OWNER);
+      }
       announce eAccepted, (key = req.key, sq = req.sq);
       send peer, eForward, (key = req.key, sq = req.sq, origin = this);
     }
 
     on eForward do (fwd: (key: int, sq: int, origin: Node)) {
       staged += (fwd.key);
+      if (!(fwd.key in claims)) {
+        claims[fwd.key] = REPLICA;
+        announce eClaimAdvertise, (key = fwd.key, node = this, role = REPLICA);
+      }
       send fwd.origin, eReceipt, (key = fwd.key, sq = fwd.sq, holder = this);
       if (peerDead && !(fwd.key in committed)) {
         committed += (fwd.key);
