@@ -168,3 +168,44 @@ spec FencedZombie observes eFenceDecision {
     }
   }
 }
+
+// NoOwnershipWhileDegraded (§7 DegradedBoot, docs/design/replication.md):
+// no node ever announces `eTakeoverDrain` while it is degraded at the
+// moment of the announce -- a degraded node may keep applying and
+// receipting replication, but must take no ownership action until it
+// promotes.
+//
+// Checked by recomputing each node's degraded status purely from the
+// `eDegradedChanged` event stream `Node.p` announces, the same
+// independent-ground-truth convention `FencedZombie` above already
+// establishes for this file (see its header comment for why): reading
+// `Node.p`'s own `degraded` field directly would just check the
+// implementation against itself, tautologically green whether or not the
+// guard at every takeover call site is actually wired correctly. This
+// spec's own scratch broken variant (PR description) -- which drops the
+// `!degraded` guard from one takeover-drain call site -- is what confirms
+// this recomputation genuinely catches a node draining while still
+// degraded, not merely a model that happens to never exercise the gap.
+//
+// A direct `assert`, not `hot state`, matching this file's established
+// convention for a per-event safety check on a bounded scenario -- see
+// `NoAckedLoss`'s header above for why `hot state` liveness is the wrong
+// shape here.
+spec NoOwnershipWhileDegraded observes eDegradedChanged, eTakeoverDrain {
+  var degradedNodes: set[Node];
+
+  start state Watching {
+    on eDegradedChanged do (dc: (node: Node, degraded: bool)) {
+      if (dc.degraded) {
+        degradedNodes += (dc.node);
+      } else {
+        degradedNodes -= (dc.node);
+      }
+    }
+
+    on eTakeoverDrain do (td: (key: int, sq: int, newOwner: Node)) {
+      assert !(td.newOwner in degradedNodes),
+        "NoOwnershipWhileDegraded violated: a node announced a takeover-drain while still degraded";
+    }
+  }
+}

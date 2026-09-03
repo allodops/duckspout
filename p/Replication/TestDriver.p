@@ -167,3 +167,108 @@ machine TestHeartbeatDetection {
     }
   }
 }
+
+// Scenario: §7's DegradedBoot -- a rebooted node comes back during a
+// catalog outage and must take no ownership action (no takeover-drain)
+// until the catalog returns, even though it still applies and receipts
+// replication normally throughout. Reuses `TestFenceBootZombie`'s reboot
+// mechanism (`eFenceBoot` with the crashed node's own `nodeId` and a
+// strictly higher incarnation) but drives the rebooted node into exactly
+// the situation that would otherwise trigger a takeover: it holds a
+// staged, uncommitted key belonging to a peer that then dies too.
+//
+// Unlike `TestFenceBootZombie`, `owner` here dies before ever accepting
+// anything -- this scenario isolates DegradedBoot's own-node
+// ownership-suppression effect and does not need a first write through
+// `owner`. (`TestFenceBootZombie`'s own key-1-staged-at-replica-forever
+// shape only stays sound there because that scenario never announces
+// `eCrashSignalHandled` at all -- see `NoAckedLoss`'s marker comments in
+// Node.p; this scenario's promotion path *does* announce it, so
+// reproducing that same dangling-key shape here would trip a false
+// `NoAckedLoss` positive on an unrelated key. Simpler is also correct
+// here: `owner`'s reboot identity is all this scenario needs from it.)
+//
+// Roles: `owner` (nodeId 1) and `replica` (nodeId 2) both boot clean,
+// then `owner` dies immediately (`eDie`). `newOwner` reboots as nodeId
+// 1's next incarnation (2) while the catalog is down (`eCatalogOutage`
+// sent first, same-sender-to-same-target FIFO with the `eFenceBoot`
+// right after it, so the outage is guaranteed observed before FenceBoot
+// evaluates it) -- `priorIncarnation = 1 > 0` plus the outage puts
+// `newOwner` straight into `degraded` per `Node.p`'s `eFenceBoot`
+// handler.
+//
+// `replica` then accepts a genuine write (key 1) and forwards it to
+// `newOwner`, which stages it as a replica -- exactly the
+// staged-but-uncommitted shape `sweepOrphanedKeys` looks for. `replica`
+// itself then dies, and the environment tells `newOwner` about it
+// (`eCrashSignal`, the same oracle convention `TestTakeoverDrain`/
+// `TestFenceBootZombie` use, chosen deliberately over the heartbeat-TTL
+// path so this scenario isolates DegradedBoot from
+// `TestHeartbeatDetection`'s already-covered mechanism -- combining the
+// two remains open scope, see docs/design/p-tla-correspondence.md).
+// `newOwner` is still degraded at this point: whether the Forward for
+// key 1 has already landed or not by the time `eCrashSignal` arrives, no
+// `eTakeoverDrain` may be announced yet -- exactly what
+// `NoOwnershipWhileDegraded` (Spec.p) checks, across every relative
+// ordering of {Forward, eCrashSignal} the checker explores (both are
+// sent by different senders -- `replica` and the environment -- so their
+// arrival order at `newOwner` is unconstrained).
+//
+// Finally the catalog returns (`eCatalogRestored`): `newOwner` promotes
+// out of degraded and, per §7's "promotes itself... and FenceBoot
+// completes," re-checks for orphaned keys right at that moment -- key 1
+// becomes eligible for takeover here, not merely from some later trigger
+// (`Node.p`'s `eCatalogRestored` handler calls `sweepOrphanedKeys`
+// itself). `NoAckedLoss` still holds: the key is drained, just later than
+// in the non-degraded scenarios, and `Node.p`'s marker-withholding while
+// degraded (see `eCrashSignal`/`eTick`'s comments) is what keeps
+// `NoAckedLoss` from false-firing on that legitimate delay.
+machine TestDegradedBoot {
+  start state Init {
+    entry {
+      var owner: Node;
+      var replica: Node;
+      var newOwner: Node;
+
+      owner = new Node();
+      replica = new Node();
+      send owner, eFenceBoot, (nodeId = 1, priorIncarnation = 0);
+      send replica, eFenceBoot, (nodeId = 2, priorIncarnation = 0);
+      send owner, eLink, replica;
+      send replica, eLink, owner;
+
+      // owner dies immediately, before accepting anything -- see header
+      // comment above for why this scenario skips TestFenceBootZombie's
+      // first-write-through-owner shape.
+      send owner, eDie;
+
+      // Reboot into a catalog outage: newOwner (same logical nodeId 1,
+      // fenced to incarnation 2) boots while the catalog is unreachable,
+      // so it comes up in degraded mode (persisted incarnation + catalog
+      // down = DegradedBoot, docs/design/replication.md §7).
+      newOwner = new Node();
+      send newOwner, eCatalogOutage;
+      send newOwner, eFenceBoot, (nodeId = 1, priorIncarnation = 1);
+      send newOwner, eLink, replica;
+      send replica, eLink, newOwner;
+
+      // replica accepts a genuine write (key 1) and forwards it to
+      // newOwner -- newOwner stages key 1 as a replica while degraded.
+      new Client((owner = replica, key = 1, sq = 1));
+
+      // replica itself now dies. newOwner is (or will be) holding
+      // replica's staged key 1, uncommitted -- ordinarily exactly the
+      // shape that triggers immediate takeover, but newOwner is still
+      // degraded: no ownership action is permitted until the catalog
+      // comes back.
+      send replica, eDie;
+      send newOwner, eCrashSignal, (dead = replica,);
+
+      // The catalog returns: newOwner promotes out of degraded mode and
+      // must re-check for orphaned keys that were suppressed while
+      // degraded -- key 1 becomes eligible for takeover right here, not
+      // merely "from now on."
+      send newOwner, eCatalogRestored;
+    }
+  }
+}
