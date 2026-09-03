@@ -38,10 +38,21 @@ machine Node {
   // every message type from a sender through one incarnation counter, not
   // one counter per message kind.
   var highestSeen: map[int, int];
+  // §5.5/§6.1: the last round this node received an `eHeartbeat` from its
+  // peer (0 default -- indistinguishable from "never received one," which
+  // is exactly the state a peer that never heartbeats should be in).
+  // `heartbeatTTL` is a small fixed constant (kept small deliberately to
+  // keep this bounded scenario's state space small, matching this file's
+  // existing incarnation-fencing convention of "simple... not true global
+  // uniqueness" scoped to what the scenario needs) rather than a
+  // configurable value threaded in from the environment.
+  var lastHeartbeatRound: int;
+  var heartbeatTTL: int;
 
   start state Active {
     entry {
       peerDead = false;
+      heartbeatTTL = 3;
     }
 
     on eLink do (p: Node) {
@@ -140,15 +151,73 @@ machine Node {
     // but not yet committed is orphaned right now -- take over and drain
     // it; peerDead also covers anything that arrives from here on.
     on eCrashSignal do (sig: (dead: Node)) {
-      var k: int;
       peerDead = true;
-      foreach (k in staged) {
-        if (!(k in committed)) {
-          committed += (k);
-          announce eTakeoverDrain, (key = k, sq = 0, newOwner = this);
-        }
+      sweepOrphanedKeys();
+      announce eCrashSignalHandled;
+    }
+
+    // §5.5/§6.1: a live peer's own heartbeat, renewing our record of when
+    // we last heard from it. Independent of our own `eTick` cycle below --
+    // a heartbeat can arrive at any time, not just when we happen to be
+    // ticking ourselves.
+    on eHeartbeat do (hb: (from: Node, round: int)) {
+      lastHeartbeatRound = hb.round;
+    }
+
+    // Our own periodic housekeeping tick (standing in for a wall-clock
+    // timer -- see `eTick`'s comment in Events.p). Every tick we (a)
+    // re-heartbeat our peer under the current round -- a genuinely dead
+    // peer (halted via eDie) simply never processes this event at all,
+    // which is what makes its heartbeats stop without any dead-check
+    // needed here, and is harmless to still send if our own peer already
+    // died (P drops a halted machine's queue) -- and (b) check whether
+    // OUR peer's heartbeat gap has reached `heartbeatTTL`. Crossing that
+    // gap is this node's own, internally-derived death detection: the
+    // same `sweepOrphanedKeys` call `eCrashSignal`'s oracle path makes
+    // above, just reached by a different trigger; `!peerDead` guards it
+    // from re-sweeping on a later tick once detection has already
+    // happened once.
+    //
+    // `eCrashSignalHandled` is announced UNCONDITIONALLY at the end of
+    // every tick, deliberately mirroring `eCrashSignal`'s own handler
+    // above (which announces it regardless of whether `staged` had any
+    // orphaned keys to sweep): this is the scenario's environment-paced
+    // "no further legitimate detection chance remains as of this round"
+    // marker, not a report of whether detection actually fired this
+    // round. Gating the announce on the `if` below instead would silence
+    // `NoAckedLoss` entirely against a TTL check that is broken in the
+    // "never fires" direction -- the marker would never arrive, so the
+    // spec's final per-key check would never run, and a permanently
+    // orphaned key would pass unnoticed. Safe here specifically because
+    // `TestDriver.p`'s heartbeat scenario ticks each node at most once;
+    // a future scenario ticking the same node repeatedly before its true
+    // last chance would need to gate this differently (e.g. only the
+    // driver's own last tick carries a "final" flag).
+    on eTick do (t: (round: int)) {
+      send peer, eHeartbeat, (from = this, round = t.round);
+      if (!peerDead && (t.round - lastHeartbeatRound >= heartbeatTTL)) {
+        peerDead = true;
+        sweepOrphanedKeys();
       }
       announce eCrashSignalHandled;
+    }
+  }
+
+  // Shared by `eCrashSignal`'s oracle path and `eTick`'s heartbeat-TTL
+  // path (see both above): any key this node already has staged but not
+  // yet committed is orphaned once its peer is known dead -- take over
+  // and drain it. Callers are responsible for setting `peerDead` and
+  // announcing `eCrashSignalHandled` themselves, since each caller's
+  // surrounding guard/idempotence needs differ (`eCrashSignal` fires
+  // exactly once per scenario; `eTick` must not re-fire once `peerDead`
+  // is already true).
+  fun sweepOrphanedKeys() {
+    var k: int;
+    foreach (k in staged) {
+      if (!(k in committed)) {
+        committed += (k);
+        announce eTakeoverDrain, (key = k, sq = 0, newOwner = this);
+      }
     }
   }
 }

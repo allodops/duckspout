@@ -89,28 +89,66 @@ there). The rest:
 | TLA+ action | P representation | Note |
 |---|---|---|
 | `ClaimAdvertise(n, p)` | None | P has no `claims` registry / `InitClaims` concept at all. The sole authorization for P's takeover is the local boolean `peerDead`; TLA+'s `TakeoverDrain` guard instead reads a global `claims` set and every node's `alive[]`. Quiescent in `Replication.cfg` too (`InitClaims` pre-seeds `n1` directly), so this is a wash for *this* scenario, not a live gap. |
-| `Heartbeat(n)` | None | `Replication.cfg` sets `MaxHb = 0` ("advisory, nothing reads it") — neither model gives this teeth here, so not a divergence for this scope. |
+| `Heartbeat(n)` | `eHeartbeat`/`eTick` handlers (`Node.p`), `TestHeartbeatDetection` (`TestDriver.p`) | **Partial, and now ahead of TLA+ here** — see §4.1 (updated). `Replication.cfg` still sets `MaxHb = 0` ("advisory, nothing reads it"), so TLA+ itself gives `Heartbeat` no teeth in this scope; P's round-counted TTL-lapse detection is real but narrower than §5.5/§6.1's full mechanism (no false-positive/flapping modeling, no takeover-suppression window, no interaction with incarnation fencing — §4.1). |
 | `CrashWipe(n)` | None | `WipeBudget = 0` in `Replication.cfg` — unreachable in TLA+'s own clean config too. |
 | `RecoverNode(n)` / `FenceBoot(n)` / `DegradedBoot(n)` | `eFenceBoot` handler (`Node.p`), `TestFenceBootZombie` (`TestDriver.p`) | **Partial**, added by the `FencedZombie` P scenario — see §4.2 (updated). `FenceBoot`'s incarnation-draw-and-persist has a P analog; `RecoverNode`'s and `DegradedBoot`'s surrounding machinery (the catalog-outage boot split, replica-only degraded mode) does not — see §4.2 for the precise boundary of what is and is not covered. |
 
 ## 4. Known gaps and divergences
 
-### 4.1 `eCrashSignal` is a stated abstraction, not a stand-in for a missing TLA+ action
+### 4.1 `eCrashSignal` is a deliberate per-scenario abstraction; P now models heartbeat-TTL detection directly in a third scenario
 
-`Events.p` (lines 14-18) already says this plainly: `eCrashSignal` "stand[s]
-in for heartbeat-TTL expiry (the mechanism is out of this slice's scope;
-the fact that the replica eventually learns the owner is dead is what this
-model needs)." The important point for this map is *why* TLA+ has nothing
-resembling it: TLA+'s actions read `alive[n]` as shared state, synchronously,
-with no notion of one node learning about another's death — `TakeoverDrain`'s
-guard (`~\E n1 \in Nodes : alive[n1] /\ HoldsClaim(n1, p)`) simply reads the
-global `alive` function. P's actors do not share state; they only learn
-things via messages. So `eCrashSignal` is not a P analog of an
-under-specified TLA+ mechanism — it is P's message-passing model inventing a
-discrete step to bridge a gap that only exists because of the modeling
-paradigm difference, standing in for a detection mechanism (heartbeat TTL)
-that is genuinely unmodeled — its timing, false-positive rate, and TTL value
-— in *both* models today.
+*Updated: a third P test scenario, `TestHeartbeatDetection`
+(`p/Replication/TestDriver.p`), now models the heartbeat-TTL detection
+mechanism `eCrashSignal` previously stood in for unconditionally. What
+follows is the corrected picture, not the original finding — see the PR
+that added `eHeartbeat`/`eTick` for the verification evidence.*
+
+`Events.p`'s `eCrashSignal` comment still says what it always has:
+`eCrashSignal` "stand[s] in for heartbeat-TTL expiry," delivered to the
+surviving replica directly rather than derived by it. `TestTakeoverDrain`
+and `TestFenceBootZombie` both still use it, deliberately — those two
+scenarios are about takeover-drain correctness and incarnation fencing
+respectively, and neither needs the detection mechanism itself to be
+real to exercise what they're actually testing. `TestHeartbeatDetection`
+is the scenario that now makes the mechanism real: `Node.p` tracks
+`lastHeartbeatRound`/`heartbeatTTL` per node, `eHeartbeat` carries a
+logical `round` counter (standing in for wall-clock ticks — this
+project's `R-determinism` bars real time from protocol crates, and the
+same principle applies to this model), and a node's own `eTick` handler
+derives peer death itself by checking `round - lastHeartbeatRound >=
+heartbeatTTL`, rather than being told about it. The orphan-drain sweep
+this triggers is the exact same `sweepOrphanedKeys` helper `eCrashSignal`'s
+handler calls — one shared implementation, two triggers.
+
+The important point for this map is still *why* TLA+ has nothing
+resembling either P mechanism: TLA+'s actions read `alive[n]` as shared
+state, synchronously, with no notion of one node learning about another's
+death — `TakeoverDrain`'s guard (`~\E n1 \in Nodes : alive[n1] /\
+HoldsClaim(n1, p)`) simply reads the global `alive` function. P's actors
+do not share state; they only learn things via messages, so *some*
+discrete step bridging that paradigm difference was always going to be
+necessary — `eCrashSignal` is one such step (an oracle), `eHeartbeat`/
+`eTick` are another (a derived one, closer to §5.5/§6.1's actual
+mechanism). Neither is a transliteration of an under-specified TLA+
+action.
+
+This narrows what remains genuinely unmodeled: `Replication.cfg` sets
+`MaxHb = 0` ("advisory, nothing reads it") on the TLA+ side, so TLA+
+itself still gives `Heartbeat` no teeth in this scope (§3.2) — P is now
+*ahead* of TLA+ here, not behind it, for the narrow slice
+`TestHeartbeatDetection` covers (round-counted TTL-lapse detection by a
+single replica against a single peer). What P's heartbeat model does
+**not** cover, so this is a scope-parity gap in the other direction now:
+false-positive/flapping behavior (a node wrongly declared dead under a
+still-live peer whose heartbeats are merely delayed), the takeover-
+suppression window (`docs/design/replication.md` §10 — planned restarts
+must not trigger takeover), and any interaction between heartbeat-TTL
+detection and incarnation fencing/reboot (`TestFenceBootZombie` and
+`TestHeartbeatDetection` are two separate scenarios; nothing exercises a
+node deriving its own peer's death from a heartbeat gap and *then*
+observing that peer reboot under a fenced incarnation). None of these
+have a TLA+ analog to be behind *or* ahead of — they are simply open
+scope on both sides.
 
 ### 4.2 P now models `FenceBoot`/recovery and checks `FencedZombie` — narrower than TLA+'s, not absent
 
@@ -158,10 +196,14 @@ What P still does **not** cover, so this remains a real, narrower scope
 gap rather than a closed one: `RecoverNode`'s and `DegradedBoot`'s
 surrounding machinery — the catalog-outage boot split (§5.7's two boot
 cases: a node with a persisted incarnation booting into replica-only
-degraded mode versus a genuinely new node waiting), Heartbeat-driven
-detection (still `eCrashSignal`'s stated abstraction, §4.1), and — the
-same gap §4.3 describes in more detail — any of TLA+'s discrete
-claim/seal/commit-guard steps that `FencedZombie` also polices on the
+degraded mode versus a genuinely new node waiting); the *combination* of
+heartbeat-TTL detection with incarnation fencing/reboot — `eHeartbeat`/
+`eTick` now give P a real death-detection mechanism (§4.1, updated), but
+`TestHeartbeatDetection` and `TestFenceBootZombie` are two separate
+scenarios, so nothing exercises a node deriving its own peer's death from
+a heartbeat gap and *then* observing that peer reboot under a fenced
+incarnation; and — the same gap §4.3 describes in more detail — any of
+TLA+'s discrete claim/seal/commit-guard steps that `FencedZombie` also polices on the
 drain-commit side (`CommitGuardsHold`'s `pt.inc = inc[pt.sealer]`).
 `TestFenceBootZombie`'s reboot is a bare identity-and-incarnation reset
 with no boot-mode branch at all; it exercises the message-fencing half of

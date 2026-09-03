@@ -100,3 +100,70 @@ machine TestFenceBootZombie {
     }
   }
 }
+
+// Scenario: the same owner-accepts-forwards-then-dies narrative as
+// `TestTakeoverDrain`, but the replica derives the owner's death from a
+// lapsed heartbeat TTL itself -- `Node.p`'s `eTick`/`eHeartbeat` handlers
+// -- instead of being told about it by `eCrashSignal`'s oracle. Neither
+// node ever receives `eCrashSignal`, `eFenceBoot`, or an `eLink`-only
+// setup; this is purely the heartbeat-TTL death-detection path in
+// isolation.
+//
+// `owner`'s round-1 heartbeat is injected directly into `replica` from
+// this environment, rather than by ticking `owner` itself -- the same
+// "sent directly from the environment, standing in for the peer's own
+// send" convention `TestTakeoverDrain`'s retransmitted Forward and
+// `TestFenceBootZombie`'s zombie Forward already use above, and required
+// here for a sharper reason than convenience: `eTick`'s handler
+// (`Node.p`) unconditionally announces `eCrashSignalHandled` once it
+// finishes, exactly mirroring `eCrashSignal`'s own always-announce
+// handler (see that comment). Ticking `owner` as well as `replica` would
+// let `owner`'s tick announce that marker the moment it happens to be
+// scheduled -- which can race *before* `owner` has even processed its
+// own `eWriteReq`/Forward -- and `NoAckedLoss` would then race-condition
+// a false positive on a perfectly correct model, the exact failure shape
+// its own header (`Spec.p`) already warns about for a premature marker.
+// Restricting `eTick` to the one node whose own detection cycle this
+// scenario is actually testing (`replica`) avoids that hazard entirely
+// while still exercising `Node.p`'s `eTick` handler faithfully for the
+// role it plays here.
+//
+// Round shape (`Node.p`'s `heartbeatTTL` is 3): `replica` receives
+// `owner`'s round-1 heartbeat (bumping `lastHeartbeatRound` to 1) at some
+// point -- its relative order against the Forward chain and against
+// `replica`'s own later tick is unconstrained (different senders), and
+// the checker explores every ordering. `owner` then actually dies
+// (`eDie`), so no further heartbeats are ever sent (nothing in this
+// environment ticks `owner` again). `replica` is ticked exactly once, at
+// round 4: whether the round-1 heartbeat has already been delivered by
+// then or not, `4 - lastHeartbeatRound` is >= 3 either way (4 - 1 = 3, or
+// 4 - 0 = 4 if the heartbeat hasn't landed yet) -- detection fires under
+// both orderings.
+//
+// `NoAckedLoss` and `ClaimAdvertiseOnce` (`TestDecl.p`) apply unchanged --
+// see `eCrashSignalHandled`'s Events.p comment for why `NoAckedLoss`
+// needs no modification to cover this scenario.
+machine TestHeartbeatDetection {
+  start state Init {
+    entry {
+      var owner: Node;
+      var replica: Node;
+      owner = new Node();
+      replica = new Node();
+      send owner, eLink, replica;
+      send replica, eLink, owner;
+
+      new Client((owner = owner, key = 1, sq = 1));
+
+      // owner's one round-1 heartbeat, then it actually dies.
+      send replica, eHeartbeat, (from = owner, round = 1);
+      send owner, eDie;
+
+      // replica's own tick cycle advances straight to round 4 (>=
+      // heartbeatTTL rounds past the last heartbeat owner ever sent,
+      // round 1) -- crossing the gap regardless of whether that round-1
+      // heartbeat has already been delivered to replica by this point.
+      send replica, eTick, (round = 4,);
+    }
+  }
+}
