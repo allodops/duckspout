@@ -26,10 +26,44 @@ event eReceipt: (key: int, sq: int, holder: Node, holderId: int, inc: int);
 
 // Environment: the owner dies. Broken (never sent) is NOT how a real
 // crash is observed -- CrashSignal is delivered to the surviving replica
-// directly, standing in for heartbeat-TTL expiry (the mechanism is out
-// of this slice's scope; the fact that the replica eventually learns the
-// owner is dead is what this model needs).
+// directly, standing in for heartbeat-TTL expiry. Used by
+// `TestTakeoverDrain` and `TestFenceBootZombie`, which only need the
+// fact that the replica eventually learns the owner is dead, not the
+// detection mechanism itself. `TestHeartbeatDetection` (`TestDriver.p`)
+// now models that mechanism directly via `eHeartbeat`/`eTick` below
+// instead of this oracle -- a deliberate per-scenario choice of
+// abstraction level, not a scope gap left unmodeled.
 event eCrashSignal: (dead: Node);
+
+// §5.5/§6.1 (docs/design/replication.md): a live node's periodic
+// heartbeat to its peer, carrying a logical `round` counter standing in
+// for wall-clock ticks -- R-determinism bars real time (`Instant::now`,
+// `SystemTime::now`) from protocol crates, and the same principle
+// applies here: model logical rounds, not timestamps. `Node.p`'s `eTick`
+// handler sends this to its peer every round it is alive to process one,
+// which is what makes "heartbeats simply stop arriving" after a real
+// crash (`eDie`) fall out of P's own halted-machine-drops-its-queue
+// semantics, not a fact this event's handler has to special-case.
+// `TestHeartbeatDetection` (`TestDriver.p`) also injects one heartbeat
+// directly from the environment (the same "stand in for the peer's own
+// send" convention `TestTakeoverDrain`/`TestFenceBootZombie` already use
+// for retransmitted/zombie Forwards) rather than ticking the sender, to
+// keep `eTick`'s marker-announcing side effect (below) scoped to only
+// the node whose own detection cycle that scenario is testing.
+event eHeartbeat: (from: Node, round: int);
+
+// The environment's periodic driver signal, standing in for each node's
+// own wall-clock timer firing (§5.5/§6.1's Heartbeat cadence and
+// TTL-lapse detection). On every tick a node (a) re-heartbeats its peer
+// under the current round, and (b) checks whether its OWN peer's
+// heartbeat gap (`round - lastHeartbeatRound`) has reached
+// `heartbeatTTL` -- deriving peer-death detection from the gap itself,
+// rather than being told about it by `eCrashSignal`'s oracle (see that
+// event's comment above). `TestHeartbeatDetection` (`TestDriver.p`) is
+// the only scenario that sends this; `TestTakeoverDrain` and
+// `TestFenceBootZombie` never send `eTick` at all and keep using
+// `eCrashSignal`, unaffected by this event's addition.
+event eTick: (round: int);
 
 // Sent to the node that is itself dying: it halts immediately (real
 // crash semantics) rather than just being talked about by others.
@@ -94,10 +128,19 @@ event eClaimAdvertise: (key: int, node: Node, role: tRole);
 // scenario's own last-relevant-event, not as liveness.
 event eForwardHandled: (key: int, sq: int);
 
-// Announced once a node finishes handling eCrashSignal -- the scenario's
-// other last-relevant-event marker (a Forward can arrive either before or
-// after the crash signal; whichever of the two happens *last* is the true
-// last chance to drain, so the spec must observe both, not just one).
+// Announced once a node finishes evaluating a peer-death detection -- the
+// scenario's other last-relevant-event marker (a Forward can arrive
+// either before or after detection settles; whichever of the two happens
+// *last* is the true last chance to drain, so the spec must observe
+// both, not just one). Originally announced only from `eCrashSignal`'s
+// oracle-path handler; `Node.p`'s `eTick` handler now announces this SAME
+// event from the heartbeat-TTL-expiry path too (both call through a
+// shared `sweepOrphanedKeys` helper) -- deliberately reused, not
+// renamed or duplicated, so `NoAckedLoss` (`Spec.p`) needs zero changes
+// to also cover `TestHeartbeatDetection`: the property it checks ("every
+// accepted key is eventually drained") does not care *how* the peer's
+// death was established, only that this marker fires once detection is
+// settled one way or the other.
 event eCrashSignalHandled;
 
 // Wire a Node's peer after both nodes exist (spawn order is otherwise
