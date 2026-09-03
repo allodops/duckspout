@@ -3,6 +3,12 @@
 type tWriteReq = (client: Client, key: int, sq: int);
 type tWriteAck = (key: int, sq: int);
 
+// §5.5's two claim roles.
+enum tRole {
+  OWNER,
+  REPLICA
+}
+
 event eWriteReq: tWriteReq;
 event eWriteAck: tWriteAck;
 
@@ -30,6 +36,12 @@ event eAccepted: (key: int, sq: int);
 
 // A replica claims an orphaned key and drains (commits) it.
 event eTakeoverDrain: (key: int, sq: int, newOwner: Node);
+
+// §5.5: "published as a side effect of PeerApply -- the first apply for a
+// partition the node has no claim row for triggers the insert." Announced
+// once per (key, node) -- a second apply for the same key must NOT
+// re-advertise (ClaimAdvertiseOnce, Spec.p).
+event eClaimAdvertise: (key: int, node: Node, role: tRole);
 
 // Announced once a node finishes handling a Forward -- the last
 // state-changing event for that key in this bounded scenario (Init sends

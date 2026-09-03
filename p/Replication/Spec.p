@@ -72,3 +72,22 @@ spec NoAckedLoss observes eAccepted, eTakeoverDrain, eForwardHandled, eCrashSign
     }
   }
 }
+
+// ClaimAdvertiseOnce (§5.5): "the first apply for a partition the node has
+// no claim row for triggers the insert" -- a *second* apply for a key this
+// node already holds a claim for must NOT re-advertise. Modeled as a
+// registry-row-count invariant: the (key, node) pair may appear in the
+// claims table at most once, ever. A direct assert (not `hot state`) for
+// the same reason as NoAckedLoss above -- this is a per-event safety check,
+// not an eventually-property.
+spec ClaimAdvertiseOnce observes eClaimAdvertise {
+  var seen: set[(key: int, node: Node)];
+
+  start state Watching {
+    on eClaimAdvertise do (ca: (key: int, node: Node, role: tRole)) {
+      assert !((key = ca.key, node = ca.node) in seen),
+        "ClaimAdvertiseOnce violated: a node re-advertised a claim it already holds";
+      seen += ((key = ca.key, node = ca.node));
+    }
+  }
+}
