@@ -7,17 +7,23 @@
 // takeover is the only route to durability; a key that never gets there
 // is lost forever.
 //
-// Checked as a direct `assert`, not a `hot state`: an earlier attempt
-// (#132 finding) modeled this as `hot state` liveness matching the P
-// tutorial's `GuaranteedWithDrawProgress` pattern, and it did not fire
-// even for a deliberately-broken variant (0 bugs, 1000 schedules). The
-// tutorial's own regression example for that pattern
-// (`Liveness_1_WarmState`) drives an infinite self-loop -- hot-state
-// checking there is about a cycle that never leaves the hot state, not
-// about a bounded scenario reaching quiescence while hot. This scenario
-// is bounded (one write, one crash, done) and P's default bugfinding
-// checker does not flag "terminated while hot" as a violation, so
-// liveness-style checking is the wrong shape here.
+// Checked as a direct `assert`, alongside a genuine `hot state` liveness
+// twin (`NoAckedLossLive`, below) checking the identical property. An
+// earlier attempt at the `hot state` formulation here (#132 finding)
+// never fired even for a deliberately-broken variant, and this file's
+// header wrongly concluded from that result that P's checker does not
+// flag "terminated while hot" as a violation for a bounded scenario --
+// **corrected**: deep research (P's own manual, Coyote's docs, a live
+// p-org/P GitHub discussion) found the opposite is explicitly
+// documented, and a direct retest confirms it empirically --
+// `NoAckedLossLive` below does fire, 100% of schedules, against the same
+// class of broken variant, once wired correctly. The earlier "never
+// fired" result was actually the exact same test-declaration wiring bug
+// (a `test` block whose machine set never actually attached the spec via
+// `assert SpecName in {...}`) found and fixed elsewhere in this file's
+// history -- the hot-state monitor was never running at all, not failing
+// to detect anything. See `NoAckedLossLive`'s own header for the checked
+// mechanism and the ordering fix both twins now share.
 //
 // There are two events that can still drain a key -- `eForward`'s own
 // inline check, and `eCrashSignal`'s staged-keys sweep -- and either can
@@ -93,6 +99,72 @@ spec NoAckedLoss observes eAccepted, eTakeoverDrain, eForwardHandled, eCrashSign
       }
     }
   }
+}
+
+// NoAckedLossLive: the SAME property as `NoAckedLoss` above ("every
+// accepted key is eventually drained"), checked as a genuine `hot state`
+// liveness monitor instead of a direct assert at a hand-picked
+// last-relevant-event marker. #132's DoD names "liveness monitors" as its
+// own deliverable, and this is the idiomatic P mechanism for exactly that
+// -- P's own manual (p-org.github.io/P/manual/monitors/) states plainly:
+// "If the program terminates and the monitor is in a hot state, then
+// there is a liveness bug." An earlier attempt at this (`NoAckedLoss`'s
+// header, above) never fired for a deliberately-broken variant and wrongly
+// concluded the mechanism itself doesn't work for a bounded scenario; a
+// retest confirms it does, once (a) the test declaration actually attaches
+// the spec (`assert SpecName in {...}`, not a bare machine set -- the same
+// wiring bug found and fixed elsewhere this session) and (b) the same
+// ordering fix `NoAckedLoss` needed applies here too: `eTakeoverDrain` for
+// a key can legitimately arrive before `eAccepted` for that key
+// (environment-originated sends have no happens-before relationship), so
+// tracking one mutable `pending` set (add-on-accept, subtract-on-drain)
+// loses a drain that happened "too early" -- `accepted`/`drained` as
+// independent monotonic sets, checked by subset containment, sidesteps it.
+//
+// Both `NoAckedLoss` and `NoAckedLossLive` are kept, deliberately: the
+// direct assert is cheaper and still correct; this hot-state twin is what
+// literally satisfies "liveness monitors" as its own artifact, not a
+// stand-in for the other. Verified (see the PR this landed in): 0 bugs
+// across 5000 schedules on the correct model; a deliberately-broken
+// variant (removing `eForward`'s inline late-arrival takeover check) is
+// caught in 100% of schedules, by this spec alone with every other spec
+// unwired, via P's documented termination-in-a-hot-state rule.
+spec NoAckedLossLive observes eAccepted, eTakeoverDrain {
+  var accepted: set[int];
+  var drained: set[int];
+
+  start state NoPending {
+    on eTakeoverDrain do (td: (key: int, sq: int, newOwner: Node)) {
+      drained += (td.key);
+    }
+
+    on eAccepted do (acc: (key: int, sq: int)) {
+      accepted += (acc.key);
+      if (!(acc.key in drained))
+        goto Draining;
+    }
+  }
+
+  hot state Draining {
+    on eAccepted do (acc: (key: int, sq: int)) {
+      accepted += (acc.key);
+    }
+
+    on eTakeoverDrain do (td: (key: int, sq: int, newOwner: Node)) {
+      drained += (td.key);
+      if (IsSubsetOf(accepted, drained))
+        goto NoPending;
+    }
+  }
+}
+
+fun IsSubsetOf(a: set[int], b: set[int]) : bool {
+  var x: int;
+  foreach (x in a) {
+    if (!(x in b))
+      return false;
+  }
+  return true;
 }
 
 // ClaimAdvertiseOnce (§5.5): "the first apply for a partition the node has
