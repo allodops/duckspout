@@ -47,6 +47,15 @@
 (*   without adding a takeover-specific finding.                          *)
 (* - Ladder thresholds sit above reach (5): overload is Ingest.tla's       *)
 (*   armed hazard, orthogonal to who holds a claim.                       *)
+(* - ReclaimOn = TRUE (v0.2, #177): the SAME node recovering from its own  *)
+(*   crash, after it had already sealed+PUT a window part but before it    *)
+(*   ever committed it, is this scope's OTHER reachable story (distinct    *)
+(*   from TakeoverDrain's different-node case above) -- n1's incarnation   *)
+(*   bumps on FenceBoot, permanently fencing its own commit of that object  *)
+(*   under CommitGuardsHold unless it reclaims the entry first             *)
+(*   (DuckSpoutCore's ReclaimSeal). WatermarkEventuallyAdvances is checked  *)
+(*   here for real now; the original gap (no reclaim available) stays      *)
+(*   permanently red at specs/broken/Finding_TakeoverOrphanedSeal.cfg.     *)
 (***************************************************************************)
 EXTENDS DuckSpoutCore, TLC
 

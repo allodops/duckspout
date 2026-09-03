@@ -49,6 +49,13 @@ CONSTANTS
                 \* #55); FALSE in every v0.1 config -- TakeoverDrain contributes
                 \* no reachable transition there, so pinned state counts are
                 \* unaffected by its addition
+  ReclaimOn,    \* module projection toggle: a recovering node's own-orphaned-
+                \* seal reclaim on/off (v0.2, #177 -- ReclaimSeal below); FALSE
+                \* in every v0.1 config AND in
+                \* specs/broken/Finding_TakeoverOrphanedSeal.cfg (which must
+                \* keep demonstrating the hazard this closes) -- ReclaimSeal
+                \* contributes no reachable transition where it's FALSE, so
+                \* those pinned state counts are unaffected by its addition
   None,         \* model value
   \* -- broken-variant switches (3.6); all FALSE in clean configs ----------
   BrkAckBeforeReceipt,     \* ClientAck drops the >= RF receipt conjunct
@@ -412,6 +419,39 @@ PutPart(pt) ==        \* atomic object appearance (A3); the object's only
   /\ objects' = objects \cup {pt}
   /\ UNCHANGED <<sealedParts, lake, expired, wm, lossLedger, pendingCommit,
                  claims, closed>>
+  /\ UNCHANGED ingVars /\ UNCHANGED repVars /\ UNCHANGED memVars
+  /\ UNCHANGED schVars
+
+-----------------------------------------------------------------------------
+(* Recovery reclaim (v0.2, #177): a recovering node's own orphaned seal --   *)
+(* sealed and PUT before it crashed, never committed -- is stuck forever     *)
+(* under CommitGuardsHold's inc fence (pt.inc = inc[pt.sealer]) once         *)
+(* FenceBoot bumps its incarnation, and SealPart's own-sealer uniqueness     *)
+(* (TN-29) means it can never seal a FRESH replacement for the same window   *)
+(* either -- the object's name is deterministic, so a second PUT would just  *)
+(* be the same object again.  What is actually stale is the incarnation the  *)
+(* catalog will check the object against, not the object itself: the        *)
+(* sealer re-registers its OWN orphaned entry (in sealedParts and/or         *)
+(* objects) under its CURRENT incarnation before attempting to commit it.    *)
+(* part/window/kind/disc/coverage/extent are untouched, so UniqueOk and      *)
+(* DisjointOk -- and therefore SingleDrainCommit -- see the identical        *)
+(* candidate they always would have; only pt.inc, the freshness stamp,       *)
+(* changes.  A live rival (another node that took the claim over and         *)
+(* sealed/committed its own replacement) is still caught: its part shares    *)
+(* the same (part, window, kind, disc) key, so UniqueOk rejects the          *)
+(* reclaimed candidate exactly as it would reject any other second seal --   *)
+(* the fence this loosens is purely the sealer-vs-itself one, never the      *)
+(* cross-sealer one SingleDrainCommit polices.                              *)
+ReclaimSeal(n, pt) ==
+  /\ ReclaimOn /\ DrainOn /\ alive[n] /\ n \notin degraded
+  /\ pt.sealer = n /\ HoldsClaim(n, pt.part)
+  /\ pt \in objects /\ pt.inc # inc[n]        \* genuinely orphaned: stale inc
+  /\ LET pt2 == [pt EXCEPT !.inc = inc[n]]
+     IN /\ objects'     = (objects \ {pt}) \cup {pt2}
+        /\ sealedParts' = IF pt \in sealedParts
+                          THEN (sealedParts \ {pt}) \cup {pt2}
+                          ELSE sealedParts
+  /\ UNCHANGED <<lake, expired, wm, lossLedger, pendingCommit, claims, closed>>
   /\ UNCHANGED ingVars /\ UNCHANGED repVars /\ UNCHANGED memVars
   /\ UNCHANGED schVars
 
@@ -846,6 +886,7 @@ Next ==
        LakeCommitOk(n, pt) \/ LakeCommitAbort(n, pt)
          \/ LakeCommitIndeterminateLanded(n, pt)
          \/ LakeCommitIndeterminateLost(n, pt)
+         \/ ReclaimSeal(n, pt)
   \/ \E n \in Nodes : Reconcile(n)
   \/ \E pt \in lake : Expire(pt)
   \/ \E n \in Nodes : \E t \in cache[n] : Evict(n, t)
@@ -883,6 +924,7 @@ ALakeCommitOk == \E n \in Nodes : \E pt \in objects : LakeCommitOk(n, pt)
 AReconcile   == \E n \in Nodes : Reconcile(n)
 AClaimAdvertise == \E n \in Nodes, p \in Partitions : ClaimAdvertise(n, p)
 AFenceBoot   == \E n \in Nodes : FenceBoot(n)
+AReclaimSeal == \E n \in Nodes : \E pt \in objects : ReclaimSeal(n, pt)
 
 FairnessBase ==   \* everything except the catalog-commit fairness
   /\ WF_vars(AStageCommit) /\ WF_vars(ADedupCheck) /\ WF_vars(AClientAck)
@@ -890,7 +932,7 @@ FairnessBase ==   \* everything except the catalog-commit fairness
   /\ WF_vars(AForward) /\ WF_vars(APeerApply) /\ WF_vars(AReceipt)
   /\ WF_vars(ACloseWindow) /\ WF_vars(ASealPart) /\ WF_vars(ASealSupplement)
   /\ WF_vars(APutPart) /\ WF_vars(AReconcile)
-  /\ WF_vars(AClaimAdvertise) /\ WF_vars(AFenceBoot)
+  /\ WF_vars(AClaimAdvertise) /\ WF_vars(AFenceBoot) /\ WF_vars(AReclaimSeal)
 
 CoreFairness ==   \* the catalog accepts commits (LakeAccepts, 3.5)
   FairnessBase /\ SF_vars(ALakeCommitOk)
@@ -1096,5 +1138,10 @@ NoWitness_TakeoverDrains ==   \* a node with no pre-seeded claim on the
                                \* restricted to InitClaims pairs (TN-4), the
                                \* only action that can grow a node's claim
                                \* beyond the pre-seeded set is TakeoverDrain
+
+NoWitness_ReclaimSealFires ==   \* the reclaim path (v0.2, #177) is live, not
+  [][ ~\E n \in Nodes, pt \in objects :  \* dead code: a recovering node's own
+        ReclaimSeal(n, pt) ]_vars        \* orphaned seal genuinely gets
+                                          \* reclaimed, not just declared
 
 =============================================================================
