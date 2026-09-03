@@ -205,11 +205,11 @@ spec = "§8 (ADR-0009)"
 
 [[gate]]
 id = "tla-mc-replication"
-status = "staged"
+status = "armed"
 cadence = "pr"
 recipe = "tla-mc"
-workflow_job = ""
-milestone = "v0.2"
+workflow_job = "ci.yml:tla-mc"
+milestone = ""
 issue = 57
 spec = "§8.1"
 
