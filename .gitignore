@@ -10,9 +10,11 @@ states/
 specs/.tools/
 
 # P tool, fetched by `just p-install` (scripts/p.mjs, #131); build output
-# from `p compile`/`p check`, generated anywhere under p/
+# from `p compile`/`p check`, generated anywhere under p/. `p compile`'s
+# build directory is fixed at "PChecker/" (empirically verified against P
+# 3.1.0 -- not "PGenerated/", which was never actually emitted).
 p/.tools/
-PGenerated/
+PChecker/
 PCheckerOutput/
 
 # Bun
