@@ -272,3 +272,84 @@ machine TestDegradedBoot {
     }
   }
 }
+
+// Scenario: §7's OTHER boot case -- "a genuinely new node[,] no
+// persisted incarnation[,] waits, in a typed startup state" --
+// distinguished here from `TestFenceBootZombie`'s reboot-with-history
+// path by starting the dying node's replacement from an `eFenceBoot`
+// with `priorIncarnation = 0`, not a nonzero prior.
+//
+// `owner` (nodeId 1) accepts and forwards a write, same opening as
+// `TestFenceBootZombie`, then suffers `eCrashWipe` -- not `eDie` --
+// standing in for `specs/DuckSpoutCore.tla`'s `CrashWipe(n)` (the disk
+// dies too). Its replacement, `newOwner`, is deliberately given a
+// DIFFERENT `nodeId` (3, not 1): TLA+'s `CrashWipe` comment says a wiped
+// node "never re-enters" (its `wiped' = wiped \cup {n}` permanently
+// blocks both `FenceBoot(n)` and `DegradedBoot(n)` for that same `n`
+// forever after), so this is deliberately NOT modeled as nodeId 1 coming
+// back -- see `eCrashWipe`'s header comment (Events.p) for the full
+// correspondence caveat. `newOwner` boots straight into a catalog outage
+// (`eCatalogOutage` sent first, same-sender-to-same-target FIFO with the
+// `eFenceBoot` right after it, the same convention `TestDegradedBoot`
+// already uses to guarantee the outage is observed first) with
+// `priorIncarnation = 0` -- nothing persisted to fall back to -- so it
+// cannot complete FenceBoot at all and goes to `Node.p`'s `Waiting`
+// state instead of `DegradedBoot`'s replica-only mode.
+//
+// While `newOwner` waits, `replica` accepts a genuine second write (key
+// 2) and forwards it to `newOwner` -- exactly the race
+// `NoIdentityWhileWaiting` must hold across: this Forward and the
+// `eCatalogRestored` below come from different senders (`replica` vs.
+// this environment), so their relative arrival order at `newOwner` is
+// unconstrained and the checker explores both. Whichever order, `Waiting`
+// drops the Forward outright (see its own comment, Node.p) -- no claim,
+// no receipt, no takeover can result from it.
+//
+// The catalog then returns (`eCatalogRestored`): `newOwner` completes
+// its very first fence (nodeId 3, incarnation 1) and leaves `Waiting`.
+// A final genuine write routed through `newOwner` (key 3) confirms the
+// positive path too -- promotion out of `Waiting` genuinely restores
+// full participation, not merely a permanently-stuck node.
+machine TestNewNodeBoot {
+  start state Init {
+    entry {
+      var owner: Node;
+      var replica: Node;
+      var newOwner: Node;
+
+      owner = new Node();
+      replica = new Node();
+      send owner, eFenceBoot, (nodeId = 1, priorIncarnation = 0);
+      send replica, eFenceBoot, (nodeId = 2, priorIncarnation = 0);
+      send owner, eLink, replica;
+      send replica, eLink, owner;
+
+      // owner accepts and forwards key 1 under incarnation 1, then
+      // suffers a wipe, not merely a crash -- see eCrashWipe's header
+      // comment (Events.p) for the eDie/eCrashWipe distinction.
+      new Client((owner = owner, key = 1, sq = 1));
+      send owner, eCrashWipe;
+
+      // The replacement: a genuinely new node (fresh nodeId 3, NOT
+      // owner's old nodeId 1 -- see this machine's header comment above
+      // for why), booting straight into a catalog outage with no
+      // persisted incarnation to bump.
+      newOwner = new Node();
+      send newOwner, eCatalogOutage;
+      send newOwner, eFenceBoot, (nodeId = 3, priorIncarnation = 0);
+      send newOwner, eLink, replica;
+      send replica, eLink, newOwner;
+
+      // A peer forward races the still-waiting newOwner (see header
+      // comment above).
+      new Client((owner = replica, key = 2, sq = 2));
+
+      // The catalog returns: newOwner completes its first-ever fence and
+      // leaves the waiting state.
+      send newOwner, eCatalogRestored;
+
+      // Positive path: newOwner can now genuinely participate.
+      new Client((owner = newOwner, key = 3, sq = 1));
+    }
+  }
+}

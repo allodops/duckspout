@@ -209,3 +209,53 @@ spec NoOwnershipWhileDegraded observes eDegradedChanged, eTakeoverDrain {
     }
   }
 }
+
+// NoIdentityWhileWaiting (§7, docs/design/replication.md): "Only a
+// genuinely new node -- no persisted incarnation -- waits, in a typed
+// startup state. It has no identity to be safely partial with." The
+// property: no node ever announces an identity-bearing action --
+// `eClaimAdvertise` (establishing a claim under a role) or
+// `eTakeoverDrain` (committing a key via takeover) -- while it is still
+// in that waiting state (`Node.p`'s `Waiting`).
+//
+// Checked by recomputing each node's waiting status purely from the
+// `eWaitingChanged` event stream `Node.p` announces -- the same
+// independent-ground-truth convention `FencedZombie`/
+// `NoOwnershipWhileDegraded` above already establish for this file (see
+// `FencedZombie`'s header comment for why: reading `Node.p`'s own
+// `waitingForFence` field directly would just check the implementation
+// against itself, tautologically green whether or not the `Waiting`
+// state's guards are actually wired correctly). This spec's own scratch
+// broken variant (PR description) -- which lets `Waiting` process
+// `eForward` the way `Active` does instead of dropping it -- is what
+// confirms this recomputation genuinely catches a node taking an
+// identity action while still waiting, not merely a model that happens
+// to never exercise the gap.
+//
+// A direct `assert`, not `hot state`, matching this file's established
+// convention for a per-event safety check on a bounded scenario -- see
+// `NoAckedLoss`'s header above for why `hot state` liveness is the wrong
+// shape here.
+spec NoIdentityWhileWaiting observes eWaitingChanged, eClaimAdvertise, eTakeoverDrain {
+  var waitingNodes: set[Node];
+
+  start state Watching {
+    on eWaitingChanged do (wc: (node: Node, waiting: bool)) {
+      if (wc.waiting) {
+        waitingNodes += (wc.node);
+      } else {
+        waitingNodes -= (wc.node);
+      }
+    }
+
+    on eClaimAdvertise do (ca: (key: int, node: Node, role: tRole)) {
+      assert !(ca.node in waitingNodes),
+        "NoIdentityWhileWaiting violated: a node advertised a claim while still in the waiting-for-first-fence state";
+    }
+
+    on eTakeoverDrain do (td: (key: int, sq: int, newOwner: Node)) {
+      assert !(td.newOwner in waitingNodes),
+        "NoIdentityWhileWaiting violated: a node announced a takeover-drain while still in the waiting-for-first-fence state";
+    }
+  }
+}

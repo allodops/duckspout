@@ -70,7 +70,8 @@ topology once takeover fires is not (§4.3).
 | `eForward` handler (`Node.p`: `staged += key`, `send origin, eReceipt`, conditionally `committed += key` + `announce eTakeoverDrain`, `announce eForwardHandled`) | `PeerApply(m, g)` **+** `Receipt(m, r)`, fused (plus the late-arrival branch of `TakeoverDrain`, see §3.2) | `PeerApply`'s guards — fencing (`g.inc >= highestSeen[m][g.rec.origin]`), gap-refusal (`g.rec.seq = AppliedThru(...) + 1`), `SchemaKnown`, the hard-rung refusal — have **no P counterpart**. P applies every forwarded record unconditionally. `Receipt` in TLA+ is a separately-schedulable action (a peer can hold an applied record for a while before receipting it); in P, receipting happens inline in the same handler that applies the record — no interleaving between "applied" and "receipted" is representable. |
 | `eReceipt` handler (`Node.p`: `holders[key] += 1`; if `holders[key] >= 2` and pending, `send eWriteAck`) | `ClientAck(n, q)` (`Cardinality(H) >= RF`) | Faithful in spirit: P's `>= 2` is `Replication.cfg`'s `RF = 2` baked in as a literal rather than carried as a parameter. Granularity differs slightly — TLA+'s `ClientAck` is a distinct action that re-evaluates the guard whenever scheduled (it can be enabled without immediately firing); P re-checks and acts within the same handler invocation that received the triggering receipt. |
 | `eCrashSignal` handler (`Node.p`: `peerDead = true`; sweep `staged \ committed`, `committed += k`, `announce eTakeoverDrain` per key; `announce eCrashSignalHandled`) | **No TLA+ action.** Explicitly an abstraction — see §4.1. | — |
-| `eDie` handler (`Node.p`: `raise halt`) | `CrashNode(n)` (`alive' = FALSE`, `inflight' = {}`, `crashBudget' - 1`; staged/dedup/cache survive — "fsynced state survives (A1)") | Good match for the dying node's own transition. P's halted machine simply stops processing (its `staged`/`committed`/`holders` fields are inert, matching "fsynced state survives" — nothing in this scenario reads a dead node's state again). `Replication.cfg`'s `WipeBudget = 0` means `CrashWipe(n)` is unreachable there too, so P having no `CrashWipe` analog is not a scope gap *for this config*. |
+| `eDie` handler (`Node.p`: `raise halt`) | `CrashNode(n)` (`alive' = FALSE`, `inflight' = {}`, `crashBudget' - 1`; staged/dedup/cache survive — "fsynced state survives (A1)") | Good match for the dying node's own transition. P's halted machine simply stops processing (its `staged`/`committed`/`holders` fields are inert, matching "fsynced state survives" — nothing in this scenario reads a dead node's state again). |
+| `eCrashWipe` handler (`Node.p`: `raise halt`, same body as `eDie`) | `CrashWipe(n)` (`wiped' = wiped \cup {n}`, `staged'/cache'/dedup'/inflight' = {}`, `alive' = FALSE` — its own comment: "a wiped node never re-enters") | **New, and only a partial, honestly-caveated match — see §4.2 (updated).** `TestNewNodeBoot` (`TestDriver.p`) sends this to the dying node, but the P handler is behaviorally indistinguishable from `eDie`'s: both just `raise halt`. Clearing `staged`/`cache`/`dedup` first, matching TLA+'s guard, would be dead code in this model (nothing reads a halted instance's fields again) — the real distinguishing behavior lives entirely in what the *environment* does for the reboot afterward, and even there it is not the same thing TLA+'s `CrashWipe` describes (see §4.2: TLA+ permanently retires `n`; P's replacement is a different `nodeId` altogether). `Replication.cfg`'s `WipeBudget = 0` still makes `CrashWipe` unreachable in TLA+'s own clean config, so there is no TLA+ execution to mechanically cross-check this against even in principle. |
 | `eAccepted` (announced inside `eWriteReq` handling) | The moment `StageCommit(n, q)` adds `r` to `staged[n]` | **Naming trap**: P's event is called `eAccepted`, which echoes TLA+'s `Accept` action by name, but its own doc comment (`Events.p` lines 25-28) says what it actually tracks is "the point past which the system has made a durability commitment" — that is TLA+'s `StageCommit` moment (what `NoAckedLoss`'s own `staged[n]` disjunct anchors on), not `Accept`'s admission moment. Read `eAccepted` as "staged," not "accepted," when comparing to TLA+. |
 | `eTakeoverDrain` (announced from both the late-Forward branch and the `eCrashSignal` sweep) | `TakeoverDrain(n, p)` **by name**, but see §4.3 for scope | Same name, materially different amount of work — flagged as a genuine divergence below, not glossed over here. |
 | `eForwardHandled`, `eCrashSignalHandled` (`Events.p`, marker events for `NoAckedLoss.p`'s assert) | — | No TLA+ counterpart. Pure P scaffolding, invented so the hand-written `NoAckedLoss` spec machine (`p/Replication/NoAckedLoss.p`) has a well-defined point to assert at in a *bounded* scenario. Its own header explains why: an earlier `hot state`-liveness formulation of the same check never fired (#132 finding) because P's default bugfinding checker does not treat "terminated while hot" as a violation the way TLA+'s fairness-driven `~>` checking does. TLA+ needs no equivalent marker because TLC checks invariants at *every* reachable state by construction. |
@@ -82,16 +83,17 @@ topology once takeover fires is not (§4.3).
 `specs/README.md`'s module-ownership table lists `Replication.tla`'s owned
 actions as: `Forward, PeerApply, Receipt, ClaimAdvertise, Heartbeat,
 TakeoverDrain, CrashNode, CrashWipe, RecoverNode, FenceBoot, DegradedBoot`.
-Of these, only `Forward`/`PeerApply`/`Receipt`/`TakeoverDrain`/`CrashNode`
-have any P representation (§3.1, with the fusions and guard-drops noted
-there). The rest:
+Of these, `Forward`/`PeerApply`/`Receipt`/`TakeoverDrain`/`CrashNode`/
+`CrashWipe` have some P representation (§3.1, with the fusions,
+guard-drops, and — for `CrashWipe` — the honest correspondence caveat
+noted there). The rest:
 
 | TLA+ action | P representation | Note |
 |---|---|---|
 | `ClaimAdvertise(n, p)` | None | P has no `claims` registry / `InitClaims` concept at all. The sole authorization for P's takeover is the local boolean `peerDead`; TLA+'s `TakeoverDrain` guard instead reads a global `claims` set and every node's `alive[]`. Quiescent in `Replication.cfg` too (`InitClaims` pre-seeds `n1` directly), so this is a wash for *this* scenario, not a live gap. |
 | `Heartbeat(n)` | `eHeartbeat`/`eTick` handlers (`Node.p`), `TestHeartbeatDetection` (`TestDriver.p`) | **Partial, and now ahead of TLA+ here** — see §4.1 (updated). `Replication.cfg` still sets `MaxHb = 0` ("advisory, nothing reads it"), so TLA+ itself gives `Heartbeat` no teeth in this scope; P's round-counted TTL-lapse detection is real but narrower than §5.5/§6.1's full mechanism (no false-positive/flapping modeling, no takeover-suppression window, no interaction with incarnation fencing — §4.1). |
-| `CrashWipe(n)` | None | `WipeBudget = 0` in `Replication.cfg` — unreachable in TLA+'s own clean config too. |
-| `RecoverNode(n)` / `FenceBoot(n)` / `DegradedBoot(n)` | `eFenceBoot`/`eCatalogOutage`/`eCatalogRestored` handlers (`Node.p`), `TestFenceBootZombie` + `TestDegradedBoot` (`TestDriver.p`) | **Partial, and now wider** — see §4.2 (updated). `FenceBoot`'s incarnation-draw-and-persist has a P analog (`TestFenceBootZombie`); `DegradedBoot`'s catalog-outage boot split now has one too (`TestDegradedBoot`: a persisted incarnation booting into a catalog outage suppresses ownership actions until promotion, checked by `NoOwnershipWhileDegraded`). `RecoverNode`'s remaining surrounding machinery does not — see §4.2 for the precise boundary of what is and is not covered. |
+| `CrashWipe(n)` | `eCrashWipe` handler (`Node.p`), `TestNewNodeBoot` (`TestDriver.p`) | **New, but narrower than the name suggests — see §4.2 (updated).** `WipeBudget = 0` in `Replication.cfg` still makes `CrashWipe` unreachable in TLA+'s own clean config, so there is no TLA+ execution to cross-check this against even in principle. What P models under this name is not TLA+'s `CrashWipe` recovering — TLA+'s own comment says a wiped node "never re-enters," full stop, and `Nodes` is a fixed set with no dynamic-membership concept to reissue an identity through. It is a P model of §7's *separate* "genuinely new node" prose instead, which has no TLA+ action of its own at all (see §4.2). |
+| `RecoverNode(n)` / `FenceBoot(n)` / `DegradedBoot(n)` | `eFenceBoot`/`eCatalogOutage`/`eCatalogRestored` handlers (`Node.p`), `TestFenceBootZombie` + `TestDegradedBoot` + `TestNewNodeBoot` (`TestDriver.p`) | **Partial, and now wider still** — see §4.2 (updated). `FenceBoot`'s incarnation-draw-and-persist has a P analog (`TestFenceBootZombie`); `DegradedBoot`'s catalog-outage boot split has one too (`TestDegradedBoot`); and `TestNewNodeBoot` now models the boot-time behavior of a node with no persisted incarnation at all (`Node.p`'s `Waiting` state, checked by `NoIdentityWhileWaiting`) — a case §7 describes but that maps to **no TLA+ action whatsoever** (`Init` already assumes every node's first boot succeeded), not a partial rendering of one. `RecoverNode`'s remaining surrounding machinery does not have a P counterpart — see §4.2 for the precise boundary of what is and is not covered. |
 
 ## 4. Known gaps and divergences
 
@@ -150,16 +152,22 @@ observing that peer reboot under a fenced incarnation). None of these
 have a TLA+ analog to be behind *or* ahead of — they are simply open
 scope on both sides.
 
-### 4.2 P now models `FenceBoot`/recovery, `DegradedBoot`, and checks `FencedZombie`/`NoOwnershipWhileDegraded` — narrower than TLA+'s, not absent
+### 4.2 P now models `FenceBoot`/recovery, `DegradedBoot`, the genuinely-new-node boot case, and checks `FencedZombie`/`NoOwnershipWhileDegraded`/`NoIdentityWhileWaiting` — narrower than TLA+'s, not absent
 
 *Updated: a second P test scenario, `TestFenceBootZombie`
 (`p/Replication/TestDriver.p`), closed the gap this section used to
 describe as unrepresented for `FenceBoot`/`RecoverNode`. A fourth scenario,
-`TestDegradedBoot`, now closes the `DegradedBoot` half of it too — see the
-PR that added `eCatalogOutage`/`eCatalogRestored`/`NoOwnershipWhileDegraded`
-for the verification evidence, and the PR before it (`eFenceBoot`/
-`FencedZombie`) for the `FenceBoot` half. What follows is the corrected
-boundary of what P covers here, not either original finding.*
+`TestDegradedBoot`, closed the `DegradedBoot` half of it too. A fifth,
+`TestNewNodeBoot`, now closes §7's *other* boot case — a genuinely new
+node with no persisted incarnation — which the update before this one had
+explicitly left as still-open scope (see the paragraph this update
+replaces below). See the PR that added `eCrashWipe`/`Node.p`'s `Waiting`
+state/`NoIdentityWhileWaiting` for the verification evidence on this
+latest addition, the PR before it (`eCatalogOutage`/`eCatalogRestored`/
+`NoOwnershipWhileDegraded`) for the `DegradedBoot` half, and the one before
+that (`eFenceBoot`/`FencedZombie`) for the `FenceBoot` half. What follows
+is the corrected boundary of what P covers here, not any of the three
+original findings.*
 
 `Replication.tla`'s own header is explicit that the recovery path matters
 to this exact scenario: "`FenceBoot`'s recovery path is reachable too...
@@ -222,29 +230,76 @@ scratch, uncommitted variant that drops the `!degraded` guard from
 `sweepOrphanedKeys` is caught in 5 schedules with a genuine
 still-degraded-takeover trace — see that PR for the exact excerpt.
 
+**The genuinely-new-node boot case, now modeled too (`TestNewNodeBoot`):**
+§7's other boot-time split reads "Only a genuinely new node — no persisted
+incarnation — waits, in a typed startup state. It has no identity to be
+safely partial with." `Node.p` now has a second named state, `Waiting`
+(the "typed startup state" itself), entered from `eFenceBoot`'s handler
+exactly when a node's very first fence attempt (`priorIncarnation = 0` —
+nothing persisted to bump) cannot complete because the catalog is down.
+Unlike `DegradedBoot`'s persisted-incarnation branch, this node draws
+*no* incarnation at all while waiting, and every handler in `Waiting`
+either drops an inbound message outright (`ignore`) or does nothing
+observable — no claim advertisement, no receipt, no takeover-drain — until
+`eCatalogRestored` lets the deferred fence finally complete and the node
+returns to `Active`. `NoIdentityWhileWaiting` (`Spec.p`) asserts this
+directly: no node ever announces `eClaimAdvertise` or `eTakeoverDrain`
+while it is in `Waiting`, checked the same independent-ground-truth way as
+`FencedZombie`/`NoOwnershipWhileDegraded` (recomputed from the announced
+`eWaitingChanged` stream, not read off `Node.p`'s own `waitingForFence`
+field). `just p-check Replication` plus direct `p check -tc
+FenceBootZombie`, `-tc HeartbeatDetection`, `-tc DegradedBoot`, and `-tc
+NewNodeBoot` runs all show 0 bugs (1000 schedules each; `NewNodeBoot` also
+clean at 5000) on the honest model; a scratch, uncommitted variant that
+lets `Waiting` process `eForward` the way `Active` does (i.e., drops the
+state gate) is caught in 70 schedules with a genuine
+claim-while-waiting trace — see that PR for the exact excerpt.
+
+A necessary correction while adding this: the natural first reading of
+"model `CrashWipe`" turns out not to be what `TestNewNodeBoot` does, and
+saying so plainly matters more than the scenario itself. `specs/
+DuckSpoutCore.tla`'s `CrashWipe(n)` guards both `FenceBoot(n)` and
+`DegradedBoot(n)` on `n \notin wiped` forever after — its own comment
+reads "a wiped node never re-enters" — and TLA+'s `Nodes` is a *fixed*
+set with no dynamic-membership concept at all, so there is no TLA+
+notion of "a replacement for `n`" to model in the first place. `eCrashWipe`
+(the new P event `TestNewNodeBoot` sends to the dying `owner`) mirrors
+`CrashWipe`'s effect on the dying node itself only in name and halting
+behavior (its handler is identical to `eDie`'s: nothing in this model
+reads a halted instance's fields again, so faithfully clearing
+`staged`/`cache`/`dedup` first would be dead code — see the `eCrashWipe`
+row in §3.1). What follows it — a brand-new `Node` instance with a
+*different* `nodeId` (3, never owner's own 1) — is a P model of §7's
+separate "genuinely new node" prose, which corresponds to **no TLA+
+action whatsoever**: `Init` already assumes every node's first-ever boot
+succeeded (`alive = [n \in Nodes |-> TRUE]`, `inc = [n \in Nodes |-> 0]`
+from turn zero), so a fresh node hitting trouble on its very first boot is
+not a reachable `DuckSpoutCore.tla` transition to begin with, not merely
+one P represents narrowly. This is a stronger claim than the usual
+scope-parity gap (§5, Class 1): it is not that TLA+ has the mechanism and
+P's is narrower, but that *neither* model has a transition for this
+specific real-system moment — the gap is symmetric, not P being behind.
+
 What this deliberately does **not** model, so it is a narrower
-representation of §5.7 rather than the real thing: there is no modeled
+representation of §7 rather than the real thing: there is no modeled
 catalog service at all, only a boolean reachability flag the environment
 flips directly (`eCatalogOutage`/`eCatalogRestored`) — no request/timeout
 shape, no partial-reachability, nothing resembling an actual catalog-DB
-client. §5.7's *other* boot case — "a genuinely new node[,] no persisted
-incarnation[,] waits, in a typed startup state" — has no P representation
-at all; `TestDegradedBoot` only exercises the persisted-incarnation branch
-(`Node.p`'s `eFenceBoot` handler never lets `priorIncarnation = 0` produce
-`degraded = true`, matching the spec text, but nothing models the waiting
-new-node path itself). And the *combination* of heartbeat-TTL detection
-with `DegradedBoot` remains open: `TestDegradedBoot` deliberately reuses
-`eCrashSignal`'s oracle (matching `TestFenceBootZombie`'s and
-`TestTakeoverDrain`'s convention) rather than `TestHeartbeatDetection`'s
-`eTick` path, so nothing exercises a degraded node deriving its own peer's
-death from a heartbeat gap while still suppressing ownership actions. Also
-still open, unchanged from the original finding: `RecoverNode`'s remaining
-surrounding machinery, and — the same gap §4.3 describes in more detail —
-any of TLA+'s discrete claim/seal/commit-guard steps that `FencedZombie`
-also polices on the drain-commit side (`CommitGuardsHold`'s `pt.inc =
-inc[pt.sealer]`). **Candidate follow-up**, unchanged from the original
-finding: widen P's takeover handling into discrete claim/seal/commit steps
-with guards (tracked the same way as §4.3's).
+client (same limitation `DegradedBoot`'s own paragraph above already
+notes). And the *combination* of heartbeat-TTL detection with either
+`DegradedBoot` or the new waiting state remains open: `TestDegradedBoot`
+and `TestNewNodeBoot` both deliberately reuse `TestFenceBootZombie`'s
+environment-driven conventions (`eCrashSignal`/`eCatalogOutage`,
+`eFenceBoot`) rather than `TestHeartbeatDetection`'s `eTick` path, so
+nothing exercises a degraded-or-waiting node deriving its own peer's
+death from a heartbeat gap. Also still open, unchanged from the original
+finding: `RecoverNode`'s remaining surrounding machinery, and — the same
+gap §4.3 describes in more detail — any of TLA+'s discrete claim/seal/
+commit-guard steps that `FencedZombie` also polices on the drain-commit
+side (`CommitGuardsHold`'s `pt.inc = inc[pt.sealer]`). **Candidate
+follow-up**, unchanged from the original finding: widen P's takeover
+handling into discrete claim/seal/commit steps with guards (tracked the
+same way as §4.3's).
 
 ### 4.3 `eTakeoverDrain` fuses claim-acquisition with commit; TLA+ keeps them apart
 
@@ -288,10 +343,16 @@ disposition: a candidate follow-up issue to widen the P model's takeover
 handling into discrete claim/seal/commit steps with guards, not a fix made
 in the PR that added `FencedZombie`'s message-fencing coverage.
 
-### 4.4 Property coverage: TLA+ checks ten invariants and two properties here; P checks three, none a transliteration
+### 4.4 Property coverage: TLA+ checks ten invariants and two properties here; P checks five, none a transliteration
 
-*Updated alongside §4.2: `FencedZombie` (`Spec.p`) is a new third P
-property, added by the same PR that closed §4.2's original gap.*
+*Updated alongside §4.2, in three steps: `FencedZombie` (`Spec.p`) was a
+new third P property, added by the PR that closed the `FenceBoot`/
+`RecoverNode` half of §4.2's original gap. `NoOwnershipWhileDegraded`
+followed as a fourth, added by the PR that closed the `DegradedBoot` half
+— this document's own count here was not updated at the time, an
+inconsistency corrected now rather than carried forward.
+`NoIdentityWhileWaiting` is the fifth, added by the PR that closed §4.2's
+genuinely-new-node-boot gap.*
 
 `Replication.cfg` checks all ten of `DuckSpoutCore.tla`'s state invariants
 (`DurableAck`, `NoAckedLoss`, `WatermarkHonesty`, `CacheTransparency`,
@@ -303,7 +364,7 @@ confirmed as a permanently-red finding
 (`specs/broken/Finding_TakeoverOrphanedSeal.cfg`), not a silently-dropped
 check.
 
-`p/Replication/*.p` checks three properties today, none a 1:1
+`p/Replication/*.p` checks five properties today, none a 1:1
 transliteration of a TLA+ invariant:
 
 - `NoAckedLoss.p`'s own header says what kind of correspondence it is:
@@ -326,6 +387,23 @@ transliteration of a TLA+ invariant:
   narrower than TLA+'s: message-level Forward/Receipt fencing only, not
   the commit-guard half (`CommitGuardsHold`'s `pt.inc = inc[pt.sealer]`) —
   see §4.2 and §4.3 for the exact boundary.
+- `NoOwnershipWhileDegraded` (`Spec.p`) has no directly-named TLA+
+  invariant twin either, same shape as `ClaimAdvertiseOnce` above:
+  `DegradedBoot(n)`'s own guards (`~alive[n] /\ n \notin wiped /\ inc[n] >
+  0`) and `TakeoverDrain(n, p)`'s (`alive[n] /\ n \notin degraded`) already
+  prevent a degraded node from taking ownership structurally, but nothing
+  in `Replication.cfg`'s checked-invariant list separately names that
+  guarantee. P's version makes it an explicit, independently-checked
+  safety property, checked by recomputing degraded status from the
+  announced `eDegradedChanged` stream rather than reading `Node.p`'s own
+  field (§4.2).
+- `NoIdentityWhileWaiting` (`Spec.p`), the newest, is likewise unnamed on
+  the TLA+ side — not because TLA+ checks it under a different name, but
+  because the boot-time case it covers (§7's genuinely-new-node path) maps
+  to no TLA+ action at all (§3.2, §4.2). It asserts no node announces
+  `eClaimAdvertise`/`eTakeoverDrain` while in `Node.p`'s `Waiting` state,
+  checked the same recomputed-ground-truth way as the two properties
+  above (from `eWaitingChanged`, not `Node.p`'s own `waitingForFence`).
 
 The other nine (`DurableAck`, `WatermarkHonesty`, `CacheTransparency`,
 `SingleDrainCommit`, `LossLedgerTruthful`, `SnapshotCovered`,
@@ -333,8 +411,10 @@ The other nine (`DurableAck`, `WatermarkHonesty`, `CacheTransparency`,
 counterpart of any kind today. This is consistent with the P model's own
 commit history describing it as an explicitly scoped-down slice, and this
 map should not be read as implying broader property coverage than these
-three checks — one of which (`FencedZombie`) is itself narrower than its
-TLA+ namesake, per §4.2.
+five checks — one of which (`FencedZombie`) is itself narrower than its
+TLA+ namesake, per §4.2, and two of which (`NoOwnershipWhileDegraded`,
+`NoIdentityWhileWaiting`) check boot-time behavior TLA+ represents only
+partially or not at all, per the same section.
 
 ## 5. Divergence protocol
 
