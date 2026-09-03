@@ -203,16 +203,6 @@ spec = "§8 (ADR-0009)"
 
 # --- staged, cadence = "pr" (future ci.yml jobs; s§6.1 lower table) ---
 
-[[gate]]
-id = "tla-mc-replication"
-status = "staged"
-cadence = "pr"
-recipe = "tla-mc"
-workflow_job = ""
-milestone = "v0.2"
-issue = 57
-spec = "§8.1"
-
 
 # --- staged, cadence = "nightly" (future nightly.yml jobs; s§6.3) ---
 
@@ -270,4 +260,18 @@ recipe = "tla-mc"
 workflow_job = "ci.yml:tla-mc"
 milestone = ""
 issue = 43
+spec = "§8.1"
+
+# Second tla-mc row (#57): same job, same matrix (ci.yml's tla-mc job fans
+# Replication out alongside Ingest/Drain/Schema) -- a separate ledger row
+# per module family, not a separate job, matching this row's own comment
+# above about how the matrix already fans per-module latency out.
+[[gate]]
+id = "tla-mc-replication"
+status = "armed"
+cadence = "pr"
+recipe = "tla-mc"
+workflow_job = "ci.yml:tla-mc"
+milestone = ""
+issue = 57
 spec = "§8.1"

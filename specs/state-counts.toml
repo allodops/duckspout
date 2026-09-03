@@ -24,3 +24,12 @@ Drain = 398526
 # safety invariants + SchemaConvergence + LadderMonotone + SchemaMonotone
 # + EveryRequestResolves.  09m09s.
 Schema = 36191
+
+# Replication.cfg -- 2 nodes, RF=2, 1 event-class partition, 1 window,
+# 1 request, MaxCrashes=1, Crashable={n1}, TakeoverOn=TRUE (#55); all 10
+# safety invariants + LadderMonotone + EveryRequestResolves.
+# WatermarkEventuallyAdvances is NOT checked here -- falsified in this
+# scope, confirmed as a permanently-red finding
+# (specs/broken/Finding_TakeoverOrphanedSeal.cfg), not a silently-dropped
+# check. 52s.
+Replication = 171070
