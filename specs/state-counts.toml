@@ -26,10 +26,16 @@ Drain = 398526
 Schema = 36191
 
 # Replication.cfg -- 2 nodes, RF=2, 1 event-class partition, 1 window,
-# 1 request, MaxCrashes=1, Crashable={n1}, TakeoverOn=TRUE (#55); all 10
-# safety invariants + LadderMonotone + EveryRequestResolves.
-# WatermarkEventuallyAdvances is NOT checked here -- falsified in this
-# scope, confirmed as a permanently-red finding
-# (specs/broken/Finding_TakeoverOrphanedSeal.cfg), not a silently-dropped
-# check. 52s.
-Replication = 171070
+# 1 request, MaxCrashes=1, Crashable={n1}, TakeoverOn=TRUE (#55),
+# ReclaimOn=TRUE (#177); all 10 safety invariants + LadderMonotone +
+# EveryRequestResolves + WatermarkEventuallyAdvances (now checked and
+# holds: DuckSpoutCore's ReclaimSeal action, gated by ReclaimOn, lets a
+# recovering node re-register its own orphaned sealedParts/objects entry
+# under its current incarnation, closing the liveness gap
+# specs/broken/Finding_TakeoverOrphanedSeal.cfg still documents with
+# ReclaimOn=FALSE). Count moved 171070 -> 171972 (+902) versus the
+# pre-#177 baseline solely because ReclaimSeal adds new reachable states
+# (the same sealedParts/objects part re-keyed under a bumped incarnation)
+# in the one crash-then-recover branch that can reach it; re-verified
+# 07m39s.
+Replication = 171972

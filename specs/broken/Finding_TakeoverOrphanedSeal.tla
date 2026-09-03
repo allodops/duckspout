@@ -11,6 +11,9 @@
 \* Reconcile does not help: it only resolves the Indeterminate-commit
 \* case (pendingCommit # None), and this crash happens before any commit
 \* attempt is ever made. Constants otherwise identical to the clean
-\* Replication.cfg.
+\* Replication.cfg, EXCEPT its .cfg pins ReclaimOn = FALSE: the fix
+\* (DuckSpoutCore's ReclaimSeal, armed by ReclaimOn = TRUE in the clean
+\* Replication.cfg) closes exactly this gap, so this module keeps the
+\* mechanism off on purpose to keep demonstrating the ORIGINAL bug shape.
 EXTENDS Replication
 =============================================================================
