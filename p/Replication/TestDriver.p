@@ -16,6 +16,15 @@ machine TestTakeoverDrain {
       new Client((owner = owner, key = 1, sq = 1));
       send owner, eDie;
       send replica, eCrashSignal, (dead = owner,);
+      // Simulate a retransmitted eForward for the same (key, sq, origin) --
+      // real networks retry, and docs/design/replication.md §4 (PeerApply)
+      // requires a duplicate/retried apply be acknowledged without
+      // re-applying. Sent directly from the environment rather than routed
+      // through `owner`'s own eWriteReq handling, since owner may already
+      // be dead (eDie above) by the time a real retry would fire -- matches
+      // how eCrashSignal above is also delivered directly by the
+      // environment rather than through the peer's own logic.
+      send replica, eForward, (key = 1, sq = 1, origin = owner);
     }
   }
 }
