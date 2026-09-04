@@ -32,20 +32,28 @@ event eWriteAck: tWriteAck;
 // partition dimension, so it is dense per logical *origin* (`originId`)
 // only. Named `originSeq`, not TLA+'s own `seq`, purely because `seq` is
 // a P reserved word (the built-in `seq[T]` collection type) -- no
-// semantic difference intended. Deliberately NOT `sq`: checking existing
-// scenarios shows `sq` is only ever the client's own request/ack
-// correlator -- e.g. `TestFenceBootZombie` reuses `sq = 1` for BOTH
-// `owner`'s real key-1 write and the unrelated zombie Forward for key 3,
-// and `TestNewNodeBoot`'s third write (`replica`'s own first-ever
-// forward) carries `sq = 1` right after a second write carried `sq = 2`
-// -- neither dense nor monotonic per origin, so reusing it as the
-// gap-checked sequence would either be wrong on its face or require
-// silently reinterpreting already-shipped scenario data. `originSeq` is
-// assigned explicitly at every call site instead (see `TestDriver.p`),
-// standing in for the origin's own durably-persisted `nextSeq[n][p]`
-// counter (§4) -- the same "environment supplies persisted state a
-// halted P machine cannot recover on its own" convention `eFenceBoot`'s
-// `priorIncarnation` already establishes for incarnation.
+// semantic difference intended. Deliberately NOT `sq`: the two are
+// different concepts even where their values happen to coincide -- `sq`
+// is a *client's* own request/ack correlator, opaque to everything except
+// `eWriteAck`'s reply matching, while `originSeq` is an *origin's*
+// durably-persisted per-(origin, partition) sequence, checked for gap
+// contiguity by GapFreedom and load-bearing to `Node.p`'s apply logic.
+// Reusing one field for both would conflate a client-facing identifier
+// with a replication-protocol invariant the client has no part in --
+// itself a KISS/DRY violation in the other direction, not an
+// optimization. (`sq` is, as it happens, asserted on nowhere in this
+// model -- only ever printed -- so reusing the field would not have
+// crashed anything; that is not why a distinct field exists.) The
+// existing scenarios' own `sq` values confirm the concepts were never
+// interchangeable in the first place: `TestNewNodeBoot`'s third write
+// (`replica`'s own first-ever forward) carries `sq = 1` right after a
+// second write carried `sq = 2` -- neither dense nor monotonic per
+// origin, because `sq` was never meant to be. `originSeq` is assigned
+// explicitly at every call site instead (see `TestDriver.p`), standing in
+// for the origin's own durably-persisted `nextSeq[n][p]` counter (§4) --
+// the same "environment supplies persisted state a halted P machine
+// cannot recover on its own" convention `eFenceBoot`'s `priorIncarnation`
+// already establishes for incarnation.
 event eForward: (key: int, sq: int, originSeq: int, origin: Node, originId: int, inc: int);
 // Replica -> Owner: receipt once the forwarded record is durably applied.
 // `holderId`/`inc` mirror `eForward`'s `originId`/`inc` -- same rationale,
