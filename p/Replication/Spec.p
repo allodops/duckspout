@@ -287,32 +287,6 @@ spec NoOwnershipWhileDegraded observes eDegradedChanged, eTakeoverDrain {
   }
 }
 
-// NoIdentityWhileWaiting (§7, docs/design/replication.md): "Only a
-// genuinely new node -- no persisted incarnation -- waits, in a typed
-// startup state. It has no identity to be safely partial with." The
-// property: no node ever announces an identity-bearing action --
-// `eClaimAdvertise` (establishing a claim under a role) or
-// `eTakeoverDrain` (committing a key via takeover) -- while it is still
-// in that waiting state (`Node.p`'s `Waiting`).
-//
-// Checked by recomputing each node's waiting status purely from the
-// `eWaitingChanged` event stream `Node.p` announces -- the same
-// independent-ground-truth convention `FencedZombie`/
-// `NoOwnershipWhileDegraded` above already establish for this file (see
-// `FencedZombie`'s header comment for why: reading `Node.p`'s own
-// `waitingForFence` field directly would just check the implementation
-// against itself, tautologically green whether or not the `Waiting`
-// state's guards are actually wired correctly). This spec's own scratch
-// broken variant (PR description) -- which lets `Waiting` process
-// `eForward` the way `Active` does instead of dropping it -- is what
-// confirms this recomputation genuinely catches a node taking an
-// identity action while still waiting, not merely a model that happens
-// to never exercise the gap.
-//
-// A direct `assert`, not `hot state`, matching this file's established
-// convention for a per-event safety check on a bounded scenario -- see
-// `NoAckedLoss`'s header above for why `hot state` liveness is the wrong
-// shape here.
 // GapFreedom (§5.4, docs/design/replication.md §4; matches
 // `specs/DuckSpoutCore.tla`'s own invariant name for the same property,
 // not its text -- the TLA+ analog is a STATE invariant recomputed from
@@ -373,6 +347,32 @@ spec GapFreedom observes eGapDecision {
   }
 }
 
+// NoIdentityWhileWaiting (§7, docs/design/replication.md): "Only a
+// genuinely new node -- no persisted incarnation -- waits, in a typed
+// startup state. It has no identity to be safely partial with." The
+// property: no node ever announces an identity-bearing action --
+// `eClaimAdvertise` (establishing a claim under a role) or
+// `eTakeoverDrain` (committing a key via takeover) -- while it is still
+// in that waiting state (`Node.p`'s `Waiting`).
+//
+// Checked by recomputing each node's waiting status purely from the
+// `eWaitingChanged` event stream `Node.p` announces -- the same
+// independent-ground-truth convention `FencedZombie`/
+// `NoOwnershipWhileDegraded` above already establish for this file (see
+// `FencedZombie`'s header comment for why: reading `Node.p`'s own
+// `waitingForFence` field directly would just check the implementation
+// against itself, tautologically green whether or not the `Waiting`
+// state's guards are actually wired correctly). This spec's own scratch
+// broken variant (PR description) -- which lets `Waiting` process
+// `eForward` the way `Active` does instead of dropping it -- is what
+// confirms this recomputation genuinely catches a node taking an
+// identity action while still waiting, not merely a model that happens
+// to never exercise the gap.
+//
+// A direct `assert`, not `hot state`, matching this file's established
+// convention for a per-event safety check on a bounded scenario -- see
+// `NoAckedLoss`'s header above for why `hot state` liveness is the wrong
+// shape here.
 spec NoIdentityWhileWaiting observes eWaitingChanged, eClaimAdvertise, eTakeoverDrain {
   var waitingNodes: set[Node];
 
@@ -394,5 +394,37 @@ spec NoIdentityWhileWaiting observes eWaitingChanged, eClaimAdvertise, eTakeover
       assert !(td.newOwner in waitingNodes),
         "NoIdentityWhileWaiting violated: a node announced a takeover-drain while still in the waiting-for-first-fence state";
     }
+  }
+}
+
+// GapFreedomCoverage: a coverage/liveness twin for GapFreedom (above),
+// guarding the one degenerate case a pure safety assert cannot rule out by
+// itself -- GapFreedom's own assert only ever fires `if (gd.accepted)`, so
+// a `Node.p` that refused every `eForward` unconditionally (applying
+// nothing, ever, an over-refusing implementation) would pass GapFreedom
+// cleanly with zero real coverage: vacuously safe, not actually correct.
+// #192's ACPR (finding 4): `TestGapFreedom`'s scenario asserted `GapFreedom`
+// alone, with no other spec and no direct "something was actually
+// accepted" check, so this blind spot was real, not hypothetical.
+//
+// Checked as a genuine `hot state` liveness monitor, the same P mechanism
+// `NoAckedLossLive` (above) already establishes in this file for exactly
+// this shape of gap -- P's own manual: "If the program terminates and the
+// monitor is in a hot state, then there is a liveness bug."
+// `TestGapFreedom`'s scenario is bounded and always terminates, so this
+// monitor either sees a genuine accepted `eGapDecision` before the
+// scenario ends, or the checker flags the termination-while-hot itself; no
+// direct assert needed.
+spec GapFreedomCoverage observes eGapDecision {
+  start hot state NoneAcceptedYet {
+    on eGapDecision do (gd: (receiver: Node, senderId: int, originSeq: int, accepted: bool)) {
+      if (gd.accepted) {
+        goto SomeAccepted;
+      }
+    }
+  }
+
+  state SomeAccepted {
+    ignore eGapDecision;
   }
 }
