@@ -604,3 +604,157 @@ not from two silently-diverging sources of truth:
   per schedule, not a fairness-conditioned temporal property), so P
   currently makes no fairness *claims* of its own to reconcile against
   TLA+'s — a difference in mechanism, not a gap in what gets checked.
+
+## 6. #135's log-conformance investigation: Class 4 fired
+
+*New section, issue #135 (ADR-0012 step 5's P half). Provenance matches
+§1's own convention: a close reading, this time of P's actual public
+tooling and manual rather than of the two models, done before writing any
+code — per the issue's own instruction to research the mechanism properly
+before committing to an implementation approach.*
+
+ADR-0012 step 5 reads: "Traces close the loop against BOTH models: TLC
+trace refinement (§8.2) and P log-conformance (PObserve-style) consume the
+same trace vocabulary — the P model is thereby a *gated* artifact, not
+folklore." Issue #135 asked for exactly that: take one of the §3.7 NDJSON
+traces and check it against `Replication.p`, preferring P's native
+PObserve support "if it exists and works cleanly," else a documented
+translation/replay harness. What follows is why neither route is
+practical *today*, with the evidence, not an impression.
+
+### 6.1 PObserve does not exist as usable software
+
+`p-org/PObserve` is a real GitHub repository — but querying it directly
+(`https://api.github.com/repos/p-org/PObserve`) shows `created_at` and
+`pushed_at` are the same instant, 2025-05-21T22:20:1{3,4}Z: one commit,
+ever. `size` is 5 (KB) — a `LICENSE` (Apache-2.0) and a `README.md` whose
+entire content is the single line "PObserve: Monitoring P Specifications
+on Traces." No source, no examples, no releases, no wiki content despite
+`has_wiki: true`, 6 stargazers, 0 forks, last touched over a year before
+this investigation (`updated_at: 2026-04-03` reflects GitHub's own
+metadata refresh, not a content change). This is a reserved name for
+intended future work, not a tool — there is nothing to install, wire, or
+even read past the title.
+
+### 6.2 P's checker has no native external-trace-replay mode
+
+Independent of PObserve's absence, P's own manual
+(`p-org.github.io/P/manual/monitors/`) documents the `spec`/monitor
+mechanism this repo's `p/Replication/Spec.p` already uses: "each time
+there is a `send` or `announce` of an event during the execution of a
+system, all the monitors... that are observing that event are executed
+synchronously." A monitor cannot `send`, `receive`, `new`, or `announce`
+anything itself — it only reacts to what the *checker's own schedule
+exploration* produces from an author-written `test` scenario (this repo's
+`TestDriver.p` machines, all hand-authored literal `send` sequences). The
+manual documents no mechanism — and none was found in the wider P/Coyote
+documentation or discussion threads — for handing the checker a fixed,
+externally-recorded sequence of events to validate instead of exploring
+one it generates itself. This is the structural reason `tla.mjs tv`
+(`scripts/tla.mjs`) has no P-side analog to imitate: TLC's trace validation
+works by walking a *declarative* state relation (`*Trace.tla` constrains
+`Next` to the recorded step sequence and checks each step is enabled) —
+no interpreter runs, nothing is instantiated. P's model is *operational*:
+`Node` machines are real actors passing real messages, and the checker's
+entire value proposition is exploring interleavings of a script, not
+replaying one fixed history against a relation.
+
+### 6.3 The vocabularies do not line up, concretely
+
+Even setting aside 6.1–6.2, the trace vocabulary and the P model's own
+event vocabulary are different by design, not by oversight:
+
+- The §3.7 trace vocabulary journals a bare `PeerApply` per apply — e.g.
+  `specs/fixtures/replication-conforming.ndjson` (branch
+  `feat/specs-replication-trace-sibling`, PR #195, not yet merged):
+  `{"node":"n2","seq":0,"event":"PeerApply"}`. `Node.p`'s `eForward`
+  handler — the closest analog — never announces anything named
+  `PeerApply`. It deliberately splits that single trace-vocabulary action
+  into two separate scaffolding announcements, `eFenceDecision` and
+  `eGapDecision` (§3.1's own `eForward` row), built specifically so
+  `FencedZombie`/`GapFreedom` can "recompute... an independent ground
+  truth" rather than "read `Node.p`'s own internal... map directly"
+  (`Spec.p`'s own header comments, quoted in §3.1) — i.e. these events are
+  test-instrumentation for the spec's own non-tautological-checking
+  discipline, not a mirror of the implementation's journaled action names.
+- `Receipt` is a journaled outcome name in the trace vocabulary, but in
+  `Node.p` it is a plain point-to-point `send` (`send fwd.origin, eReceipt,
+  ...`), never `announce`d — §3.1's own table already notes "no spec reads
+  `holders` directly, or observes `eReceipt` itself." Per §6.2, a monitor
+  can only ever see an `announce`d event, so `Receipt` as a checkable
+  log-conformance point does not exist on the P side today, full stop —
+  not narrower, absent.
+- §3.2 and §4.4 above already establish that most of `docs/trace-mapping.md`'s
+  27-variant vocabulary — `DedupCheck`, `Throttle`, `Refuse`, `SealPart`,
+  `PutPart`, all three `LakeCommit*` outcomes, `Reconcile`, `Expire`,
+  `Demote`, `Evict`, `DropWindow`, `SnapshotSeal`, `EvolveSchema`,
+  `DeclareLoss` — has zero representation anywhere in `p/Replication/*.p`.
+  `Ingest.tla`/`Drain.tla`/`Schema.tla` have no P counterpart at all (§1).
+  A P-side check could, at absolute best, ever evaluate the
+  Forward/Receipt/FenceBoot/Heartbeat/ClaimAdvertise/TakeoverDrain/
+  DegradedBoot slice §3.1 already documents as fused, narrowed, or
+  partially represented — never "the same trace vocabulary" ADR-0012 step
+  5 describes both validators consuming.
+
+### 6.4 No live-captured Replication trace exists to feed it, either
+
+`specs/fixtures/replication-manifest.toml`'s own header (same branch, PR
+#195) says plainly: every Replication fixture is "HAND-AUTHORED, not
+captured from a real `duckspout-replication` run — no such implementation
+exists yet," and calls the fixture set itself "useful only as a self-test
+of the refinement checker, not the genuine conformance value a trace
+sibling exists to provide." Unlike `Ingest` (`duckspout-daemon`'s
+`tests/trace_capture.rs`, exercised live by `trace-conformance.mjs`'s tier
+2), Replication has no live-capture path yet even on the TLA+ side. The
+traces a P-side check would need are, today, hand-authored placeholders on
+the sibling this issue was told to build on — one more reason to not build
+a second consumer of them yet.
+
+### 6.5 What a from-scratch harness would actually require
+
+Building the translation/replay route ourselves (option (b) the issue
+named) is not impossible, but it is disproportionate to what exists today:
+
+1. New `announce` instrumentation in the checker-validated `Node.p` model
+   for events that are today deliberately internal or point-to-point only
+   (a unified `PeerApply` name; `Receipt`) — a change to an *already
+   checked* model, needing re-verification that it does not perturb the
+   six existing specs' semantics (§4.4).
+2. A translation/codegen layer mapping the NDJSON's untyped node-id
+   strings and (at least in the hand-authored fixture above) argument-free
+   event records onto `p/Replication`'s minimal int-keyed, 2-node scenario
+   shape — a mechanism with no existing convention to extend (`tla.mjs
+   tv`'s declarative walk does not generalize to P's operational model,
+   §6.2), effectively a second, independent trace-consumer built from
+   nothing.
+3. Even after (1) and (2), the result would only ever validate the narrow
+   slice named in §6.3 — not "the same trace vocabulary" both validators
+   are supposed to consume per ADR-0012's own framing. Shipping that as
+   "P log-conformance" would be *less* honest than not shipping it: it
+   would look, from the ledger, like step 5's parity promise is met when
+   most of any real trace's lines are silently outside what the P side
+   could ever reject.
+
+### 6.6 Disposition
+
+This is ADR-0012 §5's own **Class 4** ("mechanical cross-check
+failure... if step 5's P-side conformance proves impractical") by its own
+definition, and the ADR's "Revisit when" section names the exact condition
+met here: "Step 5's P-side conformance proves impractical (no reliable
+log-conformance path) — the pipeline's honesty depends on it; without it,
+fall back to ADR-0011's evidence-triggered posture." §5 itself is explicit
+that Class 4 "is a methodology-level decision (owner ruling), not
+something a single PR resolves" — so this section records the finding and
+its evidence rather than forcing an implementation whose real coverage
+would misrepresent what step 5 promises, and rather than amending
+ADR-0012 (protected set, `docs/adr/`) unilaterally.
+
+**Recommendation to the owner**: invoke ADR-0012's revisit clause for step
+5's P half specifically (TLC trace refinement, §8.2, is unaffected — it
+has no equivalent architectural gap). `docs/arming-ledger.toml`'s
+`p-replication` row (`status = "staged"`, issue #131) governs `just
+p-check` — the model-*checking* gate — not log-conformance; no
+log-conformance ledger row was ever created, so nothing needs un-arming.
+If the owner instead wants the harness attempted despite §6.5's cost, that
+list is the starting scope for the follow-up issue this section would
+otherwise leave unfiled.
