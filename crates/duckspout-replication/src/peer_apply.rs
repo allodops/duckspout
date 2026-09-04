@@ -79,11 +79,18 @@
 //!   schema-evolution machinery exists in this crate yet; a peer here
 //!   applies every forwarded range's rows opaquely.
 //! - The late-arrival immediate-takeover check (`p/Replication/Node.p`'s
-//!   `eForward` handler: `peerDead && !degraded && ...`) and
-//!   `ClaimAdvertise`'s registry row — both are issue #54's
-//!   (`Node death end-to-end: TakeoverDrain + DeclareLoss`) and #53's
-//!   (`Incarnation fencing + registry claims`) scope respectively, not
-//!   this issue's.
+//!   `eForward` handler: `peerDead && !degraded && ...`) is issue #54's
+//!   (`Node death end-to-end: TakeoverDrain + DeclareLoss`) scope, not this
+//!   issue's. `ClaimAdvertise`'s registry row (issue #53) is [`crate::claims::ClaimTracker`]
+//!   — a decoupled primitive this function deliberately does not call
+//!   itself (module docs of `crate::claims` explain why: this crate cannot
+//!   reach the OWNER-side apply path, and keeping `apply_forward`'s own
+//!   ACPR-hardened guard chain free of a registry dependency keeps this hot
+//!   path's contract unchanged); a caller invokes
+//!   [`crate::claims::ClaimTracker::advertise_if_new`] after observing
+//!   [`PeerApplyOutcome::Applied`] here, exactly as `Node.p`'s own
+//!   `eForward` handler calls its inline claim check immediately after its
+//!   gap-freedom branch accepts.
 //! - `Rung(m) < 3`'s hard-overload refusal of NEW ranges (catch-up ranges
 //!   still apply) — the overload ladder is `duckspout-staging`'s existing
 //!   machinery (§4.5); wiring it into `PeerApply` needs the concrete

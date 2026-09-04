@@ -878,3 +878,105 @@ pub trait LakeCommitter: Send + Sync {
     /// [`LakeError`] for backend-invariant failures.
     fn attach_info(&self) -> BoxFuture<'_, Result<AttachInfo, LakeError>>;
 }
+
+// ---------------------------------------------------------------------------
+// Registry (v0.2)
+// ---------------------------------------------------------------------------
+
+/// The role a [`Registry::advertise_claim`] row asserts (§5.5): whether the
+/// advertising node holds the partition as ring OWNER (drains it) or as a
+/// replica (applies/receipts only, never drains). Mirrors
+/// `p/Replication/Node.p`'s `tRole` (`OWNER`/`REPLICA`) — the same two-role
+/// vocabulary, Rust-typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClaimRole {
+    /// This node is the partition's ring owner — the one that drains it
+    /// (§5.3: "Only owners drain").
+    Owner,
+    /// This node holds a replica copy only.
+    Replica,
+}
+
+/// A [`Registry`] failure. Distinguishes catalog **unreachability** — the
+/// one condition `FenceBoot`'s `DegradedBoot` split (§5.7) is keyed on —
+/// from every other backend failure, which a caller does not know how to
+/// interpret as "fall back to degraded" and must instead propagate
+/// (ambiguity fails closed, CONSTITUTION.md §11's frame).
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    /// The catalog cannot be reached right now (§9's disclosed catalog
+    /// outage) — transient by definition, retried on the next `FenceBoot`
+    /// attempt (a degraded or waiting node's promotion) rather than treated
+    /// as permanent.
+    #[error("registry unreachable: {0}")]
+    Unreachable(String),
+    /// A definitive backend failure — anything that is NOT "the catalog
+    /// cannot be reached." Never conflated with [`RegistryError::Unreachable`]:
+    /// R-8's advisory-only guarantee protects correctness from a *stale*
+    /// registry, not from a caller that mistakes a genuine backend error for
+    /// a transient outage and silently boots degraded when it should have
+    /// failed loudly instead.
+    #[error("registry backend: {0}")]
+    Backend(String),
+}
+
+/// The catalog/registry port (§5.5, §5.7, D-2, R-8): advisory discovery
+/// only — a wrong or stale answer here costs a redirect or a slower
+/// resolution, never a wrong result (R-8's own text: "correctness authority
+/// lives in watermarks, manifests, and the drain guard — all reconstructible,
+/// none advisory"). Two operations, both against the catalog DB's
+/// `nodes`/`claims` tables (`docs/design/replication.md` §5.5):
+///
+/// - [`Registry::next_incarnation`] is `FenceBoot`'s own catalog-sequence
+///   draw (§5.7): "the node draws a fresh incarnation from a catalog-DB
+///   sequence." The sequence is shared by every node, not scoped per
+///   `node` — a freshly drawn value is guaranteed greater than every
+///   incarnation ANY node has ever drawn, not merely greater than this
+///   node's own prior value (`specs/DuckSpoutCore.tla`'s `FenceBoot`:
+///   `catalogSeq' = catalogSeq + 1; inc' = [inc EXCEPT ![n] = catalogSeq +
+///   1]` — one global counter, not `inc[n] + 1`). `node` is carried purely
+///   for the catalog's own bookkeeping (§5.7: "the catalog track\[s\] the
+///   highest incarnation seen per node"), not because the sequence itself
+///   is partitioned by node.
+/// - [`Registry::advertise_claim`] is `ClaimAdvertise` (§5.5): "published as
+///   a side effect of `PeerApply`... No separate claim protocol, no claim
+///   heartbeat distinct from the node heartbeat." Callers are responsible
+///   for the "first apply for a partition this node has no claim row for"
+///   idempotency check themselves before ever calling this — this port
+///   performs no deduplication of its own, exactly as [`ReplicaLog`]
+///   performs no guard evaluation of its own.
+///
+/// Home crate: none yet. A concrete Postgres-backed implementation and its
+/// daemon-composition wiring (including replacing
+/// `duckspout-daemon::system::V01_FIXED_INCARNATION` with a real
+/// `FenceBoot` draw) are deliberately deferred to a follow-up issue —
+/// matching how [`ReplicaLog`]'s own concrete implementation was deferred
+/// past #51 (issue #193's precedent).
+pub trait Registry: Send + Sync {
+    /// Draws this node's next incarnation from the catalog's shared
+    /// monotonic sequence (§5.7), durably recorded there before it returns.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::Unreachable`] when the catalog cannot be reached —
+    /// `FenceBoot`'s degraded/waiting split (§5.7) is keyed on exactly this
+    /// variant. [`RegistryError::Backend`] for any other definitive
+    /// failure, which a caller must not treat as an outage.
+    fn next_incarnation(&self, node: &NodeId) -> BoxFuture<'_, Result<u64, RegistryError>>;
+
+    /// Publishes an advisory claim row (§5.5): `partition -> (node, role)`.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError`] — the row was not published. Claims are advisory
+    /// (R-8): a caller may treat this as a harmless miss (the claim is
+    /// simply late or absent until a future apply re-triggers the
+    /// advertisement) rather than fail the write path it rode in on — this
+    /// port does not itself mandate a retry policy.
+    fn advertise_claim(
+        &self,
+        partition: &PartitionId,
+        node: &NodeId,
+        role: ClaimRole,
+    ) -> BoxFuture<'_, Result<(), RegistryError>>;
+}
