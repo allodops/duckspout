@@ -38,6 +38,15 @@ machine Node {
   // every message type from a sender through one incarnation counter, not
   // one counter per message kind.
   var highestSeen: map[int, int];
+  // §5.4/GapFreedom (docs/design/replication.md §4; `specs/
+  // DuckSpoutCore.tla`'s `AppliedThru`): the highest `seq` this node has
+  // contiguously applied so far from each sender, keyed by the sender's
+  // *logical* `nodeId` -- same keying convention as `highestSeen` above,
+  // and the same rationale (a rebooted sender is a new machine reference,
+  // but the SAME logical origin whose sequence must stay contiguous
+  // across that reboot). Absent key means 0 (nothing applied yet from
+  // that sender), matching `highestSeen`'s own default-0 convention.
+  var appliedThru: map[int, int];
   // §5.5/§6.1: the last round this node received an `eHeartbeat` from its
   // peer (0 default -- indistinguishable from "never received one," which
   // is exactly the state a peer that never heartbeats should be in).
@@ -180,7 +189,7 @@ machine Node {
         announce eClaimAdvertise, (key = req.key, node = this, role = OWNER);
       }
       announce eAccepted, (key = req.key, sq = req.sq);
-      send peer, eForward, (key = req.key, sq = req.sq, origin = this, originId = nodeId, inc = incarnation);
+      send peer, eForward, (key = req.key, sq = req.sq, originSeq = req.originSeq, origin = this, originId = nodeId, inc = incarnation);
     }
 
     // §5.7 fencing gate: a Forward carrying an incarnation strictly below
@@ -192,9 +201,68 @@ machine Node {
     // observe the decision either way) and `eForwardHandled` (so
     // `NoAckedLoss`'s marker bookkeeping, unrelated to fencing, is
     // unaffected by whether this particular Forward was fenced).
-    on eForward do (fwd: (key: int, sq: int, origin: Node, originId: int, inc: int)) {
+    //
+    // §5.4/GapFreedom gate: nested inside the fencing accept branch,
+    // matching `specs/DuckSpoutCore.tla`'s `PeerApply` -- both guards are
+    // one joint conjunction there (a message that fails fencing never
+    // reaches gap evaluation at all), so a zombie's `originSeq` is never
+    // even considered here. NOT a fully atomic conjunction end to end,
+    // though, unlike TLA+'s single-step `PeerApply`: `highestSeen` is
+    // updated the moment fencing passes, above, strictly before this gap
+    // evaluation runs -- so a message that passes fencing but is then
+    // gap-refused below still leaves the fencing table advanced. TLA+'s
+    // `PeerApply` guard is a true conjunction: either every guard holds
+    // and every update happens together, or none of them do. This
+    // asymmetry is practically benign in every scenario this file
+    // exercises today (nothing depends on `highestSeen` NOT advancing on
+    // a gap-refused message), but it is real, so it is recorded here
+    // honestly rather than implied away by the "one joint conjunction"
+    // framing above, which is true of the fencing/gap relationship, not
+    // of this handler's state changes as a whole.
+    //
+    // Three outcomes, matching docs/design/replication.md §4's
+    // `PeerApply` row exactly. `originSeq` is a dense per-(origin,
+    // partition) sequence assigned ONCE per record, at StageCommit (§4;
+    // this model has no partition dimension, so per logical origin only,
+    // see `originSeq`'s own comment in Events.p) -- an honestly-behaving
+    // origin's own bookkeeping therefore never assigns the same
+    // `originSeq` to two different records, so "`originSeq` at or below
+    // this sender's applied watermark" and "a retransmit/redelivery of the
+    // SAME record already applied" are the same fact from an honest
+    // origin, not two facts this handler has to separately verify against
+    // each other:
+    //   - `originSeq` at or below the watermark is an idempotent
+    //     duplicate -- acked (receipt sent) without re-applying, no
+    //     restaging, no re-advertise, no takeover check (the ORIGINAL
+    //     application of that seq already had its one chance at those).
+    //     Guarded additionally on `fwd.key in staged` (matching
+    //     `specs/DuckSpoutCore.tla`'s `Receipt(m, r)` precondition, `r \in
+    //     staged[m]`): a genuine duplicate's key was necessarily staged
+    //     the first time this `originSeq` was applied, so this guard is a
+    //     no-op for an honest origin's real retransmit, and exists purely
+    //     so this handler cannot fabricate a receipt for a key it never
+    //     actually holds if that per-origin invariant is ever violated (by
+    //     a test fixture, or a future scenario) -- see #192's ACPR finding
+    //     that surfaced this: an earlier revision of `TestFenceBootZombie`
+    //     violated the invariant directly (a zombie reusing an already-
+    //     used `originSeq` for a DIFFERENT key), which both fabricated a
+    //     receipt for a key never staged here AND could silently drop the
+    //     genuinely-new key's own Forward, treating it as if it were that
+    //     duplicate -- fixed at the test-data level (TestDriver.p) since
+    //     the real bug was the fixture, not this handler, but this guard
+    //     stays as cheap, correct defense matching TLA+'s exact
+    //     precondition regardless.
+    //   - `originSeq` exactly one past the watermark is the new next
+    //     record -- applied, watermark advances, same
+    //     staged/claim/receipt/takeover-check shape `eForward` already had
+    //     before this guard existed.
+    //   - `originSeq` any further ahead would leave a gap and is refused
+    //     outright, same as a fenced zombie -- no apply, no claim, no
+    //     receipt, no takeover.
+    on eForward do (fwd: (key: int, sq: int, originSeq: int, origin: Node, originId: int, inc: int)) {
       var seen: int;
       var accept: bool;
+      var thru: int;
       seen = 0;
       if (fwd.originId in highestSeen) {
         seen = highestSeen[fwd.originId];
@@ -203,19 +271,39 @@ machine Node {
       announce eFenceDecision, (receiver = this, senderId = fwd.originId, inc = fwd.inc, accepted = accept);
       if (accept) {
         highestSeen[fwd.originId] = fwd.inc;
-        staged += (fwd.key);
-        if (!(fwd.key in claims)) {
-          claims[fwd.key] = REPLICA;
-          announce eClaimAdvertise, (key = fwd.key, node = this, role = REPLICA);
+        thru = 0;
+        if (fwd.originId in appliedThru) {
+          thru = appliedThru[fwd.originId];
         }
-        send fwd.origin, eReceipt, (key = fwd.key, sq = fwd.sq, holder = this, holderId = nodeId, inc = incarnation);
-        // This inline immediate-takeover check (a late Forward arriving
-        // after the peer is already known dead) does not route through
-        // `sweepOrphanedKeys` -- it needs its own §7 DegradedBoot guard
-        // for the same reason: no ownership action while `degraded`.
-        if (peerDead && !degraded && !(fwd.key in committed)) {
-          committed += (fwd.key);
-          announce eTakeoverDrain, (key = fwd.key, sq = fwd.sq, newOwner = this);
+        if (fwd.originSeq <= thru) {
+          // Idempotent duplicate (§4 PeerApply): ack without re-applying
+          // -- only if this key is genuinely the one already staged for
+          // this (sender, originSeq); see the header comment above for
+          // why an honest origin never reaches the `else` of this `if`,
+          // and why the guard still belongs here regardless.
+          if (fwd.key in staged) {
+            send fwd.origin, eReceipt, (key = fwd.key, sq = fwd.sq, holder = this, holderId = nodeId, inc = incarnation);
+          }
+        } else if (fwd.originSeq == thru + 1) {
+          announce eGapDecision, (receiver = this, senderId = fwd.originId, originSeq = fwd.originSeq, accepted = true);
+          appliedThru[fwd.originId] = fwd.originSeq;
+          staged += (fwd.key);
+          if (!(fwd.key in claims)) {
+            claims[fwd.key] = REPLICA;
+            announce eClaimAdvertise, (key = fwd.key, node = this, role = REPLICA);
+          }
+          send fwd.origin, eReceipt, (key = fwd.key, sq = fwd.sq, holder = this, holderId = nodeId, inc = incarnation);
+          // This inline immediate-takeover check (a late Forward arriving
+          // after the peer is already known dead) does not route through
+          // `sweepOrphanedKeys` -- it needs its own §7 DegradedBoot guard
+          // for the same reason: no ownership action while `degraded`.
+          if (peerDead && !degraded && !(fwd.key in committed)) {
+            committed += (fwd.key);
+            announce eTakeoverDrain, (key = fwd.key, sq = fwd.sq, newOwner = this);
+          }
+        } else {
+          // Gap refusal (§4 PeerApply / GapFreedom): fwd.originSeq > thru + 1.
+          announce eGapDecision, (receiver = this, senderId = fwd.originId, originSeq = fwd.originSeq, accepted = false);
         }
       }
       announce eForwardHandled, (key = fwd.key, sq = fwd.sq);
@@ -224,6 +312,45 @@ machine Node {
     // Same §5.7 gate, other direction: a Receipt carrying a stale
     // incarnation from its holder is fenced out too -- no holder-count
     // bump, no client ack triggered off it.
+    //
+    // `rc.key in holders` (added alongside GapFreedom): a real node can
+    // never receive a Receipt for a key it did not itself originate a
+    // Forward for -- `holders[key]` is unconditionally set the moment
+    // `eWriteReq`'s handler sends that Forward, strictly before any reply
+    // to it could exist. The actual reachable cause of the crash this
+    // guard fixes (a `KeyNotFoundException` on `holders[key]`, found
+    // authoring `TestGapFreedom`, TestDriver.p) is a benign P scheduling
+    // artifact, not a real node receiving a Receipt for a key it never
+    // originated: `TestGapFreedom`'s retransmit is injected directly under
+    // a still-alive origin (`sender2`) rather than routed through
+    // `sender2`'s own handler, so the Receipt it can trigger is not
+    // causally downstream of `sender2`'s own `eWriteReq` at all --
+    // `sender2` can dequeue that Receipt before it dequeues its own
+    // `eWriteReq` (sent by a different machine, the spawned `Client`; P
+    // gives no FIFO guarantee between messages from different senders),
+    // i.e. before `holders[key]` was ever set for that key. Every prior
+    // scenario's directly-injected Forward either reused a key its
+    // claimed origin HAD already durably accepted (`TestTakeoverDrain`'s
+    // retransmit) or targeted an origin already fenced out or already
+    // dead by the time any reply could return (`TestFenceBootZombie`'s
+    // zombie), so this gap in `eReceipt`'s robustness was real but latent,
+    // unreachable until `TestGapFreedom` exercised it. This guard is
+    // defensive hardening matching how a real node would actually behave
+    // -- a Receipt correlated with nothing locally tracked is simply not
+    // actionable, the same "drop what cannot be recognized" stance
+    // `Node.p`'s `Waiting` state already takes for messages arriving with
+    // no identity to evaluate them against. It IS, however, a narrowing
+    // that matters to one checked property: `FencedZombie` observes this
+    // handler's own `eFenceDecision` announcement two lines above, and
+    // that stays unconditional regardless of this guard -- so
+    // `highestSeen`'s fencing-table update below is kept under `accept`
+    // ALONE, matching what is actually announced; only the holder-count/
+    // client-ack bookkeeping that genuinely needs `rc.key` to exist is
+    // gated on `rc.key in holders`. Gating the fencing-table update too
+    // would silently diverge what `eFenceDecision` announces (accepted)
+    // from what this node actually records, exactly the shape that
+    // produces spurious `FencedZombie` violations or masks real ones. No
+    // spec reads `holders` directly, or observes `eReceipt` itself.
     on eReceipt do (rc: (key: int, sq: int, holder: Node, holderId: int, inc: int)) {
       var seen: int;
       var accept: bool;
@@ -235,9 +362,11 @@ machine Node {
       announce eFenceDecision, (receiver = this, senderId = rc.holderId, inc = rc.inc, accepted = accept);
       if (accept) {
         highestSeen[rc.holderId] = rc.inc;
-        holders[rc.key] = holders[rc.key] + 1;
-        if (holders[rc.key] >= 2 && rc.key in pendingClient) {
-          send pendingClient[rc.key], eWriteAck, (key = rc.key, sq = rc.sq);
+        if (rc.key in holders) {
+          holders[rc.key] = holders[rc.key] + 1;
+          if (holders[rc.key] >= 2 && rc.key in pendingClient) {
+            send pendingClient[rc.key], eWriteAck, (key = rc.key, sq = rc.sq);
+          }
         }
       }
     }

@@ -67,7 +67,7 @@ topology once takeover fires is not (§4.3).
 |---|---|---|
 | `eLink` (`Events.p`, wiring) | — | No TLA+ counterpart. Pure P scaffolding: P machines need an explicit peer reference because spawn order is circular; TLA+ nodes are just elements of the `Nodes` set and `RingPeers(p, n) == Nodes \ {n}` needs no wiring step. |
 | `eWriteReq` handler (`Node.p`: `staged += key`, `holders[key] = 1`, `announce eAccepted`, `send peer, eForward`) | `Accept(n, q)` **+** `StageCommit(n, q)` **+** the origin's own `Forward(n, m, r)`, fused | TLA+ keeps admission (`Accept`, gated on `Rung(n) < 2`, `WindowClosed`), durable write (`StageCommit`), and the replication send (`Forward`) as three separately-interleavable actions, with `DedupCheck(n, q)` able to intervene between them (replay or throttle a duplicate). P's single scenario has one client, one key, so it collapses all of this into one atomic handler and has **no `DedupCheck` analog at all** — there is no dedup-key concept in the P model. There is also no ladder (`SoftLim`/`ThrottleLim`/`HardLim`/`Rung`) and no `WindowClosed` gating; every P write is unconditionally admitted. |
-| `eForward` handler (`Node.p`: `staged += key`, `send origin, eReceipt`, conditionally `committed += key` + `announce eTakeoverDrain`, `announce eForwardHandled`) | `PeerApply(m, g)` **+** `Receipt(m, r)`, fused (plus the late-arrival branch of `TakeoverDrain`, see §3.2) | `PeerApply`'s guards — fencing (`g.inc >= highestSeen[m][g.rec.origin]`), gap-refusal (`g.rec.seq = AppliedThru(...) + 1`), `SchemaKnown`, the hard-rung refusal — have **no P counterpart**. P applies every forwarded record unconditionally. `Receipt` in TLA+ is a separately-schedulable action (a peer can hold an applied record for a while before receipting it); in P, receipting happens inline in the same handler that applies the record — no interleaving between "applied" and "receipted" is representable. |
+| `eForward` handler (`Node.p`: fencing gate first (`accept = fwd.inc >= highestSeen[originId]`; `announce eFenceDecision` either way, no further processing if fenced out); when fenced in, a three-way branch on `originSeq` vs. the sender's `appliedThru` watermark — idempotent duplicate (`originSeq <= thru`: `send eReceipt` only if `fwd.key in staged`, no restaging, no re-advertise, no takeover check), genuine next record (`originSeq == thru + 1`: `announce eGapDecision(accepted=true)`, `appliedThru` advances, `staged += key`, claim-advertise once, `send eReceipt`, conditionally `committed += key` + `announce eTakeoverDrain`), or gap refusal (`originSeq > thru + 1`: `announce eGapDecision(accepted=false)`, no apply, no claim, no receipt, no takeover); `announce eForwardHandled` unconditionally at the end regardless of branch) | `PeerApply(m, g)` **+** `Receipt(m, r)`, fused (plus the late-arrival branch of `TakeoverDrain`, see §3.2) | `PeerApply`'s guards: fencing (`g.inc >= highestSeen[m][g.rec.origin]`) **and** gap-refusal (`g.rec.seq = AppliedThru(...) + 1`) now both have a P counterpart (§4.4/§4.5, `GapFreedom`, added alongside `TestGapFreedom`, #132) — `Node.p`'s `eForward` handler tracks a per-sender `appliedThru` watermark and refuses (no apply, no claim, no receipt, no takeover) any `originSeq` that would leave a gap, acknowledging an at-or-below-watermark `originSeq` idempotently without re-applying (and only when the key at that watermark is genuinely the one already staged — #192's ACPR finding 1/2, see `Node.p`'s own comment), matching this section's own `PeerApply` row exactly. `SchemaKnown` and the hard-rung refusal still have **no P counterpart** — P's minimal slice has no schema-lattice or ladder-rung concept at all (§3.2). `Receipt` in TLA+ is a separately-schedulable action (a peer can hold an applied record for a while before receipting it); in P, receipting happens inline in the same handler that applies the record — no interleaving between "applied" and "receipted" is representable. |
 | `eReceipt` handler (`Node.p`: `holders[key] += 1`; if `holders[key] >= 2` and pending, `send eWriteAck`) | `ClientAck(n, q)` (`Cardinality(H) >= RF`) | Faithful in spirit: P's `>= 2` is `Replication.cfg`'s `RF = 2` baked in as a literal rather than carried as a parameter. Granularity differs slightly — TLA+'s `ClientAck` is a distinct action that re-evaluates the guard whenever scheduled (it can be enabled without immediately firing); P re-checks and acts within the same handler invocation that received the triggering receipt. |
 | `eCrashSignal` handler (`Node.p`: `peerDead = true`; sweep `staged \ committed`, `committed += k`, `announce eTakeoverDrain` per key; `announce eCrashSignalHandled`) | **No TLA+ action.** Explicitly an abstraction — see §4.1. | — |
 | `eDie` handler (`Node.p`: `raise halt`) | `CrashNode(n)` (`alive' = FALSE`, `inflight' = {}`, `crashBudget' - 1`; staged/dedup/cache survive — "fsynced state survives (A1)") | Good match for the dying node's own transition. P's halted machine simply stops processing (its `staged`/`committed`/`holders` fields are inert, matching "fsynced state survives" — nothing in this scenario reads a dead node's state again). |
@@ -343,16 +343,23 @@ disposition: a candidate follow-up issue to widen the P model's takeover
 handling into discrete claim/seal/commit steps with guards, not a fix made
 in the PR that added `FencedZombie`'s message-fencing coverage.
 
-### 4.4 Property coverage: TLA+ checks ten invariants and two properties here; P checks five, none a transliteration
+### 4.4 Property coverage: TLA+ checks ten invariants and two properties here; P checks six, none a transliteration
 
-*Updated alongside §4.2, in three steps: `FencedZombie` (`Spec.p`) was a
+*Updated alongside §4.2, in four steps: `FencedZombie` (`Spec.p`) was a
 new third P property, added by the PR that closed the `FenceBoot`/
 `RecoverNode` half of §4.2's original gap. `NoOwnershipWhileDegraded`
 followed as a fourth, added by the PR that closed the `DegradedBoot` half
 — this document's own count here was not updated at the time, an
 inconsistency corrected now rather than carried forward.
 `NoIdentityWhileWaiting` is the fifth, added by the PR that closed §4.2's
-genuinely-new-node-boot gap.*
+genuinely-new-node-boot gap. `GapFreedom` is the sixth, added by the PR
+that closed §3.1's own gap-refusal gap (`TestGapFreedom`, #132; that
+section's `eForward`/`PeerApply` row previously named gap-refusal as
+having no P counterpart while fencing did, and is now corrected in place
+rather than left describing the pre-fix model — not §4.2, which is about
+`FenceBoot`/`RecoverNode`/`DegradedBoot`/new-node-boot and never mentions
+gap-refusal at all; see §4.5 for `GapFreedom`'s own narrative and
+teeth-proof evidence).*
 
 `Replication.cfg` checks all ten of `DuckSpoutCore.tla`'s state invariants
 (`DurableAck`, `NoAckedLoss`, `WatermarkHonesty`, `CacheTransparency`,
@@ -364,14 +371,16 @@ confirmed as a permanently-red finding
 (`specs/broken/Finding_TakeoverOrphanedSeal.cfg`), not a silently-dropped
 check.
 
-`p/Replication/*.p` checks five properties today, none a 1:1
+`p/Replication/*.p` checks six properties today, none a 1:1
 transliteration of a TLA+ invariant:
 
 - `NoAckedLoss.p`'s own header says what kind of correspondence it is:
-  "Mirrors `DuckSpoutCore.tla`'s `NoAckedLoss`/`GapFreedom` in spirit, not
-  text — this is a hand-written P analog, not a transliteration." It is a
-  hybrid, informal analog of *two* of TLA+'s twelve checked properties, not
-  a 1:1 rendering of either.
+  "Mirrors `DuckSpoutCore.tla`'s `NoAckedLoss` in spirit, not text — this
+  is a hand-written P analog, not a transliteration." (Its header used to
+  also claim `GapFreedom` "in spirit," back when `GapFreedom` had no
+  dedicated P analog of its own — see the next bullet; that claim was
+  retired from `NoAckedLoss`'s header once it would have double-counted
+  the same property under two spec names.)
 - `ClaimAdvertiseOnce` (`Spec.p`) has no directly-named TLA+ invariant twin
   at all: `DuckSpoutCore.tla`'s `ClaimAdvertise(n, p)` action's own guard
   prevents redundant advertisement structurally, but nothing in
@@ -404,6 +413,23 @@ transliteration of a TLA+ invariant:
   `eClaimAdvertise`/`eTakeoverDrain` while in `Node.p`'s `Waiting` state,
   checked the same recomputed-ground-truth way as the two properties
   above (from `eWaitingChanged`, not `Node.p`'s own `waitingForFence`).
+- `GapFreedom` (`Spec.p`), the newest, **is** a named analog of
+  `DuckSpoutCore.tla`'s `GapFreedom` invariant — same relationship
+  `FencedZombie` above already has with its own TLA+ namesake: matching
+  name, matching intent (`AppliedThru`'s contiguous-prefix property,
+  enforced by `PeerApply`'s `g.rec.seq = AppliedThru(...) + 1` gap-refusal
+  guard), not a transliteration of TLA+'s set-based `S \cup D =
+  1..Cardinality(S \cup D)` formula. Checked the same
+  recomputed-ground-truth way as `FencedZombie`/`NoOwnershipWhileDegraded`/
+  `NoIdentityWhileWaiting` above: from the announced `eGapDecision` stream
+  (`Node.p`'s own `eForward` handler, one per sender per evaluated
+  `originSeq`), not from `Node.p`'s internal `appliedThru` map directly.
+  Its scope is narrower than TLA+'s in the same two ways `FencedZombie`'s
+  already is: no partition dimension (this model has none at all, so it
+  is per logical origin only) and message-level only — the `SchemaKnown`
+  and hard-rung-refusal guards `PeerApply` also conjoins gap-refusal with
+  remain unmodeled (§3.2, this section's `eForward`/`PeerApply` row
+  above).
 
 The other nine (`DurableAck`, `WatermarkHonesty`, `CacheTransparency`,
 `SingleDrainCommit`, `LossLedgerTruthful`, `SnapshotCovered`,
@@ -411,10 +437,68 @@ The other nine (`DurableAck`, `WatermarkHonesty`, `CacheTransparency`,
 counterpart of any kind today. This is consistent with the P model's own
 commit history describing it as an explicitly scoped-down slice, and this
 map should not be read as implying broader property coverage than these
-five checks — one of which (`FencedZombie`) is itself narrower than its
-TLA+ namesake, per §4.2, and two of which (`NoOwnershipWhileDegraded`,
+six checks — two of which (`FencedZombie`, per §4.2/§4.3; `GapFreedom`,
+per the bullet above and §4.5) are themselves narrower than their TLA+
+namesakes, and two of which (`NoOwnershipWhileDegraded`,
 `NoIdentityWhileWaiting`) check boot-time behavior TLA+ represents only
-partially or not at all, per the same section.
+partially or not at all, per §4.2.
+
+### 4.5 GapFreedom, now modeled: closing §3.1's gap-refusal representation gap
+
+*New, added alongside `TestGapFreedom` (#132), with its teeth-proof
+evidence corrected here as part of a subsequent ACPR on the PR that added
+it (#192, finding 4): the originally-reported "100% of schedules" catch
+came from a broken variant that removed BOTH the idempotent-duplicate
+short-circuit AND the `originSeq == thru + 1` gap gate at once, so most of
+that catch rate was `GapFreedom`'s own recomputation failing on the
+duplicate case (`2 != 2 + 1`) before any real gap was ever exercised, not
+gap-refusal specifically. This entry gives the real, isolated number
+instead, and records it here rather than only in a PR body, matching this
+document's own precedent for the other properties added this way (§4.2).*
+
+§3.1's `eForward`/`PeerApply` row used to name gap-refusal (`g.rec.seq =
+AppliedThru(...) + 1`) as the one `PeerApply` guard with **no P
+counterpart** while fencing already had one. `Node.p`'s `eForward` handler
+now tracks a per-sender `appliedThru` watermark and refuses (no apply, no
+claim, no receipt, no takeover) any `originSeq` that would leave a gap —
+see that row's corrected left column for the handler's full current
+branch structure. `GapFreedom` (`Spec.p`) checks this directly, the same
+non-tautological, recomputed-ground-truth way `FencedZombie` already
+established (§4.2): it rebuilds the contiguous-watermark fact purely from
+the announced `eGapDecision` stream, not from `Node.p`'s own internal
+`appliedThru` map, so a `Node.p` that stopped enforcing gap-refusal but
+kept announcing `eGapDecision` honestly would still be caught.
+
+`TestGapFreedom` (`TestDriver.p`) races two `Node` instances, `sender1`
+and `sender2`, sharing one explicit logical origin (`nodeId = 1`, via
+`eFenceBoot` on both — encoded directly rather than left resting on P's
+shared zero-default, per #192's ACPR finding 8), plus a directly-injected
+retransmit of `sender2`'s write, to force genuinely out-of-order delivery
+at `receiver` in some explored schedules — see that scenario's own header
+comment for the full three-way schedule breakdown. `just p-check
+Replication` plus a direct `p check -tc GapFreedom` run both show 0 bugs
+across 5000 explored schedules on the honest model. A second monitor,
+`GapFreedomCoverage` (`Spec.p`, a `hot state` liveness twin added
+alongside this correction, #192 finding 4), also shows 0 bugs across the
+same runs — closing the one blind spot a pure safety assert cannot rule
+out on its own: `GapFreedom`'s assert only ever fires `if (gd.accepted)`,
+so a `Node.p` that refused every `eForward` unconditionally would pass it
+vacuously; `GapFreedomCoverage` demands the scenario actually produce at
+least one genuine accepted `eGapDecision` before it terminates.
+
+A scratch, uncommitted variant that breaks gap-refusal **alone** —
+widening the applied-next gate from `originSeq == thru + 1` to
+`originSeq >= thru + 1`, leaving the idempotent-duplicate branch
+untouched — is caught in **821 of 1000** explored schedules (82.1%), run
+with `p check`'s `--explore` flag to force full exploration past the
+first bug found rather than stopping there. This is the real, isolated
+catch rate for gap-refusal specifically: materially lower than the
+original combined-variant's reported 100%, and lower than 100% for a
+legitimate reason `TestGapFreedom`'s own header comment already
+documents — the safety check only has something to catch on schedules
+where the race actually produces genuine out-of-order delivery at
+`receiver`, which is not every explored schedule (one of the scenario's
+three enumerated orderings never lets a gap occur at all).
 
 ## 5. Divergence protocol
 

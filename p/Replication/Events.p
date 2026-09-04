@@ -1,6 +1,14 @@
 // Payloads and events for the replication takeover-drain scenario.
 
-type tWriteReq = (client: Client, key: int, sq: int);
+// `sq` is the client's own opaque request/ack correlator (matched back on
+// `eWriteAck`) -- reused freely across scenarios (see `TestNewNodeBoot`'s
+// third write, `sq = 1` again for a brand-new origin) with no ordering
+// guarantee of its own. `originSeq` (below, `eForward`) is the *distinct*
+// §5.4/GapFreedom sequence number this scenario adds -- checked, not just
+// carried; see `eForward`'s own comment for why `sq` cannot faithfully
+// double as it. Named `originSeq`, not `seq`, purely because `seq` is a P
+// reserved word (the built-in `seq[T]` collection type).
+type tWriteReq = (client: Client, key: int, sq: int, originSeq: int);
 type tWriteAck = (key: int, sq: int);
 
 // §5.5's two claim roles.
@@ -18,7 +26,35 @@ event eWriteAck: tWriteAck;
 // reference (needed to route the eReceipt reply). `inc` is the sender's
 // incarnation at send time (§5.7: "every message ... carries (node_id,
 // incarnation)").
-event eForward: (key: int, sq: int, origin: Node, originId: int, inc: int);
+// `originSeq` (added for GapFreedom, #132's third named safety property):
+// the §5.4 "dense per-(origin, partition) sequence assigned at
+// StageCommit" (docs/design/replication.md §4) -- this model has no
+// partition dimension, so it is dense per logical *origin* (`originId`)
+// only. Named `originSeq`, not TLA+'s own `seq`, purely because `seq` is
+// a P reserved word (the built-in `seq[T]` collection type) -- no
+// semantic difference intended. Deliberately NOT `sq`: the two are
+// different concepts even where their values happen to coincide -- `sq`
+// is a *client's* own request/ack correlator, opaque to everything except
+// `eWriteAck`'s reply matching, while `originSeq` is an *origin's*
+// durably-persisted per-(origin, partition) sequence, checked for gap
+// contiguity by GapFreedom and load-bearing to `Node.p`'s apply logic.
+// Reusing one field for both would conflate a client-facing identifier
+// with a replication-protocol invariant the client has no part in --
+// itself a KISS/DRY violation in the other direction, not an
+// optimization. (`sq` is, as it happens, asserted on nowhere in this
+// model -- only ever printed -- so reusing the field would not have
+// crashed anything; that is not why a distinct field exists.) The
+// existing scenarios' own `sq` values confirm the concepts were never
+// interchangeable in the first place: `TestNewNodeBoot`'s third write
+// (`replica`'s own first-ever forward) carries `sq = 1` right after a
+// second write carried `sq = 2` -- neither dense nor monotonic per
+// origin, because `sq` was never meant to be. `originSeq` is assigned
+// explicitly at every call site instead (see `TestDriver.p`), standing in
+// for the origin's own durably-persisted `nextSeq[n][p]` counter (§4) --
+// the same "environment supplies persisted state a halted P machine
+// cannot recover on its own" convention `eFenceBoot`'s `priorIncarnation`
+// already establishes for incarnation.
+event eForward: (key: int, sq: int, originSeq: int, origin: Node, originId: int, inc: int);
 // Replica -> Owner: receipt once the forwarded record is durably applied.
 // `holderId`/`inc` mirror `eForward`'s `originId`/`inc` -- same rationale,
 // other direction.
@@ -170,6 +206,30 @@ event eTakeoverDrain: (key: int, sq: int, newOwner: Node);
 // to recognize the *same logical sender* across a reboot, which a machine
 // reference cannot do (a rebooted node is a different machine instance).
 event eFenceDecision: (receiver: Node, senderId: int, inc: int, accepted: bool);
+
+// §5.4 PeerApply's gap-refusal guard (docs/design/replication.md §4;
+// `specs/DuckSpoutCore.tla`'s `GapFreedom`/`g.rec.seq = AppliedThru(...) +
+// 1`): announced by `Node.p`'s `eForward` handler every time it evaluates
+// a NEW (not already-applied-and-idempotently-acked) `originSeq` from a
+// sender that already passed the incarnation fence -- `accepted = true`
+// means this `originSeq` was exactly the receiver's next expected one for
+// that sender and was applied, advancing its watermark; `accepted =
+// false` means it was strictly ahead of that watermark (a gap) and was
+// refused outright. Purpose-built scaffolding for `GapFreedom` (Spec.p),
+// the same independent-ground-truth convention `eFenceDecision`/
+// `eDegradedChanged`/`eWaitingChanged` already establish in this file --
+// see `FencedZombie`'s header comment (Spec.p) for why the spec needs
+// this rather than reading `Node.p`'s own internal `appliedThru` map
+// directly. Deliberately NOT announced for the idempotent-duplicate case
+// (`originSeq` at or below the watermark, acknowledged without
+// re-applying, §4) -- that case neither advances nor gaps the watermark,
+// so it carries no information this spec's contiguity check needs;
+// `GapFreedom`'s independent recomputation would be a no-op either way
+// for it. `senderId` is the sender's logical node identity (see
+// `eFenceBoot`), matching `eFenceDecision`'s own convention, for the same
+// reason: recognizing the same logical sender across a reboot, which a
+// machine reference cannot do.
+event eGapDecision: (receiver: Node, senderId: int, originSeq: int, accepted: bool);
 
 // §5.5: "published as a side effect of PeerApply -- the first apply for a
 // partition the node has no claim row for triggers the insert." Announced
