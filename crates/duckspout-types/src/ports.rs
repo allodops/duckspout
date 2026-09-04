@@ -423,16 +423,66 @@ pub trait ReplicaLog: Send + Sync {
     /// `(origin, partition)` — `0` when nothing has been applied yet. This
     /// is `AppliedThru` (`specs/DuckSpoutCore.tla`) and the receipt
     /// watermark `Receipt` ships (§5.4).
+    ///
+    /// **Must include drained-and-expired-from-staging rows, not only rows
+    /// currently live in the hot table.** `AppliedThru`'s own TLA+
+    /// definition is a union of two sets, not a scan of one:
+    ///
+    /// ```text
+    /// AppliedThru(m, p, o) ==
+    ///   PrefixLen({r.seq : r \in {r2 \in staged[m] : r2.part = p /\ r2.origin = o}}
+    ///               \cup DrainedSeqs(p, o))
+    /// ```
+    /// (`specs/DuckSpoutCore.tla:168-170`; `DrainedSeqs` at `:152-160` is
+    /// every seq some committed-to-the-lake or sanctioned-expired part
+    /// already covers.) A row that has drained out of the hot staging
+    /// table (§6's `DropWindow`) is gone from `staged[m]` but must still
+    /// count toward the applied prefix — otherwise a peer's `applied_thru`
+    /// would regress toward `0` the first time anything it applied drains,
+    /// permanently gap-refusing every subsequent `Forward` from that
+    /// origin (`PeerApply`'s gap check, §5.4, would then see a `seq` far
+    /// past `applied_thru + 1` for rows the peer genuinely already has).
+    /// An implementation backed only by a live scan of the hot table
+    /// (inviting reading, in isolation, `docs/design/replication.md`'s "the
+    /// table is the log" framing) is **non-conformant** with this
+    /// contract — it must also consult whatever durably records drained
+    /// coverage (the window manifest / watermark bookkeeping,
+    /// [`WatermarkBookkeeping::recorded_coverage`]), exactly as
+    /// `DrainedSeqs` does. (ACPR #194 MEDIUM-5 — recorded here, ahead of
+    /// #193's concrete implementation, so a naive/broken version cannot be
+    /// built without directly contradicting this port's own doc comment.)
     fn applied_thru(&self, origin: &NodeId, partition: &PartitionId) -> u64;
 
     /// Whether `seq` for `(origin, partition)` has already been durably
     /// applied. `PeerApply`'s idempotent-duplicate path (`seq <=
     /// applied_thru`) calls this **before** re-receipting rather than
-    /// trusting the incoming Forward's own claim — the defensive guard
-    /// PR #192's ACPR pass added to the P model's `Node.p` after finding
-    /// that an incoming message reusing an already-used `seq` for a
-    /// genuinely different record could otherwise fabricate a receipt for a
-    /// record this peer never actually staged.
+    /// trusting the incoming Forward's own claim.
+    ///
+    /// **What this guards against, honestly (ACPR #194 HIGH-3):** this
+    /// method carries no record identity (no key, no content hash) — it
+    /// cannot distinguish "the same record redelivered" from "a different
+    /// record that happens to claim an already-used `seq`." It is
+    /// defense-in-depth against a `ReplicaLog` backend whose
+    /// [`ReplicaLog::applied_thru`] and `has_applied` answers are mutually
+    /// inconsistent (a backend bug), a state a **conformant**
+    /// implementation can never produce — `applied_thru`'s own contract
+    /// makes it, by definition, the prefix length of exactly the set this
+    /// method answers over, so `seq <= applied_thru` and `has_applied(seq)`
+    /// are the same fact for a conformant backend, not two independently
+    /// checkable ones.
+    ///
+    /// This is explicitly **not** a defense against a same-`seq`,
+    /// different-record collision from a single origin: issue #192's own
+    /// ACPR resolution considered and rejected building seq→key tracking
+    /// for exactly that scenario, reasoning that "an honestly-behaving
+    /// origin can therefore never legitimately assign the same
+    /// `originSeq` to two different keys ... defending against a
+    /// same-origin same-seq different-key collision would be defending
+    /// against a scenario the real protocol cannot produce." An earlier
+    /// revision of this port's own doc comment (and of
+    /// `duckspout-replication`'s `PeerApply` doc/PR text) claimed this
+    /// method guarded against exactly that scenario — that claim was
+    /// false and has been corrected here; #192's reasoning stands.
     fn has_applied(&self, origin: &NodeId, partition: &PartitionId, seq: u64) -> bool;
 
     /// Durably applies `record` into this peer's hot staging table, exactly

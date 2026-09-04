@@ -36,11 +36,49 @@ pub enum ReceiptOutcome {
     /// is unchanged. A partitioned former self's stale receipt must never
     /// be allowed to (dis)count toward `ClientAck`.
     Fenced,
+    /// `receipt.holder == receipt.origin` — a node claiming to have
+    /// receipted its own write. `specs/DuckSpoutCore.tla`'s `Receipt`
+    /// action forbids this structurally (`r.origin # m`, line 319) and
+    /// `AtRF`'s `H` is a SET UNION of `{r.origin}` with the receipted
+    /// holders (line 190) that would silently dedupe a holder equal to
+    /// origin even if one arrived — but `client_ack_ready`'s own counting
+    /// here is a plain per-holder watermark map, which has no such
+    /// built-in dedup: recording a self-receipt would let one node's own
+    /// write count as its own replica, satisfying `client_ack_ready(rf)`
+    /// with zero real peer copies. Refused outright before fencing or the
+    /// watermark map is touched, matching the P model's own defensive
+    /// posture at message boundaries (never a `panic!`/`debug_assert!` —
+    /// a misbehaving or buggy peer's malformed claim is exactly the kind
+    /// of input this protocol boundary must degrade gracefully on, not
+    /// crash the receiving node over). (ACPR #194 HIGH-1.)
+    SelfReceiptRejected,
 }
 
 /// Origin-side receipt bookkeeping: per `(holder, origin, partition)`, the
-/// highest contiguous seq that holder has reported durably applied, plus
-/// the §5.7 fencing this crate applies to every message uniformly.
+/// highest contiguous seq that holder has reported durably applied.
+///
+/// Deliberately owns no [`FenceTable`] of its own (ACPR #194 HIGH-2). §5.7's
+/// `highestSeen` is ONE receiver-held table per node
+/// (`specs/DuckSpoutCore.tla`: `highestSeen: [Nodes -> [Nodes -> Nat]]`,
+/// keyed by receiving node then sender — never by message kind), because a
+/// single physical node plays BOTH roles at once: it is a `PeerApply`
+/// receiver, fencing the origins whose `Forward`s it applies
+/// ([`crate::peer_apply::apply_forward`]), and it is a `Receipt` receiver,
+/// fencing the holders whose receipts it records (here) — and those can be
+/// the very same sender node, just addressing this node through the other
+/// message kind (this node forwards its own writes to that peer, which
+/// receipts back). A zombie sender is a zombie regardless of which message
+/// kind reveals its stale incarnation first, so both paths must consult and
+/// advance the SAME table — exactly how `p/Replication/Node.p` already
+/// shares one `highestSeen` map across its `eForward` and `eReceipt`
+/// handlers. An earlier revision of this tracker owned a private
+/// [`FenceTable`] instead, which meant a sender admitted via the Forward
+/// path was invisible to this path entirely: a zombie holder could
+/// fabricate ack evidence here even though the same physical node had
+/// already been fenced out on the Forward side. [`ReceiptTracker::record`]
+/// therefore takes the caller's shared `&mut FenceTable` as a parameter,
+/// exactly as [`apply_forward`](crate::peer_apply::apply_forward) already
+/// does.
 ///
 /// Keyed by `origin` (not assumed to always be "this node") so one tracker
 /// can, in principle, serve a node acting as the origin for more than one
@@ -49,7 +87,6 @@ pub enum ReceiptOutcome {
 /// matters for this node's own `ClientAck` decisions.
 #[derive(Debug, Default)]
 pub struct ReceiptTracker {
-    fence: FenceTable,
     watermarks: HashMap<(NodeId, NodeId, PartitionId), u64>,
 }
 
@@ -60,19 +97,27 @@ impl ReceiptTracker {
         Self::default()
     }
 
-    /// Records `receipt`, fencing it first (§5.7 — every message, `Receipt`
-    /// included, carries `(node_id, incarnation)` and is checked against the
-    /// highest incarnation already seen from that sender). A receipt whose
-    /// watermark is **lower** than what is already on file for the same
-    /// `(holder, origin, partition)` (an out-of-order-delivered stale
-    /// receipt) never regresses the recorded watermark — cumulative
-    /// acknowledgments only ever advance (§4).
-    pub fn record(&mut self, receipt: ReceiptMessage) -> ReceiptOutcome {
+    /// Records `receipt` against the caller-owned `fence` table (the SAME
+    /// table [`apply_forward`](crate::peer_apply::apply_forward) uses —
+    /// see this struct's own doc comment for why one shared table, not a
+    /// private one, is required). Rejects a self-receipt
+    /// (`receipt.holder == receipt.origin`) outright, then fences (§5.7 —
+    /// every message, `Receipt` included, carries `(node_id, incarnation)`
+    /// and is checked against the highest incarnation already seen from
+    /// that sender, across BOTH message kinds). A receipt whose watermark
+    /// is **lower** than what is already on file for the same `(holder,
+    /// origin, partition)` (an out-of-order-delivered stale receipt) never
+    /// regresses the recorded watermark — cumulative acknowledgments only
+    /// ever advance (§4).
+    pub fn record(&mut self, fence: &mut FenceTable, receipt: ReceiptMessage) -> ReceiptOutcome {
+        if receipt.holder == receipt.origin {
+            return ReceiptOutcome::SelfReceiptRejected;
+        }
         let identity = FenceIdentity {
             node: receipt.holder.clone(),
             incarnation: receipt.incarnation,
         };
-        if matches!(self.fence.admit(&identity), FenceOutcome::Zombie { .. }) {
+        if matches!(fence.admit(&identity), FenceOutcome::Zombie { .. }) {
             return ReceiptOutcome::Fenced;
         }
         let key = (receipt.holder, receipt.origin, receipt.partition);
@@ -134,13 +179,20 @@ impl ReceiptTracker {
 ///
 /// This is the exact predicate `StageOutcome::DuplicateInFlight`'s own doc
 /// comment anticipates ("unreachable at RF = 1 ... the branch exists
-/// because §3's `DedupCheck` has it, and replication (v0.2) makes it live"):
-/// wiring `EngineStager`'s `at_rf` parameter to call through to this
-/// function for `rf > 1` is daemon-composition work, tracked alongside
+/// because §3's `DedupCheck` has it, and replication (v0.2) makes it live").
+/// Wiring `EngineStager`'s `at_rf` parameter to call through to this
+/// function for `rf > 1` is tracked in issue #193 alongside
 /// [`duckspout_types::ReplicaLog`]'s concrete `duckspout-staging`
-/// implementation in issue #193 (this crate cannot make that call itself —
+/// implementation (this crate cannot make that call itself —
 /// `duckspout-staging` depending on `duckspout-replication` would be a
-/// forbidden protocol×protocol edge, ADR-0008).
+/// forbidden protocol×protocol edge, ADR-0008) — but that wiring is more
+/// than daemon-composition: `AT_RF_V01` is a `const` consumed *inside*
+/// `stage_blocking`'s open transaction (`duckspout-staging/src/stager.rs`),
+/// a place a composition root cannot inject into, so making it live needs
+/// an actual port/signature change to `EngineStager`/`StageCommitter` (plus
+/// recovering `last_seq` from `entry.outcome_json` to call this function at
+/// all), not merely plugging this function into an existing seam. (ACPR
+/// #194 MEDIUM-7.)
 #[must_use]
 pub fn client_ack_ready(
     receipts: &ReceiptTracker,
@@ -193,35 +245,44 @@ mod tests {
     /// off-by-one that demanded RF peers on top of the origin.
     #[test]
     fn rf_two_is_ready_after_exactly_one_peer_receipt() {
+        let mut fence = FenceTable::new();
         let mut receipts = ReceiptTracker::new();
         let origin = NodeId::new("origin-1");
         let partition = PartitionId::new("p0");
         assert!(!client_ack_ready(&receipts, &origin, &partition, 10, 2));
 
         assert_eq!(
-            receipts.record(receipt("replica-a", "origin-1", "p0", 1, 10)),
+            receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 10)),
             ReceiptOutcome::Recorded
         );
         assert!(client_ack_ready(&receipts, &origin, &partition, 10, 2));
     }
 
-    /// RF=3 needs TWO distinct receipted peers, not one repeated twice —
-    /// would catch a count that double-counts retransmits from the same
-    /// holder instead of counting distinct holders.
+    /// RF=3 needs TWO distinct receipted peers, not one repeated twice.
+    /// This is a shape-lock / regression-guard on the distinct-holder
+    /// counting shape, not (currently) a test that can fail on an actual
+    /// double-count: `watermarks` is keyed `(holder, origin, partition)`,
+    /// so a retransmit from the SAME holder overwrites its one entry
+    /// rather than adding a second — no mutation of today's code can make
+    /// a same-holder retransmit count twice. It guards the shape a future
+    /// refactor (e.g. a per-receipt log instead of a per-holder map) could
+    /// break. (ACPR #194 LOW-12: corrects this comment's earlier claim
+    /// that it "would catch a count that double-counts retransmits.")
     #[test]
     fn rf_three_needs_two_distinct_peers_not_one_peer_twice() {
+        let mut fence = FenceTable::new();
         let mut receipts = ReceiptTracker::new();
         let origin = NodeId::new("origin-1");
         let partition = PartitionId::new("p0");
 
-        receipts.record(receipt("replica-a", "origin-1", "p0", 1, 10));
-        receipts.record(receipt("replica-a", "origin-1", "p0", 1, 10)); // retransmit
+        receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 10));
+        receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 10)); // retransmit
         assert!(
             !client_ack_ready(&receipts, &origin, &partition, 10, 3),
             "one peer, receipted twice, must not count as two"
         );
 
-        receipts.record(receipt("replica-b", "origin-1", "p0", 1, 10));
+        receipts.record(&mut fence, receipt("replica-b", "origin-1", "p0", 1, 10));
         assert!(client_ack_ready(&receipts, &origin, &partition, 10, 3));
     }
 
@@ -230,29 +291,34 @@ mod tests {
     /// merely "some receipt exists."
     #[test]
     fn a_peer_short_of_the_needed_seq_does_not_count() {
+        let mut fence = FenceTable::new();
         let mut receipts = ReceiptTracker::new();
         let origin = NodeId::new("origin-1");
         let partition = PartitionId::new("p0");
-        receipts.record(receipt("replica-a", "origin-1", "p0", 1, 5));
+        receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 5));
         assert!(!client_ack_ready(&receipts, &origin, &partition, 10, 2));
-        receipts.record(receipt("replica-a", "origin-1", "p0", 1, 10));
+        receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 10));
         assert!(client_ack_ready(&receipts, &origin, &partition, 10, 2));
     }
 
     /// A zombie (fenced) receipt must not raise the recorded watermark —
     /// `FencedZombie` applied to the receipt side of the protocol: a
     /// partitioned former self's stale receipt cannot manufacture ack
-    /// evidence for a range it was never actually caught up on.
+    /// evidence for a range it was never actually caught up on. Also
+    /// belongs with the fencing/receipt tests, not (as the PR body
+    /// previously mis-categorized it) under "Idempotent-duplicate" (ACPR
+    /// #194 LOW-11).
     #[test]
     fn a_fenced_receipt_does_not_advance_the_watermark() {
+        let mut fence = FenceTable::new();
         let mut receipts = ReceiptTracker::new();
         assert_eq!(
-            receipts.record(receipt("replica-a", "origin-1", "p0", 2, 10)),
+            receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 2, 10)),
             ReceiptOutcome::Recorded
         );
         // A stale incarnation, even claiming a HIGHER watermark, is fenced.
         assert_eq!(
-            receipts.record(receipt("replica-a", "origin-1", "p0", 1, 999)),
+            receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 999)),
             ReceiptOutcome::Fenced
         );
         assert_eq!(
@@ -268,11 +334,15 @@ mod tests {
     /// An out-of-order-delivered receipt under the SAME (non-stale)
     /// incarnation, reporting a lower watermark than one already recorded,
     /// must not regress it — cumulative acknowledgments only ever advance.
+    /// This test belongs with the `receipt.rs` fencing tests, not (as the
+    /// PR body previously mis-categorized it) under "Fencing" in a way
+    /// that implied it lived in `fencing.rs` (ACPR #194 LOW-11).
     #[test]
     fn watermark_never_regresses_under_the_same_incarnation() {
+        let mut fence = FenceTable::new();
         let mut receipts = ReceiptTracker::new();
-        receipts.record(receipt("replica-a", "origin-1", "p0", 1, 10));
-        receipts.record(receipt("replica-a", "origin-1", "p0", 1, 4));
+        receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 10));
+        receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 4));
         assert_eq!(
             receipts.holder_applied_thru(
                 &NodeId::new("replica-a"),
@@ -288,8 +358,9 @@ mod tests {
     /// (or another origin's) `ClientAck` decision.
     #[test]
     fn receipts_are_scoped_per_origin_and_partition() {
+        let mut fence = FenceTable::new();
         let mut receipts = ReceiptTracker::new();
-        receipts.record(receipt("replica-a", "origin-1", "p0", 1, 10));
+        receipts.record(&mut fence, receipt("replica-a", "origin-1", "p0", 1, 10));
         assert!(!client_ack_ready(
             &receipts,
             &NodeId::new("origin-1"),
@@ -306,6 +377,76 @@ mod tests {
         ));
     }
 
+    /// ACPR #194 HIGH-1 scratch-repro re-verification: a receipt claiming
+    /// `holder == origin` — a node "receipting" its own write — is
+    /// rejected outright and never reaches the watermark map, so it can
+    /// never contribute toward `client_ack_ready`. Before this guard
+    /// existed, recording exactly one such receipt made
+    /// `client_ack_ready(rf = 2)` report `true` with ZERO real replicas —
+    /// this is the exact fabricated-durability scratch test the ACPR
+    /// finding constructed.
+    #[test]
+    fn a_receipt_claiming_holder_equals_origin_is_rejected_and_never_counts() {
+        let mut fence = FenceTable::new();
+        let mut receipts = ReceiptTracker::new();
+        let origin = NodeId::new("origin-1");
+        let partition = PartitionId::new("p0");
+
+        let outcome = receipts.record(&mut fence, receipt("origin-1", "origin-1", "p0", 1, 10));
+        assert_eq!(outcome, ReceiptOutcome::SelfReceiptRejected);
+        assert!(
+            !client_ack_ready(&receipts, &origin, &partition, 10, 2),
+            "a self-receipt must not fabricate ack evidence at any RF > 1"
+        );
+        assert_eq!(
+            receipts.holder_applied_thru(&origin, &origin, &partition),
+            0,
+            "a rejected self-receipt must not enter the watermark map at all"
+        );
+    }
+
+    /// ACPR #194 HIGH-2 scratch-repro re-verification: the SAME
+    /// [`FenceTable`] the Forward-handling path (`apply_forward`) advances
+    /// is visible to and enforced on the Receipt-handling path. A sender
+    /// already known (via a Forward this node applied) to be at
+    /// incarnation 5 cannot later "receipt" this node at incarnation 1 —
+    /// even though `ReceiptTracker` has never itself seen that sender,
+    /// because it shares the table rather than owning a private one. This
+    /// is simulated directly against `FenceTable::admit` (matching what
+    /// `apply_forward` does internally when it fences a Forward's
+    /// `range.origin`) rather than by re-driving the full `apply_forward`
+    /// machinery, which is exercised end-to-end by
+    /// `tests/composed_pipeline.rs`'s own version of this exact scenario.
+    #[test]
+    fn a_sender_fenced_via_the_forward_path_is_fenced_on_the_receipt_path_too() {
+        let mut fence = FenceTable::new();
+        // The Forward path (apply_forward) admits "replica-b" as an origin
+        // at incarnation 5.
+        assert_eq!(
+            fence.admit(&crate::fencing::FenceIdentity {
+                node: NodeId::new("replica-b"),
+                incarnation: Incarnation(5),
+            }),
+            crate::fencing::FenceOutcome::Admitted
+        );
+
+        // The SAME table is now handed to the Receipt path. A zombie
+        // "replica-b" claiming incarnation 1 must be fenced, even though
+        // ReceiptTracker itself has recorded nothing about replica-b yet.
+        let mut receipts = ReceiptTracker::new();
+        let outcome = receipts.record(&mut fence, receipt("replica-b", "origin-1", "p0", 1, 999));
+        assert_eq!(outcome, ReceiptOutcome::Fenced);
+        assert_eq!(
+            receipts.holder_applied_thru(
+                &NodeId::new("replica-b"),
+                &NodeId::new("origin-1"),
+                &PartitionId::new("p0")
+            ),
+            0,
+            "a zombie receipt must never enter the watermark map"
+        );
+    }
+
     proptest! {
         /// §8.5-style law: for ANY RF and ANY number of distinct
         /// sufficiently-caught-up peers, `client_ack_ready` agrees exactly
@@ -318,14 +459,15 @@ mod tests {
             caught_up_peers in 0usize..6,
             extra_short_peers in 0usize..4,
         ) {
+            let mut fence = FenceTable::new();
             let mut receipts = ReceiptTracker::new();
             let origin = NodeId::new("origin-1");
             let partition = PartitionId::new("p0");
             for i in 0..caught_up_peers {
-                receipts.record(receipt(&format!("caught-up-{i}"), "origin-1", "p0", 1, 100));
+                receipts.record(&mut fence, receipt(&format!("caught-up-{i}"), "origin-1", "p0", 1, 100));
             }
             for i in 0..extra_short_peers {
-                receipts.record(receipt(&format!("short-{i}"), "origin-1", "p0", 1, 5));
+                receipts.record(&mut fence, receipt(&format!("short-{i}"), "origin-1", "p0", 1, 5));
             }
             let expected = 1 + caught_up_peers >= rf as usize;
             prop_assert_eq!(

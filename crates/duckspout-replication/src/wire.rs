@@ -81,6 +81,15 @@ pub struct WireDecodeError(String);
 // --- on-the-wire shapes (serde-derivable; `Bytes` has no serde impl in this
 // workspace's pinned `bytes` version, so the row payload rides as `Vec<u8>`
 // here and converts back to `Bytes` at the `Envelope` boundary) -----------
+//
+// Known hot-path inefficiency, deliberately not fixed here (ACPR #194
+// MEDIUM-6): `records: Vec<u8>` serializes through plain `serde_json` as a
+// JSON array of decimal numbers, a 3-4x inflation over the raw Arrow IPC
+// bytes it carries (e.g. base64 would be ~1.33x instead). Fixing this is a
+// wire-format change with its own review surface (this format is an
+// internal implementation detail per the module doc above, so it is free
+// to change without an ADR) — out of scope for the pass that added this
+// comment; see `forward.rs`'s matching note at its own encode call site.
 
 #[derive(Serialize, Deserialize)]
 enum WireEnvelope {

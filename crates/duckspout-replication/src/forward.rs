@@ -38,36 +38,66 @@ pub struct ForwardBatch {
     pub records: Bytes,
 }
 
-/// Sends `batch` to every peer in `peers`, over `self_incarnation` (§5.7).
-/// Returns one `(peer, send result)` per peer, in `peers`' order — message
-/// loss is silent to the sender (`Transport`'s own contract, §5): an `Err`
-/// here means the transport itself refused the send (e.g. an unknown peer),
-/// never that delivery failed, which this crate learns about only through
-/// the peer's own `Receipt` (or its absence).
+/// Sends `batch` to every peer in `peers` other than `self_node`, over
+/// `self_incarnation` (§5.7). Returns one `(peer, send result)` per peer
+/// actually sent to, in `peers`' order — message loss is silent to the
+/// sender (`Transport`'s own contract, §5): an `Err` here means the
+/// transport itself refused the send (e.g. an unknown peer), never that
+/// delivery failed, which this crate learns about only through the peer's
+/// own `Receipt` (or its absence).
 ///
-/// Journals one [`TraceEvent::Forward`] per peer sent to, unconditionally on
-/// the send attempt (matching `Transport::send`'s own "handed to the
-/// transport, not delivered" contract — there is no delivery-confirmed
-/// moment to gate this on).
+/// `self_node` is filtered out of `peers` before any send is attempted
+/// (ACPR #194 HIGH-1): `specs/DuckSpoutCore.tla`'s `RingPeers(p, n) ==
+/// Nodes \ {n}` (line 284) excludes self from a partition's replica set
+/// structurally — a node is never its own replica. §5.2 already documents
+/// the membership view as advisory ("two nodes briefly holding different
+/// views cannot corrupt anything"), so a stale/buggy view handed to this
+/// function could, in principle, include this node's own id; this filter
+/// is the enforcement point that makes self-forwarding actually
+/// impossible rather than merely "the caller is supposed to" exclude it —
+/// [`crate::peer_apply::apply_forward`]'s own self-origin guard is the
+/// matching defense-in-depth on the receiving side, for a Forward that
+/// reaches a peer some other way.
+///
+/// Journals one [`TraceEvent::Forward`] per peer sent to (never for the
+/// filtered-out self, since nothing was sent), unconditionally on the send
+/// attempt (matching `Transport::send`'s own "handed to the transport, not
+/// delivered" contract — there is no delivery-confirmed moment to gate this
+/// on).
 pub async fn forward_to_peers(
     transport: &dyn Transport,
+    self_node: &NodeId,
     self_incarnation: Incarnation,
     peers: &[NodeId],
     batch: &ForwardBatch,
     trace: Option<&dyn TraceSink>,
 ) -> Vec<(NodeId, Result<(), TransportError>)> {
+    // The message is identical for every peer (ACPR #194 MEDIUM-6): encode
+    // once and clone the resulting `Bytes` per send — cheap, that's the
+    // whole point of `Bytes` — instead of re-running `serde_json::to_vec`
+    // over the same Arrow IPC payload once per peer.
+    //
+    // Known hot-path inefficiency, deliberately not fixed here (MEDIUM-6):
+    // `wire.rs` encodes the row payload as a JSON array of decimal numbers
+    // (3-4x inflation over the raw bytes) rather than e.g. base64 — fixing
+    // that is a wire-format change with its own review surface, out of
+    // scope for this pass.
+    let message = ForwardMessage {
+        incarnation: self_incarnation,
+        partition: batch.coverage.partition.clone(),
+        range: batch.coverage.range.clone(),
+        window: batch.window,
+        dataset: batch.dataset.clone(),
+        records: batch.records.clone(),
+    };
+    let payload = Envelope::Forward(message).to_bytes();
+
     let mut results = Vec::with_capacity(peers.len());
     for peer in peers {
-        let message = ForwardMessage {
-            incarnation: self_incarnation,
-            partition: batch.coverage.partition.clone(),
-            range: batch.coverage.range.clone(),
-            window: batch.window,
-            dataset: batch.dataset.clone(),
-            records: batch.records.clone(),
-        };
-        let payload = Envelope::Forward(message).to_bytes();
-        let result = transport.send(peer.clone(), payload).await;
+        if peer == self_node {
+            continue;
+        }
+        let result = transport.send(peer.clone(), payload.clone()).await;
         if let Some(trace) = trace {
             trace.record(TraceEvent::Forward);
         }
@@ -147,8 +177,15 @@ mod tests {
         block_on(async {
             let transport = FakeTransport::default();
             let peers = vec![NodeId::new("replica-a"), NodeId::new("replica-b")];
-            let results =
-                forward_to_peers(&transport, Incarnation(1), &peers, &batch(), None).await;
+            let results = forward_to_peers(
+                &transport,
+                &NodeId::new("origin-1"),
+                Incarnation(1),
+                &peers,
+                &batch(),
+                None,
+            )
+            .await;
             assert_eq!(results.len(), 2);
             assert!(results.iter().all(|(_, r)| r.is_ok()));
 
@@ -179,8 +216,15 @@ mod tests {
                 ..Default::default()
             };
             let peers = vec![NodeId::new("replica-a"), NodeId::new("replica-b")];
-            let results =
-                forward_to_peers(&transport, Incarnation(1), &peers, &batch(), None).await;
+            let results = forward_to_peers(
+                &transport,
+                &NodeId::new("origin-1"),
+                Incarnation(1),
+                &peers,
+                &batch(),
+                None,
+            )
+            .await;
             assert_eq!(results.len(), 2);
             assert!(results[0].1.is_err());
             assert!(results[1].1.is_ok());
@@ -192,9 +236,51 @@ mod tests {
     fn empty_peer_list_sends_nothing() {
         block_on(async {
             let transport = FakeTransport::default();
-            let results = forward_to_peers(&transport, Incarnation(1), &[], &batch(), None).await;
+            let results = forward_to_peers(
+                &transport,
+                &NodeId::new("origin-1"),
+                Incarnation(1),
+                &[],
+                &batch(),
+                None,
+            )
+            .await;
             assert!(results.is_empty());
             assert!(transport.sent.lock().expect("lock").is_empty());
+        });
+    }
+
+    /// ACPR #194 HIGH-1 scratch-repro re-verification: a peer list that
+    /// (through a stale/buggy membership view, §5.2) includes this node's
+    /// own id never gets sent to — `RingPeers(p, n) == Nodes \ {n}`
+    /// (`specs/DuckSpoutCore.tla:284`) excludes self from the replica set
+    /// structurally, and this is the enforcement point. Would catch a
+    /// regression that dropped the `self_node` filter and let a node
+    /// address a Forward to itself.
+    #[test]
+    fn self_node_in_the_peer_list_is_never_sent_to() {
+        block_on(async {
+            let transport = FakeTransport::default();
+            let self_node = NodeId::new("origin-1");
+            let peers = vec![
+                self_node.clone(),
+                NodeId::new("replica-a"),
+                self_node.clone(),
+            ];
+            let results = forward_to_peers(
+                &transport,
+                &self_node,
+                Incarnation(1),
+                &peers,
+                &batch(),
+                None,
+            )
+            .await;
+            assert_eq!(results.len(), 1, "only the genuine peer is sent to");
+            assert_eq!(results[0].0, NodeId::new("replica-a"));
+            let sent = transport.sent.lock().expect("lock");
+            assert_eq!(sent.len(), 1);
+            assert!(!sent.iter().any(|(to, _)| *to == self_node));
         });
     }
 }
