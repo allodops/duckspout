@@ -8,24 +8,41 @@
 //! ([`duckspout_types::Registry::next_incarnation`]). Three outcomes, one
 //! function ([`fence_boot`]), matching §7's own three-way split and
 //! `p/Replication/Node.p`'s checker-validated `eFenceBoot` handler (the most
-//! concrete operational reference this module follows — see that file's own
-//! comments for the exact edge cases each branch below was built against):
+//! concrete operational reference this module follows for the three-way
+//! split's overall SHAPE — see that file's own comments for the exact edge
+//! cases each branch below was built against; the one place this module
+//! deliberately does NOT follow `Node.p` is the `DegradedBoot` branch's
+//! incarnation handling — see that bullet below for the actual authority
+//! there):
 //!
 //! - **The catalog answers.** [`BootOutcome::Active`] — a fresh, catalog-drawn
 //!   incarnation, strictly greater than every incarnation any node has ever
 //!   drawn (not merely greater than this node's own prior value — the
 //!   catalog sequence is shared, [`duckspout_types::Registry`]'s own module
 //!   docs). Persisted locally before this function returns, so a later
-//!   catalog outage still has *something* to fall back to.
+//!   catalog outage still has *something* to fall back to. [`fence_boot`]
+//!   does not blindly trust the registry's draw: a value that is `0`, or
+//!   not strictly greater than this node's own already-persisted
+//!   incarnation, is a [`Registry`] contract violation
+//!   ([`BootError::RegistryIncarnationRegressed`]) rather than something
+//!   silently accepted and durably persisted as a regression.
 //! - **The catalog is unreachable, but a persisted incarnation exists.**
 //!   [`BootOutcome::Degraded`] — `DegradedBoot` (§7): this node keeps
 //!   applying and receipting replication under its existing incarnation but
 //!   takes no ownership action until it promotes. Nothing is persisted here
-//!   (nothing changed); a later call to [`fence_boot`] — the daemon's own
-//!   promotion retry once the catalog is observed reachable again — is
-//!   `FenceBoot` "complet\[ing\]" (§7's own words) and will draw a genuinely
-//!   fresh incarnation, exactly the same [`BootOutcome::Active`] path a
-//!   never-degraded boot takes.
+//!   (nothing changed) — the incarnation itself is also NOT bumped on this
+//!   branch, per `specs/DuckSpoutCore.tla`'s `DegradedBoot` action, which
+//!   explicitly has `UNCHANGED <<inc, ...>>`; **that TLA+ action, not**
+//!   `p/Replication/Node.p`'s `eFenceBoot` handler (which DOES bump the
+//!   incarnation on this same branch, unconditionally, before even checking
+//!   `catalogOutage`), **is the authority this specific branch follows** —
+//!   the P-model behavior here is a known divergence from the TLA+ spec,
+//!   recorded in `docs/design/p-tla-correspondence.md` §4.2, not something
+//!   this module should imitate. A later call to [`fence_boot`] — the
+//!   daemon's own promotion retry once the catalog is observed reachable
+//!   again — is `FenceBoot` "complet\[ing\]" (§7's own words) and will draw a
+//!   genuinely fresh incarnation, exactly the same [`BootOutcome::Active`]
+//!   path a never-degraded boot takes.
 //! - **The catalog is unreachable AND nothing is persisted.**
 //!   [`BootOutcome::Waiting`] — a genuinely new node "has no identity to be
 //!   safely partial with" (§7) and cannot complete `FenceBoot` at all yet;
@@ -44,6 +61,22 @@
 //!   eventually, `duckspout-daemon`'s takeover logic, issue #54's scope).
 //!   `p/Replication/Node.p`'s `sweepOrphanedKeys`'s own `if (degraded)
 //!   return;` guard is the exact shape a caller here must replicate.
+//!   **Not yet wired anywhere**: a repo-wide search finds zero call sites
+//!   consulting [`BootOutcome`] outside this module's own tests today —
+//!   `duckspout-daemon` still boots on a hardcoded
+//!   `V01_FIXED_INCARNATION` placeholder unrelated to this machinery. This
+//!   is legitimate, correctly-scoped-and-named deferral (the daemon/
+//!   `duckspout-accept` wiring is issue #54's territory), but it means
+//!   [`BootOutcome::permits_ownership_actions`] exists as an obvious,
+//!   correctly-named seam for that future caller to reach for — not
+//!   evidence this module already enforces anything past reporting.
+//! - **Fence out its own zombie predecessor on a degraded reboot.** Because
+//!   `DegradedBoot` does not bump the incarnation (the bullet above), a node
+//!   that dies and reboots degraded resumes under the SAME incarnation its
+//!   dead predecessor held — [`crate::fencing::FenceTable`] therefore cannot
+//!   distinguish the two by incarnation alone if the dead predecessor is not
+//!   actually dead (a partition, not a crash). Worth carrying forward as a
+//!   consideration for issue #54.
 //! - **Drive a retry loop.** A degraded or waiting node's promotion is a
 //!   future call to [`fence_boot`], triggered by whatever the daemon uses to
 //!   observe "the catalog is reachable again" (a periodic probe, a
@@ -88,6 +121,24 @@ pub enum BootOutcome {
     Waiting,
 }
 
+impl BootOutcome {
+    /// Whether this outcome permits taking an ownership action (claim
+    /// advertisement, takeover, drain) at all — `true` only for
+    /// [`BootOutcome::Active`]. `NoOwnershipWhileDegraded` /
+    /// `NoIdentityWhileWaiting` (`p/Replication/Spec.p`) are the properties
+    /// this answers; module docs above are explicit that enforcing them is
+    /// the CALLER's obligation, not this module's — this method exists as
+    /// the obvious, correctly-named seam for that caller (the
+    /// `duckspout-accept`/`duckspout-daemon` wiring, issue #54's scope) to
+    /// call before every ownership action, rather than re-deriving the same
+    /// `matches!(outcome, BootOutcome::Active { .. })` check ad hoc at each
+    /// call site.
+    #[must_use]
+    pub fn permits_ownership_actions(&self) -> bool {
+        matches!(self, BootOutcome::Active { .. })
+    }
+}
+
 /// A [`fence_boot`] failure. Every variant means the boot ceremony could not
 /// determine an outcome at all — never confused with [`BootOutcome::Degraded`]
 /// / [`BootOutcome::Waiting`], which are themselves *successful*, disclosed
@@ -98,10 +149,18 @@ pub enum BootError {
     /// The locally persisted incarnation could not be read for a reason
     /// other than "nothing is there yet" (a torn write, a failed fsync
     /// read-back, or any other [`StorageError`]) — this is exactly the kind
-    /// of ambiguity CONSTITUTION.md §11 says to fail closed on: a corrupt
-    /// local incarnation file is never treated as "no persisted identity"
-    /// (which would silently re-admit a node that may have written data
-    /// under a real prior incarnation) nor guessed at.
+    /// of ambiguity CONSTITUTION.md §11 says to fail closed on. **What this
+    /// does NOT do, stated accurately (an earlier revision of this comment
+    /// overstated the risk):** the current logic only ever uses a
+    /// successfully-read `persisted` value to choose between
+    /// [`BootOutcome::Degraded`] and [`BootOutcome::Waiting`] when the
+    /// registry is unreachable — a read failure here can never *silently
+    /// re-admit* a node under a wrong incarnation, because [`fence_boot`]
+    /// does not fall back to treating a read failure as "no persisted
+    /// identity" (that would be the actual danger this variant guards
+    /// against); it simply refuses to proceed at all. The fail-closed
+    /// behavior itself is unchanged — only this comment's description of
+    /// why is corrected.
     #[error("could not read the persisted incarnation: {0}")]
     PersistedIncarnationUnreadable(StorageError),
     /// The persisted incarnation file's content could not be parsed as a
@@ -116,6 +175,27 @@ pub enum BootError {
     /// unreachable.
     #[error("registry backend failure while drawing an incarnation: {0}")]
     RegistryBackend(RegistryError),
+    /// The registry's [`duckspout_types::Registry::next_incarnation`] draw
+    /// violated its own contract (see that method's doc comment): the drawn
+    /// value was either `0` — [`crate::fencing::Incarnation`]'s own doc
+    /// comment is explicit that `0` is never minted by a real boot, since
+    /// [`crate::fencing::FenceTable`] relies on it as every never-before-seen
+    /// sender's harmless floor — or not strictly greater than this node's
+    /// own already-persisted incarnation, which the shared monotonic
+    /// sequence [`duckspout_types::Registry`]'s own docs describe must never
+    /// produce. Silently accepting and persisting either shape would durably
+    /// regress this node's incarnation, undermining `FencedZombie` for every
+    /// peer that already saw the higher, now-forgotten value — this is a
+    /// hard boot failure, not something [`fence_boot`] guesses past.
+    #[error(
+        "registry drew an invalid incarnation {drawn} (persisted incarnation on file: {persisted:?})"
+    )]
+    RegistryIncarnationRegressed {
+        /// The value the registry handed back.
+        drawn: u64,
+        /// This node's own already-persisted incarnation, when one exists.
+        persisted: Option<u64>,
+    },
     /// The catalog draw succeeded, but persisting the fresh incarnation
     /// locally failed. Deliberately NOT collapsed into
     /// [`BootOutcome::Degraded`]: a fresh incarnation this node cannot
@@ -151,6 +231,12 @@ pub async fn fence_boot(
 
     match registry.next_incarnation(self_node).await {
         Ok(fresh) => {
+            if fresh == 0 || persisted.is_some_and(|prior| fresh <= prior) {
+                return Err(BootError::RegistryIncarnationRegressed {
+                    drawn: fresh,
+                    persisted,
+                });
+            }
             persist_incarnation(storage, incarnation_path, incarnation_dir, fresh).await?;
             Ok(BootOutcome::Active {
                 incarnation: Incarnation(fresh),
@@ -192,6 +278,17 @@ async fn read_persisted_incarnation(
 /// Durably persists `incarnation` at `path` — content fsync, then the
 /// containing `dir`'s fsync, matching [`Storage::put`]'s own two-fsync
 /// durability contract exactly.
+///
+/// **Known gap (ACPR #197 LOW-7), named rather than fixed here:** this is an
+/// in-place overwrite of one path, not a temp-file-plus-rename. A crash
+/// between [`Storage::put`] and the two fsyncs below can leave a torn file
+/// that reads back as [`BootError::PersistedIncarnationCorrupt`] with no
+/// recovery path in code or docs — the node stays permanently unbootable
+/// until an operator manually deletes the file. This repo has no existing
+/// temp+rename convention for [`Storage`] to follow yet, and building one
+/// (or a two-slot durable-write scheme) is a bigger change than this PR's
+/// scope; worth a follow-up once a real [`Storage`] backend exists to
+/// design the recovery path against.
 async fn persist_incarnation(
     storage: &dyn Storage,
     path: StoragePath,
@@ -222,6 +319,7 @@ mod tests {
 
     use bytes::Bytes;
     use duckspout_types::BoxFuture;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -245,9 +343,43 @@ mod tests {
     /// full storage engine. Modeled after `duckspout-ctk::InMemStorage`'s
     /// own content/name-durability distinction (this crate cannot depend on
     /// `duckspout-ctk`, ADR-0008).
+    ///
+    /// Also supports injected failures on `get`/`fsync_file`/`fsync_dir` and
+    /// counts fsync calls (ACPR #197 MEDIUM-6): the plain no-op fsyncs below
+    /// are unobserved by any prior test, so a `persist_incarnation` that
+    /// silently dropped either call (`let _ = ...` instead of `?`) would
+    /// have passed the whole suite — the counters and injectable failures
+    /// exist specifically to close that hole.
     #[derive(Default)]
     struct FakeStorage {
         files: Mutex<HashMap<String, Bytes>>,
+        fail_next_get: Mutex<bool>,
+        fail_next_fsync_file: Mutex<bool>,
+        fail_next_fsync_dir: Mutex<bool>,
+        fsync_file_calls: Mutex<usize>,
+        fsync_dir_calls: Mutex<usize>,
+    }
+
+    impl FakeStorage {
+        fn fail_next_get(&self) {
+            *self.fail_next_get.lock().expect("lock") = true;
+        }
+
+        fn fail_next_fsync_file(&self) {
+            *self.fail_next_fsync_file.lock().expect("lock") = true;
+        }
+
+        fn fail_next_fsync_dir(&self) {
+            *self.fail_next_fsync_dir.lock().expect("lock") = true;
+        }
+
+        fn fsync_file_call_count(&self) -> usize {
+            *self.fsync_file_calls.lock().expect("lock")
+        }
+
+        fn fsync_dir_call_count(&self) -> usize {
+            *self.fsync_dir_calls.lock().expect("lock")
+        }
     }
 
     impl Storage for FakeStorage {
@@ -260,6 +392,14 @@ mod tests {
         }
 
         fn get(&self, path: StoragePath) -> BoxFuture<'_, Result<Bytes, StorageError>> {
+            let mut fail = self.fail_next_get.lock().expect("lock");
+            if *fail {
+                *fail = false;
+                return Box::pin(std::future::ready(Err(StorageError::Backend(
+                    "fake backend read failure".to_string(),
+                ))));
+            }
+            drop(fail);
             let result = self
                 .files
                 .lock()
@@ -275,11 +415,23 @@ mod tests {
             Box::pin(std::future::ready(Ok(())))
         }
 
-        fn fsync_file(&self, _path: StoragePath) -> BoxFuture<'_, Result<(), StorageError>> {
+        fn fsync_file(&self, path: StoragePath) -> BoxFuture<'_, Result<(), StorageError>> {
+            *self.fsync_file_calls.lock().expect("lock") += 1;
+            let mut fail = self.fail_next_fsync_file.lock().expect("lock");
+            if *fail {
+                *fail = false;
+                return Box::pin(std::future::ready(Err(StorageError::FsyncFailed(path))));
+            }
             Box::pin(std::future::ready(Ok(())))
         }
 
-        fn fsync_dir(&self, _dir: StoragePath) -> BoxFuture<'_, Result<(), StorageError>> {
+        fn fsync_dir(&self, dir: StoragePath) -> BoxFuture<'_, Result<(), StorageError>> {
+            *self.fsync_dir_calls.lock().expect("lock") += 1;
+            let mut fail = self.fail_next_fsync_dir.lock().expect("lock");
+            if *fail {
+                *fail = false;
+                return Box::pin(std::future::ready(Err(StorageError::FsyncFailed(dir))));
+            }
             Box::pin(std::future::ready(Ok(())))
         }
     }
@@ -418,50 +570,140 @@ mod tests {
         });
     }
 
-    /// Promotion (§7: "promotes itself when the catalog returns and
-    /// `FenceBoot` completes") is simply a LATER `fence_boot` call once the
-    /// catalog answers again — this test drives exactly that sequence and
-    /// confirms the promoted incarnation is strictly greater than the
-    /// degraded one, satisfying `FencedZombie`'s own yardstick against any
-    /// peer that already admitted a Forward under the degraded incarnation.
+    proptest! {
+        /// ACPR #197 HIGH-2: rewrite of a gamed test. The original
+        /// `promotion_after_a_degraded_boot_draws_a_strictly_higher_incarnation`
+        /// hardcoded `FakeRegistry::reachable_at(9)` and asserted equality to
+        /// the constant `Incarnation(9)` baked into its own setup — changing
+        /// `reachable_at(9)` to `reachable_at(1)` would have made the
+        /// "strictly higher" property this test's name claims FALSE while
+        /// the test kept passing (it would just check a different hardcoded
+        /// constant against itself). This property test checks the actual
+        /// claim, independent of any one hardcoded value: for ANY persisted
+        /// incarnation and ANY strictly-higher value the registry hands back
+        /// on promotion, `fence_boot` accepts it and returns exactly that
+        /// value — the promoted incarnation is genuinely, not incidentally,
+        /// greater than the degraded one, satisfying `FencedZombie`'s own
+        /// yardstick against any peer that already admitted a Forward under
+        /// the degraded incarnation.
+        #[test]
+        fn promotion_draws_a_strictly_higher_incarnation_for_arbitrary_registry_values(
+            persisted in 1u64..1000,
+            delta in 1u64..1000,
+        ) {
+            let fresh = persisted + delta;
+            let (degraded, promoted) = block_on(async {
+                let storage = FakeStorage::default();
+                let (path, dir) = paths();
+                let node = NodeId::new("n1");
+                persist_incarnation(&storage, path.clone(), dir.clone(), persisted)
+                    .await
+                    .expect("seed a prior incarnation");
+
+                let degraded_registry = FakeRegistry::unreachable();
+                let degraded = fence_boot(
+                    &storage,
+                    &degraded_registry,
+                    &node,
+                    path.clone(),
+                    dir.clone(),
+                )
+                .await
+                .expect("boots degraded");
+
+                // The catalog returns, offering the next value in its shared
+                // sequence -- strictly greater than the degraded incarnation.
+                let restored_registry = FakeRegistry::reachable_at(fresh);
+                let promoted = fence_boot(&storage, &restored_registry, &node, path, dir)
+                    .await
+                    .expect("promotion succeeds");
+                (degraded, promoted)
+            });
+
+            prop_assert_eq!(
+                degraded,
+                BootOutcome::Degraded {
+                    incarnation: Incarnation(persisted)
+                }
+            );
+            prop_assert_eq!(
+                promoted,
+                BootOutcome::Active {
+                    incarnation: Incarnation(fresh)
+                }
+            );
+            prop_assert!(
+                fresh > persisted,
+                "the promoted incarnation must be strictly higher than the degraded one"
+            );
+        }
+    }
+
+    /// ACPR #197 HIGH-2 scratch-repro re-verification: a registry that hands
+    /// back a value at or below this node's own already-persisted
+    /// incarnation (persisted = 9, registry returns 2) is a `Registry`
+    /// contract violation, not a value `fence_boot` silently accepts and
+    /// durably persists as a regression. Before this fix, `fence_boot`
+    /// returned `BootOutcome::Active { incarnation: Incarnation(2) }` here
+    /// and persisted it, destroying the higher value on disk.
     #[test]
-    fn promotion_after_a_degraded_boot_draws_a_strictly_higher_incarnation() {
+    fn a_registry_draw_at_or_below_the_persisted_incarnation_is_rejected() {
         block_on(async {
             let storage = FakeStorage::default();
             let (path, dir) = paths();
             let node = NodeId::new("n1");
-            persist_incarnation(&storage, path.clone(), dir.clone(), 3)
+            persist_incarnation(&storage, path.clone(), dir.clone(), 9)
                 .await
-                .expect("seed a prior incarnation");
+                .expect("seed a prior incarnation of 9");
 
-            let degraded_registry = FakeRegistry::unreachable();
-            let degraded = fence_boot(
-                &storage,
-                &degraded_registry,
-                &node,
-                path.clone(),
-                dir.clone(),
-            )
-            .await
-            .expect("boots degraded");
-            assert_eq!(
-                degraded,
-                BootOutcome::Degraded {
-                    incarnation: Incarnation(3)
+            let registry = FakeRegistry::reachable_at(2);
+            let outcome = fence_boot(&storage, &registry, &node, path.clone(), dir).await;
+            match outcome {
+                Err(BootError::RegistryIncarnationRegressed { drawn, persisted }) => {
+                    assert_eq!(drawn, 2);
+                    assert_eq!(persisted, Some(9));
                 }
+                other => panic!("expected Err(RegistryIncarnationRegressed), got {other:?}"),
+            }
+
+            // The persisted value on disk must be untouched by the rejected
+            // draw -- confirms nothing was durably regressed.
+            let still_persisted = read_persisted_incarnation(&storage, path)
+                .await
+                .expect("read back");
+            assert_eq!(
+                still_persisted,
+                Some(9),
+                "a rejected regressive draw must never overwrite the persisted incarnation"
             );
+        });
+    }
 
-            // The catalog returns, offering the next value in its shared
-            // sequence -- strictly greater than the degraded incarnation.
-            let restored_registry = FakeRegistry::reachable_at(9);
-            let promoted = fence_boot(&storage, &restored_registry, &node, path, dir)
-                .await
-                .expect("promotion succeeds");
-            assert_eq!(
-                promoted,
-                BootOutcome::Active {
-                    incarnation: Incarnation(9)
-                }
+    /// ACPR #197 HIGH-2: `Incarnation(0)` is never minted by a real boot
+    /// (`fencing.rs`'s own doc comment — `FenceTable` relies on this as
+    /// every never-before-seen sender's harmless floor), so a registry that
+    /// hands back `0` is rejected outright, even for a genuinely new node
+    /// with nothing persisted yet (where the naive "greater than persisted"
+    /// check alone would not catch it, since `None` never compares as
+    /// `<=` anything).
+    #[test]
+    fn a_registry_draw_of_zero_is_rejected_even_for_a_new_node() {
+        block_on(async {
+            let storage = FakeStorage::default();
+            let (path, dir) = paths();
+            let node = NodeId::new("n1");
+
+            let registry = FakeRegistry::reachable_at(0);
+            let outcome = fence_boot(&storage, &registry, &node, path, dir).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(BootError::RegistryIncarnationRegressed {
+                        drawn: 0,
+                        persisted: None
+                    })
+                ),
+                "expected Err(RegistryIncarnationRegressed{{drawn: 0, ..}}), got {outcome:?}"
             );
         });
     }
@@ -564,6 +806,81 @@ mod tests {
             assert!(
                 matches!(outcome, Err(BootError::PersistedIncarnationCorrupt(_))),
                 "a corrupt local file must fail closed, not resolve to Waiting"
+            );
+        });
+    }
+
+    /// ACPR #197 MEDIUM-6(a): a `Storage` read failure that is NOT
+    /// `StorageError::NotFound` (a backend error, a torn write, a failed
+    /// fsync read-back — anything ambiguous) must fail closed as
+    /// [`BootError::PersistedIncarnationUnreadable`], never collapsed to
+    /// "treat as no persisted identity." A mutation that widened
+    /// `read_persisted_incarnation`'s `Err(StorageError::NotFound(_)) =>
+    /// Ok(None)` arm to catch every `StorageError` variant would have
+    /// survived the whole suite before this test existed — nothing else
+    /// exercised a non-`NotFound` read failure.
+    #[test]
+    fn a_non_not_found_storage_error_is_never_treated_as_no_persisted_identity() {
+        block_on(async {
+            let storage = FakeStorage::default();
+            storage.fail_next_get();
+            let (path, dir) = paths();
+            let registry = FakeRegistry::unreachable();
+            let node = NodeId::new("n1");
+
+            let outcome = fence_boot(&storage, &registry, &node, path, dir).await;
+            assert!(
+                matches!(outcome, Err(BootError::PersistedIncarnationUnreadable(_))),
+                "a non-NotFound storage read failure must fail closed as Unreadable, \
+                 not silently resolve to Waiting/Degraded as if nothing were persisted; \
+                 got {outcome:?}"
+            );
+        });
+    }
+
+    /// ACPR #197 MEDIUM-6(b): `persist_incarnation` must actually call
+    /// BOTH `Storage::fsync_file` and `Storage::fsync_dir`, and propagate a
+    /// failure from either — the two-fsync durability contract
+    /// [`persist_incarnation`]'s own doc comment claims. Before this test,
+    /// `FakeStorage`'s fsyncs were unrecorded no-ops that nothing observed,
+    /// so turning either call in `persist_incarnation` into `let _ = ...`
+    /// (silently dropping the error) would have survived the whole suite.
+    #[test]
+    fn persist_incarnation_calls_and_propagates_failure_from_both_fsyncs() {
+        block_on(async {
+            // Happy path: both fsyncs are actually invoked exactly once.
+            let storage = FakeStorage::default();
+            let (path, dir) = paths();
+            persist_incarnation(&storage, path.clone(), dir.clone(), 5)
+                .await
+                .expect("persist succeeds");
+            assert_eq!(
+                storage.fsync_file_call_count(),
+                1,
+                "persist_incarnation must call Storage::fsync_file"
+            );
+            assert_eq!(
+                storage.fsync_dir_call_count(),
+                1,
+                "persist_incarnation must call Storage::fsync_dir"
+            );
+
+            // A failing fsync_file must propagate, not be swallowed.
+            let storage = FakeStorage::default();
+            storage.fail_next_fsync_file();
+            let outcome = persist_incarnation(&storage, path.clone(), dir.clone(), 5).await;
+            assert!(
+                matches!(outcome, Err(BootError::PersistFailed(_))),
+                "a failing fsync_file must propagate as PersistFailed, got {outcome:?}"
+            );
+
+            // A failing fsync_dir must propagate too.
+            let storage = FakeStorage::default();
+            storage.fail_next_fsync_dir();
+            let outcome = persist_incarnation(&storage, path, dir, 5).await;
+            assert!(
+                matches!(outcome, Err(BootError::PersistFailed(_))),
+                "a failing fsync_dir must propagate as PersistFailed, got {outcome:?}"
             );
         });
     }

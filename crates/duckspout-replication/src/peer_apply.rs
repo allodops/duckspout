@@ -87,10 +87,10 @@
 //!   reach the OWNER-side apply path, and keeping `apply_forward`'s own
 //!   ACPR-hardened guard chain free of a registry dependency keeps this hot
 //!   path's contract unchanged); a caller invokes
-//!   [`crate::claims::ClaimTracker::advertise_if_new`] after observing
-//!   [`PeerApplyOutcome::Applied`] here, exactly as `Node.p`'s own
-//!   `eForward` handler calls its inline claim check immediately after its
-//!   gap-freedom branch accepts.
+//!   [`crate::claims::ClaimTracker::should_advertise`]/[`crate::claims::ClaimTracker::mark_advertised`]
+//!   after observing [`PeerApplyOutcome::Applied`] here, exactly as
+//!   `Node.p`'s own `eForward` handler calls its inline claim check
+//!   immediately after its gap-freedom branch accepts.
 //! - `Rung(m) < 3`'s hard-overload refusal of NEW ranges (catch-up ranges
 //!   still apply) — the overload ladder is `duckspout-staging`'s existing
 //!   machinery (§4.5); wiring it into `PeerApply` needs the concrete

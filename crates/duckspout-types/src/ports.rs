@@ -956,6 +956,24 @@ pub trait Registry: Send + Sync {
     /// Draws this node's next incarnation from the catalog's shared
     /// monotonic sequence (§5.7), durably recorded there before it returns.
     ///
+    /// **The contract a conformant implementation MUST uphold** (ACPR #197
+    /// HIGH-2 — stated explicitly here, ahead of any concrete Postgres-backed
+    /// implementation, the same way [`ReplicaLog::applied_thru`]'s own doc
+    /// comment was tightened for exactly this reason, #194 MEDIUM-5):
+    /// every `Ok` value must be **non-zero** (`0` is never a valid
+    /// incarnation — `duckspout-replication::fencing::FenceTable` relies on
+    /// `0` as the harmless floor every never-before-seen sender starts at)
+    /// and **strictly greater than every value this sequence has ever
+    /// handed back to ANY node**, not merely greater than this node's own
+    /// prior draw — the sequence is shared, not partitioned by `node`
+    /// (module docs above). `node` is carried purely for the catalog's own
+    /// per-node bookkeeping (§5.7: "the catalog track\[s\] the highest
+    /// incarnation seen per node"), never as a partitioning key for the
+    /// sequence itself. A caller
+    /// (`duckspout-replication::boot::fence_boot`) treats any violation of
+    /// this contract as a hard, fail-closed error rather than silently
+    /// accepting and durably persisting a regression.
+    ///
     /// # Errors
     ///
     /// [`RegistryError::Unreachable`] when the catalog cannot be reached —
