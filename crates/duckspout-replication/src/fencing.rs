@@ -12,15 +12,15 @@
 //! [`FenceTable`] is exactly that receiver-held bookkeeping —
 //! `highestSeen: [Nodes -> [Nodes -> Nat]]` in the TLA+ model, `highestSeen:
 //! map[int, int]` per logical sender in `p/Replication/Node.p`. What is
-//! **not** here, and is `duckspout-replication` issue #53's separate scope
-//! (`Incarnation fencing + registry claims`): `FenceBoot`'s own boot-time
-//! incarnation draw from the catalog sequence, `DegradedBoot`'s
+//! **not** here, and is `crate::boot`/`crate::claims`'s separate scope
+//! (issue #53, `Incarnation fencing + registry claims`): `FenceBoot`'s own
+//! boot-time incarnation draw from the catalog sequence, `DegradedBoot`'s
 //! catalog-outage boot split, and `ClaimAdvertise`'s registry rows. This
 //! module gives `Forward`/`PeerApply`/`Receipt` (issue #51) exactly the
 //! comparison-and-reject primitive those three need to be minimally correct
 //! now — a node's own incarnation is simply handed in by the caller (the
-//! daemon, once #53 lands `FenceBoot`) as an opaque, already-drawn
-//! [`Incarnation`].
+//! daemon, once `crate::boot::fence_boot` is wired into daemon composition)
+//! as an opaque, already-drawn [`Incarnation`].
 
 use std::collections::HashMap;
 

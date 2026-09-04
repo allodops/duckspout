@@ -19,12 +19,13 @@
 //! gating (issue #51, §4, §5.1, §5.4) are implemented across
 //! [`fencing`], [`wire`], [`forward`], [`peer_apply`], and [`receipt`].
 //! Incarnation fencing ([`fencing::FenceTable`]) is the one guard all three
-//! protocol steps share (§5.7) — scoped here to exactly the
-//! comparison-and-reject primitive `Forward`/`PeerApply`/`Receipt` need;
-//! `FenceBoot`'s own boot-time incarnation draw, `DegradedBoot`'s
-//! catalog-outage boot split, and `ClaimAdvertise`'s registry rows are
-//! issue #53's separate scope (`Incarnation fencing + registry claims`).
-//! `TakeoverDrain`/`DeclareLoss` (§5.6, §5.8) are issue #54's.
+//! protocol steps share (§5.7) — scoped there to exactly the
+//! comparison-and-reject primitive `Forward`/`PeerApply`/`Receipt` need on
+//! the RECEIVING side. `FenceBoot`'s own boot-time incarnation draw and
+//! `DegradedBoot`'s catalog-outage boot split (issue #53, §5.7) — the
+//! BOOTING node's own side — are [`boot`]; `ClaimAdvertise`'s registry-row
+//! idempotency guard (§5.5, issue #53) is [`claims`]. `TakeoverDrain`/
+//! `DeclareLoss` (§5.6, §5.8) are issue #54's.
 //!
 //! Layering (§10.1, ADR-0008): depends on `duckspout-types` only among
 //! workspace crates; the runtime is reached exclusively through the
@@ -33,13 +34,20 @@
 //! defined in `duckspout-types` per ADR-0008 exactly as
 //! `duckspout_types::SealSurface` crosses the drain↔staging boundary; a
 //! concrete `duckspout-staging` implementation and daemon wiring are
-//! tracked as follow-up work in issue #193, not part of this crate).
+//! tracked as follow-up work in issue #193, not part of this crate),
+//! [`duckspout_types::Registry`] for the catalog ([`boot`]/[`claims`]'s own
+//! module docs — a concrete implementation and daemon-composition wiring,
+//! including replacing `duckspout-daemon::system::V01_FIXED_INCARNATION`
+//! with a real `FenceBoot` draw, are likewise deferred to a follow-up
+//! issue, not part of this crate).
 //!
 //! Design home: `docs/design/replication.md` (absorbed from `DUCKSPOUT.md`
 //! §5).
 
 #![forbid(unsafe_code)]
 
+pub mod boot;
+pub mod claims;
 pub mod fencing;
 pub mod forward;
 pub mod hrw;
@@ -48,6 +56,8 @@ pub mod receipt;
 pub mod routing;
 pub mod wire;
 
+pub use boot::{BootError, BootOutcome, fence_boot};
+pub use claims::ClaimTracker;
 pub use fencing::{FenceIdentity, FenceOutcome, FenceTable, Incarnation};
 pub use forward::{ForwardBatch, forward_to_peers};
 pub use hrw::{hrw_owner, hrw_ranked};
