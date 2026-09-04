@@ -1,6 +1,6 @@
 [package]
 name = "duckspout-replication"
-description = "DuckSpout replication: HRW placement (implemented), ring protocol and fencing (v0.2 stubs)."
+description = "DuckSpout replication: HRW placement, Forward/PeerApply/Receipt, and incarnation fencing."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The Forward/Receipt wire envelope (§5.4) and ForwardedRecord's row payload
+# ride Transport::send's `Bytes` payload type.
+bytes = { workspace = true }
 duckspout-types = { workspace = true }
 serde = { workspace = true }
+# The Forward/Receipt wire envelope's encoding (module `wire`) — an internal
+# implementation detail of this crate's own peer protocol, not a public
+# format any other crate reads.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
