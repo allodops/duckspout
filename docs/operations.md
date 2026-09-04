@@ -105,7 +105,22 @@ The same binary, the same SIGTERM choreography, the same config file:
 - **Bootstrap**: `cluster.seed_peers` (static address list) seeds the
   advisory peer view, exactly as etcd's `initial-cluster` does; the
   registry supersedes the static list as soon as Heartbeats flow. Empty by
-  default — on K8s the headless Service DNS makes it unnecessary.
+  default — on K8s the headless Service DNS makes it unnecessary. Each
+  entry is a dial address — `host`, `host:port`, or `[ipv6]:port` (bracketed
+  IPv6 only; a bare, unbracketed IPv6 literal is not a supported entry
+  shape) — and its **host portion must match, character for character, the
+  kernel hostname the named peer itself boots with**. This is a real
+  requirement, not a hint: every node derives its own ring/ownership view
+  from `cluster.seed_peers` independently, so a seed whose host does not
+  match what that peer's own boot presents (a Kubernetes `StatefulSet` DNS
+  name like `ds-0.ds.ns.svc` differing from the pod's bare `hostname`
+  `ds-0`, or a seed given as a raw IP) is a **permanent** disagreement, not
+  the transient view-skew §9.1.1's ring section tolerates — no two nodes
+  ever converge on the same owner for that peer's ring positions, and
+  writes routed through it never receipt. There is no boot-time check for
+  this yet (issue #53's registry/discovery work is the natural home for a
+  real peer-identity handshake); get the hostnames right operationally in
+  the meantime.
 - **docker compose**: shipped, marked **dev-only**. It demonstrates
   topology; it does not demonstrate durability (compose gives no per-node
   fault isolation worth the name).
