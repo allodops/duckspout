@@ -45,6 +45,16 @@
 //!   tick, then the process exits (§9.1.2's shallow drain — v0.1 has no
 //!   replica peers to hand staged data to, so "shallow" here is exactly
 //!   "finish, do not orphan work mid-tick").
+//! - **HRW ring integration + ownership routing** (§5.2–5.3, issue #52):
+//!   [`Daemon::boot`] reads `cluster.seed_peers` and this node's own id into
+//!   a [`duckspout_replication::routing::MembershipView`]
+//!   (`build_membership_view`, private) and stores it, alongside
+//!   `cluster.rf`, on the daemon's own core state. [`DaemonHandle::routing_plan`] resolves
+//!   [`duckspout_replication::routing::route_write`] against that view —
+//!   the ring owner, the RF replica set, and whether this node is the
+//!   owner — for any partition, real composed state rather than the bare
+//!   `hrw_owner` re-export below on its own. See that re-export's doc
+//!   comment for exactly what remains unwired and why.
 //!
 //! # What is explicitly deferred, and why
 //!
@@ -60,6 +70,24 @@
 //!   built-in dataset, `otlp_logs` (the OTLP adapter's fixed target); its
 //!   drain plan (`otlp_logs_drain_plan`) is hardcoded rather than read
 //!   from a declaration ledger that does not exist yet.
+//! - **Actually Forwarding a routed write over the network** (issue #52's
+//!   own scope note): [`DaemonHandle::routing_plan`] makes the ownership
+//!   decision real and composed, but nothing in the accept path calls it
+//!   yet, because there is nothing to Forward *through*: no crate in this
+//!   workspace implements `duckspout_types::Transport` over a real
+//!   network today (only `duckspout-ctk`'s in-memory `InMemTransport`
+//!   exists, a test double), and `duckspout_types::ReplicaLog`'s concrete
+//!   `duckspout-staging` backend is issue #193's separate, already-filed
+//!   follow-up. Hooking `duckspout_replication::forward::forward_to_peers`
+//!   into the OTLP accept path needs both — a peer-transport server bound
+//!   on `node.peer_listen` (§9.6.1's already-reserved, currently-unbound
+//!   port) is genuinely new scope, not a wiring-only task, so it is left
+//!   for a dedicated follow-up rather than invented here as an untested
+//!   stub. `cluster.rf > 1` is therefore still not durable beyond the
+//!   local node's own copy at v0.1 — exactly the same limitation
+//!   `StageOutcome::DuplicateInFlight`'s and `client_ack_ready`'s own doc
+//!   comments already disclose ("unreachable at RF = 1 ... replication
+//!   (v0.2) makes it live"), unchanged by this issue.
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -77,7 +105,7 @@ use duckspout_staging::{
 };
 use duckspout_types::{
     BoxFuture, Clock, DatasetDeclaration, DatasetId, DatasetKind, DecodedBatch, LakeCommitter,
-    NodeId, SealSurface, StageCommitter, StageError, StageOutcome, Storage,
+    NodeId, PartitionId, SealSurface, StageCommitter, StageError, StageOutcome, Storage,
 };
 use duckspout_watermark::{SharedLedger, WatermarkLedger};
 use tokio::net::TcpListener;
@@ -88,11 +116,19 @@ use crate::serving::{HotFlightService, ServingConfig};
 use crate::status::{self, StatusSnapshot};
 use crate::system::{self, FsStorage, SystemClock};
 
-/// Placement (§5): any node accepts, then forwards to the HRW owner. Not
-/// wired into the accept path at v0.1 (module docs — single-node, no
-/// replication yet); re-exported so the composition-shape declaration
-/// (§10.1's crate graph) stays honest ahead of the v0.2 forwarding wiring.
+/// Placement (§5): any node accepts, then forwards to the HRW owner. The
+/// bare placement function, re-exported so the composition-shape
+/// declaration (§10.1's crate graph) stays honest even for callers that
+/// only need [`hrw_owner`] directly rather than a resolved
+/// [`RoutingPlan`] — [`DaemonHandle::routing_plan`] below is the real,
+/// composed seam (§5.2–5.3, issue #52): it resolves [`route_write`]
+/// against the [`MembershipView`] built at boot (`build_membership_view`,
+/// private), not a bare candidate list a caller has to
+/// assemble itself. **Not called from the OTLP accept path yet** — module
+/// docs' "What is explicitly deferred" section explains why (no peer
+/// `Transport` exists to Forward the routed write through).
 pub use duckspout_replication::hrw_owner;
+pub use duckspout_replication::routing::{MembershipView, RoutingPlan, route_write};
 
 /// Everything that can go wrong composing or booting the daemon. Every
 /// variant is a boot-time failure — nothing here is a runtime data-path
@@ -174,6 +210,44 @@ struct DaemonCore {
     clock: SystemClock,
     drain_stalled: AtomicBool,
     ready: AtomicBool,
+    /// The ownership-routing membership view (§5.2, issue #52), built once
+    /// at boot from `cluster.seed_peers` (module docs of
+    /// [`build_membership_view`]). Advisory and static for the lifetime of
+    /// the process at v0.1 — there is no live registry (#53) to refresh it
+    /// from yet.
+    membership: MembershipView,
+    /// `cluster.rf` (§5.1, §5.11), read once at boot.
+    rf: u16,
+}
+
+/// Assembles the [`DaemonCore`] from `config` and every already-opened port
+/// ([`Daemon::boot`]'s own locals) — split out of `boot` purely to keep that
+/// function under the workspace's line-count ceiling; it composes nothing
+/// [`Daemon::boot`] didn't already decide. Builds the ownership-routing
+/// [`MembershipView`] (§5.2, issue #52; [`build_membership_view`]'s own doc
+/// comment) as its one piece of actual logic.
+fn assemble_core(
+    config: &DaemonConfig,
+    node_id: NodeId,
+    stager: Arc<Stager>,
+    seal_surface: Arc<EngineSealSurface<FsStorage>>,
+    drain: DrainCoordinator,
+    ledger: Arc<SharedLedger>,
+    clock: SystemClock,
+) -> Arc<DaemonCore> {
+    let membership = build_membership_view(config, &node_id);
+    Arc::new(DaemonCore {
+        node_id,
+        stager,
+        seal_surface,
+        drain,
+        ledger,
+        clock,
+        drain_stalled: AtomicBool::new(false),
+        ready: AtomicBool::new(false),
+        membership,
+        rf: config.cluster.rf,
+    })
 }
 
 impl DaemonCore {
@@ -305,6 +379,19 @@ impl DaemonHandle {
     pub fn node_id(&self) -> &NodeId {
         &self.0.node_id
     }
+
+    /// Resolves the ownership-routing decision for `partition` (§5.2–5.3,
+    /// issue #52): the ring owner, the RF replica set, and whether this
+    /// node is that owner — [`route_write`] against the [`MembershipView`]
+    /// built at boot (`build_membership_view`, private) and `cluster.rf`.
+    ///
+    /// `None` only when the membership view is somehow empty — unreachable
+    /// past a real [`Daemon::boot`], which always seeds it with this node's
+    /// own id (`build_membership_view`'s own doc comment).
+    #[must_use]
+    pub fn routing_plan(&self, partition: &PartitionId) -> Option<RoutingPlan> {
+        route_write(partition, &self.0.node_id, &self.0.membership, self.0.rf)
+    }
 }
 
 /// A booted-but-not-yet-serving daemon: every port is wired and both
@@ -412,16 +499,15 @@ impl Daemon {
         )?
         .into_server();
 
-        let core = Arc::new(DaemonCore {
+        let core = assemble_core(
+            config,
             node_id,
-            stager: Arc::clone(&stager),
+            Arc::clone(&stager),
             seal_surface,
             drain,
             ledger,
             clock,
-            drain_stalled: AtomicBool::new(false),
-            ready: AtomicBool::new(false),
-        });
+        );
 
         // --- Listeners ---
         let (otlp_listener, otlp_addr) = bind_listener("otlp", config.node.otlp_listen).await?;
@@ -646,6 +732,54 @@ fn otlp_logs_drain_plan() -> DatasetDrainPlan {
         sort_key: None,
     };
     DatasetDrainPlan::from_declaration(&declaration, "ts")
+}
+
+/// Builds this node's [`MembershipView`] (§5.2, issue #52) from
+/// `cluster.seed_peers` plus `self_node` — the only membership source at
+/// v0.1, per `docs/design/replication.md` §5.2 ("seeded at bootstrap by
+/// `cluster.seed_peers`... superseded by the registry once reachable") and
+/// [`duckspout_replication::routing`]'s own module docs (the registry does
+/// not exist yet, issue #53). `self_node` is always included, so
+/// [`route_write`] never sees an empty view — even a lone, unconfigured
+/// node routes every partition to itself.
+///
+/// A duplicate peer entry (repeated in config, or one that happens to
+/// resolve to `self_node`'s own id) is folded rather than kept twice —
+/// `MembershipView` is a set of distinct candidates, and `hrw_ranked`'s own
+/// score is per-node, so a repeated entry would silently double that node's
+/// odds of nothing (HRW's score doesn't accumulate across duplicate rows,
+/// but a duplicate WOULD show up twice in `RoutingPlan::replicas`, corrupting
+/// its "distinct RF holders" meaning) — folding here keeps that invariant
+/// true from construction rather than relying on every caller to dedup.
+fn build_membership_view(config: &DaemonConfig, self_node: &NodeId) -> MembershipView {
+    let mut candidates = vec![self_node.clone()];
+    for raw in &config.cluster.seed_peers {
+        let peer = seed_peer_node_id(raw);
+        if !candidates.contains(&peer) {
+            candidates.push(peer);
+        }
+    }
+    MembershipView::new(candidates)
+}
+
+/// Renders one `cluster.seed_peers` entry as the [`NodeId`] its own boot
+/// will present as — matching [`system::detect_node_id`]'s
+/// `<hostname>/<incarnation>` convention. `cluster.seed_peers` entries are
+/// dial addresses (`host` or `host:port`, §9.1.3), so a trailing `:<port>`
+/// (all-ASCII-digit, so a bare IPv6 literal is never mistaken for one) is
+/// stripped before appending the fixed v0.1 incarnation
+/// ([`system::V01_FIXED_INCARNATION`] — no real per-peer incarnation is
+/// knowable from config alone; `FenceBoot`'s real draw is issue #53's).
+/// This is advisory, like the whole membership view (§5.2): a seed entry
+/// whose host does not match what that peer's own `detect_node_id` produces
+/// costs one avoidable forward hop once ownership resolves to a
+/// name nothing answers to, never correctness.
+fn seed_peer_node_id(raw: &str) -> NodeId {
+    let host = raw
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(raw, |(host, _)| host);
+    NodeId::new(format!("{host}/{}", system::V01_FIXED_INCARNATION))
 }
 
 /// The ingest roller's obligation (`duckspout-staging/src/seal.rs` module
