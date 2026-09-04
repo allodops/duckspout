@@ -16,8 +16,8 @@
 //! - every cross-crate port trait (ADR-0008): [`ports::Clock`],
 //!   [`ports::Scheduler`], [`ports::Transport`], [`ports::Storage`],
 //!   [`ports::AcceptAdapter`], [`ports::StageCommitter`],
-//!   [`ports::SealSurface`], [`ports::WatermarkBookkeeping`],
-//!   [`ports::LakeCommitter`].
+//!   [`ports::ReplicaLog`], [`ports::SealSurface`],
+//!   [`ports::WatermarkBookkeeping`], [`ports::LakeCommitter`].
 //!
 //! No I/O anywhere: this crate's dependencies are `serde`, `serde_json`,
 //! thiserror, and bytes — nothing that can open a socket or a file.
@@ -42,10 +42,11 @@ pub use manifest::{OriginSeqRange, PartKind, WindowManifest};
 pub use otlp::{GrpcCode, OtlpErrorClass};
 pub use ports::{
     AcceptAdapter, AcceptError, AttachInfo, BoxFuture, Clock, ColumnSpec, CommitOutcome,
-    DecodedBatch, DrainableWindow, DropOutcome, LakeCommitter, LakeError, LedgerRejection,
-    Scheduler, SchemaEvolution, SealError, SealRequest, SealSurface, SealedPart, StageCommitter,
-    StageError, StageOutcome, StagedCoverage, Storage, StorageError, StoragePath, Transport,
-    TransportError, WatermarkBookkeeping, WireError, WireRequest,
+    DecodedBatch, DrainableWindow, DropOutcome, ForwardedRecord, LakeCommitter, LakeError,
+    LedgerRejection, ReplicaApplyError, ReplicaLog, Scheduler, SchemaEvolution, SealError,
+    SealRequest, SealSurface, SealedPart, StageCommitter, StageError, StageOutcome, StagedCoverage,
+    Storage, StorageError, StoragePath, Transport, TransportError, WatermarkBookkeeping, WireError,
+    WireRequest,
 };
 pub use status::{NodeStatus, OverloadStatus, fill_scaled_budget, throttle_retry_delay_ms};
 pub use trace::{EnvironmentEvent, TraceEvent, TraceRecord, TraceSink};

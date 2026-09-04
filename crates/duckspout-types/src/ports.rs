@@ -354,6 +354,101 @@ pub trait StageCommitter: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// ReplicaLog (v0.2)
+// ---------------------------------------------------------------------------
+
+/// One forwarded replication record, exactly as the origin staged it (§5.4
+/// `Forward`): the peer applies it at the origin's own `(partition, seq)`
+/// range — it never assigns either itself, unlike [`StageCommitter`]'s own
+/// commit, which mints a fresh `seq` locally. This is why `PeerApply` cannot
+/// reuse [`StageCommitter::stage_commit`]: the two operations differ in
+/// exactly the one thing that matters for gap-freedom (who assigns `seq`).
+///
+/// `range` mirrors [`OriginSeqRange`]: a `StageCommit` may mint more than one
+/// sequence number in a single durable transaction (a multi-row batch), so a
+/// `Forward` ships the whole contiguous range that commit produced, not one
+/// `seq` at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedRecord {
+    /// The partition the range belongs to.
+    pub partition: PartitionId,
+    /// The origin-assigned, contiguous `(origin, seq)` range this record
+    /// covers (§4.2.3, §5.4).
+    pub range: OriginSeqRange,
+    /// The dense per-partition window the rows were staged into (§2.3).
+    pub window: WindowId,
+    /// The dataset the rows belong to.
+    pub dataset: DatasetId,
+    /// The rows themselves, as one Arrow IPC stream — opaque here exactly as
+    /// [`DecodedBatch::records`] is (§10.1: this crate stays near-leafless).
+    pub records: Bytes,
+}
+
+/// A `PeerApply` durable-apply failure (§5.4): the record is **not**
+/// staged and **must not** be receipted (the exact bug PR #192's ACPR pass
+/// on the P model's `Node.p` caught and fixed: a receipt for a record that
+/// was never actually staged).
+#[derive(Debug, thiserror::Error)]
+pub enum ReplicaApplyError {
+    /// The replica-log backend failed the durable apply, described.
+    #[error("replica-log backend: {0}")]
+    Backend(String),
+}
+
+/// The peer-side durable-apply boundary `PeerApply` (§5.4) commits through:
+/// "the peer applies the batch into its hot staging table for the
+/// partition" (`docs/design/replication.md` §4). Defined here, not in
+/// `duckspout-staging` directly (ADR-0008: protocol×protocol edges are
+/// banned, so a port crossing the replication↔staging boundary lives in
+/// `duckspout-types`, exactly as [`SealSurface`] does for the drain↔staging
+/// boundary) — `duckspout-staging` is expected to implement it over the same
+/// hot engine [`StageCommitter`] commits through ("the table is the log," §4:
+/// one storage engine, one fsync discipline, one recovery path for both the
+/// origin's own rows and a peer's applied ones).
+///
+/// `duckspout-replication` is the sole consumer; wiring a concrete
+/// `duckspout-staging` implementation into the daemon's composition root is
+/// tracked as follow-up work (issue #193), not done in the same change that
+/// defines the port — matching how this workspace lands a port and its
+/// implementation as separately reviewable steps elsewhere (`SealSurface`
+/// landed ahead of the drain that fully exercises it).
+///
+/// Every method reads or mutates state for one `(origin, partition)` pair —
+/// gap-freedom and fencing are both scoped that way (§5.4; generalized here
+/// from the origin-only granularity the checker-validated P model uses,
+/// since the real system has a partition dimension the P model deliberately
+/// omits, `docs/design/p-tla-correspondence.md` §3.2).
+pub trait ReplicaLog: Send + Sync {
+    /// The highest contiguous `seq` this peer has durably applied for
+    /// `(origin, partition)` — `0` when nothing has been applied yet. This
+    /// is `AppliedThru` (`specs/DuckSpoutCore.tla`) and the receipt
+    /// watermark `Receipt` ships (§5.4).
+    fn applied_thru(&self, origin: &NodeId, partition: &PartitionId) -> u64;
+
+    /// Whether `seq` for `(origin, partition)` has already been durably
+    /// applied. `PeerApply`'s idempotent-duplicate path (`seq <=
+    /// applied_thru`) calls this **before** re-receipting rather than
+    /// trusting the incoming Forward's own claim — the defensive guard
+    /// PR #192's ACPR pass added to the P model's `Node.p` after finding
+    /// that an incoming message reusing an already-used `seq` for a
+    /// genuinely different record could otherwise fabricate a receipt for a
+    /// record this peer never actually staged.
+    fn has_applied(&self, origin: &NodeId, partition: &PartitionId, seq: u64) -> bool;
+
+    /// Durably applies `record` into this peer's hot staging table, exactly
+    /// as `StageCommit` durably applies the origin's own rows (one fsynced
+    /// transaction, §4.2 A1). Callers (`duckspout-replication`) call this
+    /// only after `PeerApply`'s fencing and gap-freedom guards both pass —
+    /// this port performs no guard evaluation of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicaApplyError`] — the record is not staged; the caller must not
+    /// receipt it (§5.4).
+    fn apply(&self, record: ForwardedRecord) -> BoxFuture<'_, Result<(), ReplicaApplyError>>;
+}
+
+// ---------------------------------------------------------------------------
 // SealSurface (v0.1)
 // ---------------------------------------------------------------------------
 

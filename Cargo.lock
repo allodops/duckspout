@@ -1039,9 +1039,12 @@ dependencies = [
 name = "duckspout-replication"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "duckspout-types",
  "proptest",
  "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
