@@ -26,7 +26,7 @@ use crate::dataset::DatasetKind;
 use crate::ids::{DatasetId, PartName, PartitionId, TenantId, WindowId};
 use crate::manifest::{OriginSeqRange, WindowManifest};
 use crate::otlp::{GrpcCode, OtlpErrorClass};
-use crate::watermark::WatermarkRow;
+use crate::watermark::{LossLedgerRow, WatermarkRow};
 
 use crate::ids::NodeId;
 
@@ -997,4 +997,172 @@ pub trait Registry: Send + Sync {
         node: &NodeId,
         role: ClaimRole,
     ) -> BoxFuture<'_, Result<(), RegistryError>>;
+}
+
+// ---------------------------------------------------------------------------
+// LossLedgerCommitter (v0.2, §5.8, issue #54)
+// ---------------------------------------------------------------------------
+
+/// A [`LossLedgerCommitter::commit_loss`] failure. Every variant is a
+/// not-durable outcome — the ledger row is not recorded and the watermark
+/// has not moved.
+///
+/// **Honestly, this has exactly one variant today (ACPR #199 LOW-8(b)):** an
+/// earlier revision of this doc claimed it "mirrors [`LakeError`]'s own
+/// split between [backend-invariant and transient]" — [`LakeError`] draws
+/// that split across THREE variants (`NotImplemented`, `Misconfigured`,
+/// `Backend`) plus its own [`CommitOutcome`] carrying the transient half
+/// separately; this type has only [`LossCommitError::Backend`], so no such
+/// split exists here yet. Nothing wrong with that on its own — `commit_loss`
+/// is a single durable write, not `commit_files`'s three-valued outcome —
+/// but the doc should not claim a structural parallel that isn't there.
+#[derive(Debug, thiserror::Error)]
+pub enum LossCommitError {
+    /// A backend-invariant failure — misconfiguration or an unimplemented
+    /// backend.
+    #[error("loss-ledger commit backend: {0}")]
+    Backend(String),
+}
+
+/// Atomically persists one `DeclareLoss` confession alongside the watermark
+/// advance it authorizes (§5.8: "the watermark never moves without the
+/// confession landing atomically beside it ... `WatermarkHonesty`'s contract
+/// becomes 'complete, except the ledgered ranges'"). A **separate** port from
+/// [`LakeCommitter`] rather than a seventh method on it: `LakeCommitter`'s own
+/// doc comment caps it at six operations because "nothing on the critical
+/// path may need more" (Keep Rule, §11), and `DeclareLoss` is deliberately
+/// the opposite of that — an operator-invoked, never-automatic ceremony
+/// (§5.8), off the drain's critical path entirely. A concrete implementation
+/// is free to share the same underlying catalog transaction machinery as
+/// [`LakeCommitter::commit_files`] (the same `DuckLake` catalog is the
+/// obvious backend, §6.4) — that is a backend-implementation choice, not
+/// part of this port's contract, exactly as [`ReplicaLog`] and
+/// [`StageCommitter`] are free to share one hot engine ("the table is the
+/// log", §5.4) despite being two separate ports.
+///
+/// Home crate: none yet, matching [`Registry`]'s own precedent — a concrete
+/// `duckspout-lake-ducklake`-backed implementation and daemon/`duckspout-ctl`
+/// composition wiring (including the "refused while any live replica still
+/// advertises coverage" guard's live-coverage source) are deliberately
+/// deferred to a follow-up issue; this PR lands the port and the pure
+/// ceremony guard (`duckspout_watermark::loss::check_declare_loss`) it
+/// gates, matching how #51/#53 landed `ReplicaLog`/`Registry` ahead of their
+/// concrete backends.
+pub trait LossLedgerCommitter: Send + Sync {
+    /// Durably records `row` and, when the ledger's own re-run of the
+    /// advance rule (`duckspout_watermark::WatermarkLedger::record_loss`)
+    /// produces one, the watermark row it authorizes — both in the same
+    /// catalog transaction, or neither. The caller runs
+    /// `duckspout_watermark::loss::check_declare_loss` (consent +
+    /// refusal-while-recoverable) **before** calling this — this port
+    /// performs no guard evaluation of its own, exactly as [`ReplicaLog`]
+    /// and [`Registry`] perform none of theirs.
+    ///
+    /// **Atomicity is scoped to exactly ONE row, not the whole ceremony
+    /// (ACPR #199 LOW-7).** `check_declare_loss` accepts a request naming
+    /// several ranges and refuses or approves it as one all-or-nothing
+    /// decision — but that decision covers only the CHECK. Once approved, a
+    /// caller submitting an N-range `DeclareLoss` request calls this method
+    /// once per range, i.e. N separate durable transactions; a failure
+    /// after some have already committed leaves those ranges permanently
+    /// ledgered and the rest not, with no rollback path back to "as if the
+    /// whole ceremony never happened." This is likely an acceptable
+    /// consequence given `DeclareLoss` is already an exceptional,
+    /// operator-invoked ceremony (§5.8) — an operator can simply retry the
+    /// remaining, not-yet-ledgered ranges — but it is a real, disclosed
+    /// property of this port's contract, not something a caller should
+    /// assume away from the request-level "all-or-nothing" wording in
+    /// `check_declare_loss`'s own docs (which is honest about scoping to
+    /// the CHECK, not the commit). A future revision could accept
+    /// `Vec<LossLedgerRow>` for genuine multi-range commit atomicity; that
+    /// is not this port's contract today.
+    ///
+    /// # Errors
+    ///
+    /// [`LossCommitError`] only for backend-invariant failures; a
+    /// transient rejection is expected to fold into a retry at the caller.
+    /// **What "idempotent" covers here, honestly (ACPR #199 LOW-8(c)):**
+    /// `duckspout_watermark::WatermarkLedger::record_loss`'s own
+    /// IN-MEMORY coverage union is naturally idempotent for a repeated
+    /// row — recording the same range twice folds to the same coverage
+    /// state. That is NOT the same claim as this durable PORT being
+    /// idempotent: [`row`](LossLedgerRow) carries a `declared_at_ms` the
+    /// caller supplies fresh on each retry, so a naive implementation that
+    /// simply `INSERT`s the row would durably persist a SECOND permanent
+    /// ledger entry for the same declared range on retry after a failure
+    /// whose durable effect was actually unknown (the same "was it durable"
+    /// ambiguity [`LakeCommitter::commit_files`]'s own `Indeterminate`
+    /// outcome exists to resolve — this port has no such three-valued
+    /// outcome and does not resolve it). This is an open question a
+    /// concrete implementation must address (e.g. an upsert keyed on the
+    /// declared range, or a read-back before retry), not something this
+    /// port's contract currently settles.
+    fn commit_loss(
+        &self,
+        row: LossLedgerRow,
+        watermark: Option<WatermarkRow>,
+    ) -> BoxFuture<'_, Result<(), LossCommitError>>;
+}
+
+// ---------------------------------------------------------------------------
+// TakeoverDrainTrigger (v0.2, §5.6 step 4, issue #54)
+// ---------------------------------------------------------------------------
+
+/// One partition whose new owner (always the LOCAL node raising this signal
+/// — a node only ever learns of its own promotion) must now drain the dead
+/// owner's undrained window(s) from its own already-replicated copy (§5.6
+/// step 4, `TakeoverDrain`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeoverDrainSignal {
+    /// The partition whose ownership just transferred.
+    pub partition: PartitionId,
+    /// The node whose death triggered the transfer.
+    pub dead_owner: NodeId,
+    /// The new owner — always the node raising this signal.
+    pub new_owner: NodeId,
+}
+
+/// A [`TakeoverDrainTrigger::trigger`] failure.
+#[derive(Debug, thiserror::Error)]
+pub enum TakeoverDrainError {
+    /// A backend-invariant failure in whatever schedules the drain side.
+    #[error("takeover-drain trigger backend: {0}")]
+    Backend(String),
+}
+
+/// The seam `TakeoverDrain` (§5.6 step 4) crosses from `duckspout-replication`
+/// (which resolves ownership and detects the transfer, `crate::routing`,
+/// `duckspout_replication::takeover`) into the drain side (which knows how
+/// to seal/commit windows, `duckspout-drain`) — the two are both protocol
+/// crates, so a direct edge is banned (ADR-0008) and the port lives here,
+/// exactly as [`SealSurface`] crosses the drain↔staging boundary.
+///
+/// Called once `duckspout_replication::takeover::resolve_takeover` (plus the
+/// caller's own dead-node detection and [`Registry`]-backed liveness feed,
+/// neither of which this issue implements — §5.6 step 1 is a separate,
+/// Heartbeat-TTL-based concern) determines the local node has newly become
+/// `signal.partition`'s ring owner. At-least-once-safe: the drain side's own
+/// scheduling (`duckspout-drain`'s existing dense-next fence,
+/// `SingleDrainCommit`) is what actually makes a repeated or racing trigger
+/// harmless, not this port's own delivery guarantee.
+///
+/// Home crate: none yet. A concrete implementation — wiring this into
+/// `duckspout-drain`'s `DrainCoordinator` (so the partition's already-
+/// locally-replicated, already-closed windows become schedulable) plus the
+/// `duckspout-daemon` composition that calls [`TakeoverDrainTrigger::trigger`]
+/// in the first place — is deliberately deferred to a follow-up issue (this
+/// PR's description names it), matching how [`ReplicaLog`]'s and
+/// [`Registry`]'s own concrete backends were deferred past the PRs that
+/// defined them (#193, and this port's own precedent above).
+pub trait TakeoverDrainTrigger: Send + Sync {
+    /// Signals a completed ownership transfer for `signal.partition`.
+    ///
+    /// # Errors
+    ///
+    /// [`TakeoverDrainError`] for a backend-invariant failure in whatever
+    /// schedules the drain side; never for "the partition was already
+    /// draining" or similar transient/idempotent conditions, which the
+    /// drain side's own fence absorbs silently.
+    fn trigger(&self, signal: TakeoverDrainSignal)
+    -> BoxFuture<'_, Result<(), TakeoverDrainError>>;
 }

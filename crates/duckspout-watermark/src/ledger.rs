@@ -839,6 +839,54 @@ mod tests {
         }
     }
 
+    /// ACPR #199 HIGH-4 scratch-repro re-verification: a second manifest
+    /// for an ALREADY-COMMITTED window — exactly the shape a churn-boundary
+    /// supplement part (§5.6 step 5) would need to commit — is rejected
+    /// with `WindowNotNext`, never `CoverageOverlap`, even though its
+    /// coverage is genuinely disjoint from what was already committed for
+    /// that window. This is the concrete, executable proof behind
+    /// `duckspout_replication::takeover`'s corrected module docs: an
+    /// earlier revision of this codebase's documentation (that module,
+    /// `compute_residue`'s own doc, and PR #199's own description) claimed
+    /// this guard "already enforces" disjoint supplement coverage
+    /// generically — false, because the dense-next contiguity check below
+    /// runs BEFORE any coverage-overlap check and rejects the second
+    /// manifest outright. `duckspout_replication::takeover::compute_residue`
+    /// computes a value that cannot currently be submitted through any
+    /// commit path this ledger offers.
+    #[test]
+    fn a_second_manifest_for_an_already_committed_window_hits_window_not_next_not_coverage_overlap()
+    {
+        let mut ledger = WatermarkLedger::new();
+        ledger
+            .record_commit(&manifest("p", 0, &[("o1", 1, 5)], 1_000))
+            .expect("window 0 commits its primary part");
+
+        // A hypothetical supplement for the SAME window, with coverage that
+        // is genuinely disjoint from what window 0 already committed
+        // (o1 6..=10, no overlap with 1..=5 at all) -- the exact shape
+        // `compute_residue` would hand a caller to submit.
+        let supplement = manifest("p", 0, &[("o1", 6, 10)], 1_000);
+        let err = ledger
+            .record_commit(&supplement)
+            .expect_err("no code path accepts a second manifest for window 0 today");
+        assert!(
+            matches!(
+                err,
+                AdvanceError::WindowNotNext {
+                    expected: WindowId(1),
+                    got: WindowId(0),
+                    ..
+                }
+            ),
+            "expected WindowNotNext (the dense-next fence, reached first), \
+             got {err:?} -- if this ever becomes CoverageOverlap instead, \
+             the dense-next check has grown a supplement exemption and the \
+             module docs claiming no such exemption exists need updating \
+             alongside it"
+        );
+    }
+
     #[test]
     fn loss_for_an_unknown_partition_records_without_a_watermark() {
         let mut ledger = WatermarkLedger::new();

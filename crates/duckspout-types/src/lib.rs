@@ -18,7 +18,8 @@
 //!   [`ports::AcceptAdapter`], [`ports::StageCommitter`],
 //!   [`ports::ReplicaLog`], [`ports::SealSurface`],
 //!   [`ports::WatermarkBookkeeping`], [`ports::LakeCommitter`],
-//!   [`ports::Registry`].
+//!   [`ports::Registry`], [`ports::LossLedgerCommitter`] (§5.8),
+//!   [`ports::TakeoverDrainTrigger`] (§5.6 step 4).
 //!
 //! No I/O anywhere: this crate's dependencies are `serde`, `serde_json`,
 //! thiserror, and bytes — nothing that can open a socket or a file.
@@ -44,11 +45,15 @@ pub use otlp::{GrpcCode, OtlpErrorClass};
 pub use ports::{
     AcceptAdapter, AcceptError, AttachInfo, BoxFuture, ClaimRole, Clock, ColumnSpec, CommitOutcome,
     DecodedBatch, DrainableWindow, DropOutcome, ForwardedRecord, LakeCommitter, LakeError,
-    LedgerRejection, Registry, RegistryError, ReplicaApplyError, ReplicaLog, Scheduler,
-    SchemaEvolution, SealError, SealRequest, SealSurface, SealedPart, StageCommitter, StageError,
-    StageOutcome, StagedCoverage, Storage, StorageError, StoragePath, Transport, TransportError,
-    WatermarkBookkeeping, WireError, WireRequest,
+    LedgerRejection, LossCommitError, LossLedgerCommitter, Registry, RegistryError,
+    ReplicaApplyError, ReplicaLog, Scheduler, SchemaEvolution, SealError, SealRequest, SealSurface,
+    SealedPart, StageCommitter, StageError, StageOutcome, StagedCoverage, Storage, StorageError,
+    StoragePath, TakeoverDrainError, TakeoverDrainSignal, TakeoverDrainTrigger, Transport,
+    TransportError, WatermarkBookkeeping, WireError, WireRequest,
 };
 pub use status::{NodeStatus, OverloadStatus, fill_scaled_budget, throttle_retry_delay_ms};
 pub use trace::{EnvironmentEvent, TraceEvent, TraceRecord, TraceSink};
-pub use watermark::{AppliedWatermarkRow, DimensionWatermarkRow, WatermarkRow};
+pub use watermark::{
+    AppliedWatermarkRow, DeclareLossRequest, DimensionWatermarkRow, LossLedgerRow, LostRange,
+    ReplicaCoverage, WatermarkRow,
+};
