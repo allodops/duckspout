@@ -230,6 +230,24 @@ scratch, uncommitted variant that drops the `!degraded` guard from
 `sweepOrphanedKeys` is caught in 5 schedules with a genuine
 still-degraded-takeover trace — see that PR for the exact excerpt.
 
+**Known divergence, flagged here (ACPR #197 MEDIUM-5), not fixed in `p/`:**
+`Node.p`'s `eFenceBoot` handler bumps the incarnation unconditionally
+(`incarnation = fb.priorIncarnation + 1`) BEFORE it even checks
+`catalogOutage`/`fb.priorIncarnation` to decide whether to also set
+`degraded` — so `Node.p` bumps the incarnation on the `DegradedBoot` branch
+too. `specs/DuckSpoutCore.tla`'s own `DegradedBoot(n)` action does the
+opposite: `UNCHANGED <<catalogSeq, inc, ...>>` — the incarnation is
+explicitly NOT bumped while degraded, only the boolean `degraded` set membership
+changes. The Rust implementation (`crates/duckspout-replication/src/boot.rs`)
+follows the TLA+ action, not `Node.p`, on this specific branch — `boot.rs`'s
+own module doc says so explicitly. This PR does not change `p/` to match
+TLA+ here (out of this PR's scope, which touches no `p/` file); it is named
+as open scope for whoever next touches `TestDegradedBoot`. Worth carrying
+forward for issue #54: an un-bumped degraded reboot resumes under the SAME
+incarnation its dead predecessor held, so it cannot fence out that
+predecessor as a zombie by incarnation alone if the "dead" node was actually
+just partitioned, not crashed.
+
 **The genuinely-new-node boot case, now modeled too (`TestNewNodeBoot`):**
 §7's other boot-time split reads "Only a genuinely new node — no persisted
 incarnation — waits, in a typed startup state. It has no identity to be

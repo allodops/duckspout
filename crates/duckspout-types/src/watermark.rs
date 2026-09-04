@@ -49,3 +49,109 @@ pub struct AppliedWatermarkRow {
     /// is refused (gap refusal, §5).
     pub applied_seq: u64,
 }
+
+// ---------------------------------------------------------------------------
+// DeclareLoss (§5.8, issue #54)
+// ---------------------------------------------------------------------------
+//
+// These three types were originally sketched, types-only, inside
+// `duckspout-watermark::loss` ("the ceremony's logic ... lands at v0.2 with
+// replication" — that module's own doc comment). They move here now that the
+// ceremony is real (issue #54): `LossLedgerCommitter` below needs
+// `LossLedgerRow` in its signature, and ADR-0008 requires every type crossing
+// a cross-crate port boundary to live in `duckspout-types`, exactly as
+// `StagedCoverage`/`WindowManifest` already do for their own boundaries.
+// `duckspout-watermark::loss` re-exports all three verbatim — no shape
+// change, so nothing downstream (the existing `WatermarkLedger::record_loss`,
+// its tests, `reconstruct.rs`) needed to change.
+
+/// One **exact** lost `(partition, origin, seq-range)` — §5.8: no wildcards,
+/// no "whatever is missing". Seqs are 1-based and inclusive on both ends.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LostRange {
+    /// The partition the lost range belongs to.
+    pub partition: PartitionId,
+    /// The origin that assigned the lost sequence numbers.
+    pub origin: NodeId,
+    /// First lost seq, inclusive (1-based).
+    pub first_seq: u64,
+    /// Last lost seq, inclusive.
+    pub last_seq: u64,
+}
+
+/// The `DeclareLoss` ceremony's request shape (§5.8). Unwedging a frozen
+/// watermark is a deliberate operator act, never automatic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclareLossRequest {
+    /// The exact ranges being declared lost.
+    pub ranges: Vec<LostRange>,
+    /// The literal consent parameter — the name is the consent form (§5.8).
+    /// The ceremony refuses any request where this is not `true`; it is a
+    /// field, not a default.
+    pub accept_data_loss: bool,
+}
+
+/// A permanent loss-ledger row (§5.8, §7.3): the first-class queryable
+/// confession, written **in the same catalog transaction** as the watermark
+/// advance past the lost range. `WatermarkHonesty`'s contract becomes
+/// "complete, except the ledgered ranges" — auditable forever.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LossLedgerRow {
+    /// The declared-lost range.
+    pub range: LostRange,
+    /// When the ceremony declared the loss, Unix milliseconds — supplied by
+    /// the caller through the `Clock` port (this crate reads no clock, D-2).
+    pub declared_at_ms: i64,
+}
+
+/// One live replica's advertised coverage of one origin's sequence range
+/// within a partition (§5.5's `replicated_through`) — exactly the evidence
+/// `DeclareLoss`'s refusal guard reads (§5.8: "refused while any live
+/// replica still advertises coverage of the range"). The caller assembles
+/// this from whatever it trusts as "live" (a registry read, a heartbeat-
+/// filtered membership view, §5.6's detection timeline) — this crate reads
+/// no such state itself; determining liveness is `duckspout-replication`'s
+/// domain, not this one's.
+///
+/// **`partition` is load-bearing (ACPR #199 HIGH-1):** an earlier revision
+/// of this type carried no partition field at all, so
+/// `check_declare_loss`'s refusal guard could only match on `origin` —
+/// a multi-partition `DeclareLoss` request whose caller supplied coverage
+/// scoped to only SOME of the request's partitions would be silently
+/// approved for a range in an unscoped partition even when a live replica
+/// there still fully covered it, because the guard had no field to notice
+/// the mismatch with. `partition` closes that hole: the guard now matches
+/// on `(partition, origin)`, exactly as the ranges themselves are scoped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaCoverage {
+    /// The live node advertising this coverage.
+    pub node: NodeId,
+    /// The partition this coverage answers for.
+    pub partition: PartitionId,
+    /// The origin whose sequence range this coverage answers for.
+    pub origin: NodeId,
+    /// The highest contiguous seq `node` advertises as durably held for
+    /// `origin` within `partition`.
+    pub replicated_thru: u64,
+}
+
+#[cfg(test)]
+mod loss_tests {
+    use super::*;
+
+    #[test]
+    fn loss_rows_round_trip_through_serde() {
+        let row = LossLedgerRow {
+            range: LostRange {
+                partition: PartitionId::new("t0-s0"),
+                origin: NodeId::new("node-a"),
+                first_seq: 6,
+                last_seq: 7,
+            },
+            declared_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&row).expect("serializes");
+        let back: LossLedgerRow = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, row);
+    }
+}

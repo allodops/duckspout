@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 duckspout-types = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -8,9 +8,13 @@
 //!
 //! §5.2's own words: "the candidate set comes from the registry (`nodes`
 //! table, section 5), seeded at bootstrap by `cluster.seed_peers` ... and
-//! superseded by the registry once reachable." The registry does not exist
-//! yet — it is issue #53's scope (`Incarnation fencing + registry claims`).
-//! [`MembershipView`] is therefore, at v0.1, permanently in the
+//! superseded by the registry once reachable." Issue #53 defines the
+//! catalog/registry PORT ([`duckspout_types::Registry`]) and the boot
+//! ceremony that draws an incarnation from it (`crate::boot`), but neither a
+//! concrete registry implementation nor a live heartbeat/liveness feed into
+//! this module exists yet — that daemon-composition wiring is deliberately
+//! deferred (`crate::boot`'s own module docs name the follow-up).
+//! [`MembershipView`] is therefore, at v0.1, still permanently in the
 //! seed-peers regime: a static snapshot built once at daemon boot from
 //! `cluster.seed_peers` plus the local node's own id
 //! (`duckspout-daemon/src/wiring.rs`), never refreshed by a live
@@ -24,10 +28,11 @@
 //! membership view minus the dead node." That specific case is not new
 //! logic to build here: it falls out for free from [`hrw_ranked`] run over
 //! whatever candidate set the caller supplies. A liveness-aware caller
-//! (post-#53, once a heartbeat/registry feed exists) simply constructs a
+//! (once a heartbeat/registry feed exists — §5.6's own detection timeline is
+//! issue #54's scope, `Node death end-to-end`) simply constructs a
 //! [`MembershipView`] with the dead node already excluded, and
-//! [`route_write`] "ring-walks" automatically — the missing piece #53 adds
-//! is the INPUT (who is live), not new ring-walk logic in this module.
+//! [`route_write`] "ring-walks" automatically — the missing piece is the
+//! INPUT (who is live), not new ring-walk logic in this module.
 //!
 //! What is genuinely NOT proven to work today, despite the math being sound
 //! (ACPR #196 LOW-6 — this claim was previously overstated as unqualified):

@@ -37,6 +37,18 @@
 //!   at-or-below, so a row *at* the watermark instant is lake-covered
 //!   ([`WatermarkLedger::covers`]).
 //!
+//! # `DeclareLoss` (§5.8, issue #54)
+//!
+//! [`WatermarkLedger::record_loss`] is the bookkeeping half (recording a
+//! [`LossLedgerRow`] and re-running the advance rule); [`check_declare_loss`]
+//! is the ceremony's own guard (the literal `accept_data_loss: true` consent,
+//! and refusal while any live replica still advertises coverage) — see
+//! `crate::loss`'s module docs for the full shape and what stays deliberately
+//! deferred (the durable atomic commit through
+//! [`duckspout_types::LossLedgerCommitter`], and gathering the live-coverage
+//! snapshot itself, both composition-root concerns this crate cannot reach,
+//! ADR-0008).
+//!
 //! Layering (§10.1, ADR-0008): depends on `duckspout-types` only among
 //! workspace crates. Persistence is the committer's transaction, never this
 //! crate's I/O.
@@ -55,9 +67,14 @@ mod reconstruct;
 mod testutil;
 
 pub use ledger::{AdvanceError, WatermarkLedger, WindowRecord};
-pub use loss::{DeclareLossRequest, LossLedgerRow, LostRange};
+pub use loss::{DeclareLossRequest, LossLedgerRow, LossRefusal, LostRange, check_declare_loss};
 pub use port::SharedLedger;
 pub use reconstruct::{CoverageHole, ReconstructError, Reconstruction, Stall, StallReason};
+
+/// [`duckspout_types::ReplicaCoverage`], re-exported for convenience next to
+/// [`check_declare_loss`], which consumes it — see that function's own doc
+/// comment.
+pub use duckspout_types::ReplicaCoverage;
 
 /// The port this crate implements for the drain (ADR-0008 home-crate
 /// re-export): the drain computes nothing watermark-shaped itself — it
