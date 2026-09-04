@@ -1,0 +1,72 @@
+# Fixture expectations for the Replication trace-conformance self-test
+# (§8.2's teeth; runner: scripts/trace-conformance.mjs, spec:
+# specs/traces/ReplicationTrace.tla).  Mirrors ingest-manifest.toml's
+# structure and discipline exactly: every doctored fixture MUST be
+# rejected by exactly the mechanism named here — one tooth going blunt
+# cannot hide behind another — and the runner asserts halt cursors and
+# invariant names, never just "it failed".
+#
+# PROVENANCE (see ReplicationTrace.tla's header for the full account):
+# every fixture below is HAND-AUTHORED, not captured from a real
+# `duckspout-replication` run — no such implementation exists yet
+# (ADR-0012 blocks it, #51, until issue #55 and the P model, #132, both
+# land).  Issue #55's own tracking comment called a synthetic trace
+# sibling "useful only as a self-test of the refinement checker, not the
+# genuine conformance value a trace sibling exists to provide"; this
+# manifest is exactly that self-test, and is honest about being one --
+# there is deliberately no "replication-captured.ndjson" entry (contrast
+# ingest-captured.ndjson, backed by duckspout-daemon's
+# tests/trace_capture.rs re-capturing and byte-comparing on every run).
+# scripts/trace-conformance.mjs's live and real-backend tiers stay
+# Ingest-only for the same reason; only the generic fixtures tier below
+# picks this manifest up.
+#
+# expect vocabulary: identical to ingest-manifest.toml's ("conforms" /
+# "halt" + halt_at / "invariant" + invariant / "decoder").
+#
+# The conforming trace is authored at ReplicationTrace.tla's documented
+# scope (see its header): two same-origin requests in window 1 (q1, q2)
+# carried through Forward -> PeerApply -> Receipt -> ClientAck at RF = 2,
+# n1 crashing once fully acked, n2 taking over the claim and draining
+# window 1 from its own replicated copy, n1 recovering (FenceBoot), and a
+# third request (q3, window 2) accepted and acked on the recovered n1 --
+# exercising the module's full 5.6 "node death, end to end" narrative.
+
+[[fixture]]
+file = "replication-conforming.ndjson"
+expect = "conforms"
+
+[[fixture]]
+file = "replication-doctored-receipt-before-peerapply.ndjson"
+expect = "halt"
+halt_at = 6
+why = "n2's Receipt of q1's record recorded before any PeerApply ever applied it: staged[n2] is still empty at that entry, so no record exists for Receipt to attest (R-1's receipted-copy count depends on Receipt only ever following a real apply) -- the refinement halts at the unexplainable Receipt, mirroring ack-before-stagecommit's reordering mechanism one protocol hop later"
+
+[[fixture]]
+file = "replication-doctored-peerapply-before-forward.ndjson"
+expect = "halt"
+halt_at = 5
+why = "n2's PeerApply of q1's record recorded before its own Forward: chan is empty (the message never crossed the network yet), so PeerApply has no message to apply -- the refinement halts at the unexplainable PeerApply, the network-crossing precondition Forward -> PeerApply -> Receipt depends on"
+
+[[fixture]]
+file = "replication-doctored-missing-forward.ndjson"
+expect = "halt"
+halt_at = 9
+why = "q1's Forward deleted while q2's stays recorded, leaving exactly one Forward-tagged entry for two staged records: existential matching lets that one entry explain q1's Forward instead (the refinement is payload-free, so it always prefers the binding that keeps the walk alive when one exists -- see ReplicationTrace.tla's header note on why a GENUINE PeerApply-gap doctoring is not representable at this granularity), which is itself informative -- q2's message never crosses the network under ANY binding. q1 acks cleanly (RF = 2 receipted) at entry 8; q2 has no receipt under any interpretation, so its ClientAck at entry 9 has no >= RF evidence to explain -- the walk halts there. A Forward that must silently cover two distinct records is exactly the bug this catches: the second one's durability (R-1) is never actually established, and the refinement says so at the first point that depends on it, not at the deleted step itself"
+
+[[fixture]]
+file = "replication-doctored-missing-clientack.ndjson"
+expect = "invariant"
+invariant = "TraceComplete"
+why = "q3's trailing ClientAck deleted (q3 lives in window 2, which nothing later in the trace needs closed, so this is a clean TraceComplete violation and not a cascading halt): the request resolves in reality (RF = 2 already receipted) but not in the record -- TraceComplete's resolution clause"
+
+[[fixture]]
+file = "replication-doctored-missing-lakecommit.ndjson"
+expect = "invariant"
+invariant = "TraceComplete"
+why = "window 1's LakeCommitOk (and its DropWindow) deleted after n2's post-takeover SealPart + PutPart: a PUT part left neither committed nor abandoned -- TraceComplete's drain-pipeline clause, now exercised specifically on a takeover-drained part rather than an ordinary one"
+
+[[fixture]]
+file = "replication-doctored-seq-gap.ndjson"
+expect = "decoder"
+why = "a per-node seq gap on n1 (…3 then 5): D-6's dense per-node numbering is violated; the decoder rejects before refinement ever runs, identically to ingest-doctored-seq-gap.ndjson's mechanism"
