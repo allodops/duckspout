@@ -45,6 +45,16 @@
 //!   tick, then the process exits (§9.1.2's shallow drain — v0.1 has no
 //!   replica peers to hand staged data to, so "shallow" here is exactly
 //!   "finish, do not orphan work mid-tick").
+//! - **HRW ring integration + ownership routing** (§5.2–5.3, issue #52):
+//!   [`Daemon::boot`] reads `cluster.seed_peers` and this node's own id into
+//!   a [`duckspout_replication::routing::MembershipView`]
+//!   (`build_membership_view`, private) and stores it, alongside
+//!   `cluster.rf`, on the daemon's own core state. [`DaemonHandle::routing_plan`] resolves
+//!   [`duckspout_replication::routing::route_write`] against that view —
+//!   the ring owner, the RF replica set, and whether this node is the
+//!   owner — for any partition, real composed state rather than the bare
+//!   `hrw_owner` re-export below on its own. See that re-export's doc
+//!   comment for exactly what remains unwired and why.
 //!
 //! # What is explicitly deferred, and why
 //!
@@ -60,6 +70,24 @@
 //!   built-in dataset, `otlp_logs` (the OTLP adapter's fixed target); its
 //!   drain plan (`otlp_logs_drain_plan`) is hardcoded rather than read
 //!   from a declaration ledger that does not exist yet.
+//! - **Actually Forwarding a routed write over the network** (issue #52's
+//!   own scope note): [`DaemonHandle::routing_plan`] makes the ownership
+//!   decision real and composed, but nothing in the accept path calls it
+//!   yet, because there is nothing to Forward *through*: no crate in this
+//!   workspace implements `duckspout_types::Transport` over a real
+//!   network today (only `duckspout-ctk`'s in-memory `InMemTransport`
+//!   exists, a test double), and `duckspout_types::ReplicaLog`'s concrete
+//!   `duckspout-staging` backend is issue #193's separate, already-filed
+//!   follow-up. Hooking `duckspout_replication::forward::forward_to_peers`
+//!   into the OTLP accept path needs both — a peer-transport server bound
+//!   on `node.peer_listen` (§9.6.1's already-reserved, currently-unbound
+//!   port) is genuinely new scope, not a wiring-only task, so it is left
+//!   for a dedicated follow-up rather than invented here as an untested
+//!   stub. `cluster.rf > 1` is therefore still not durable beyond the
+//!   local node's own copy at v0.1 — exactly the same limitation
+//!   `StageOutcome::DuplicateInFlight`'s and `client_ack_ready`'s own doc
+//!   comments already disclose ("unreachable at RF = 1 ... replication
+//!   (v0.2) makes it live"), unchanged by this issue.
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -77,7 +105,7 @@ use duckspout_staging::{
 };
 use duckspout_types::{
     BoxFuture, Clock, DatasetDeclaration, DatasetId, DatasetKind, DecodedBatch, LakeCommitter,
-    NodeId, SealSurface, StageCommitter, StageError, StageOutcome, Storage,
+    NodeId, PartitionId, SealSurface, StageCommitter, StageError, StageOutcome, Storage,
 };
 use duckspout_watermark::{SharedLedger, WatermarkLedger};
 use tokio::net::TcpListener;
@@ -88,11 +116,19 @@ use crate::serving::{HotFlightService, ServingConfig};
 use crate::status::{self, StatusSnapshot};
 use crate::system::{self, FsStorage, SystemClock};
 
-/// Placement (§5): any node accepts, then forwards to the HRW owner. Not
-/// wired into the accept path at v0.1 (module docs — single-node, no
-/// replication yet); re-exported so the composition-shape declaration
-/// (§10.1's crate graph) stays honest ahead of the v0.2 forwarding wiring.
+/// Placement (§5): any node accepts, then forwards to the HRW owner. The
+/// bare placement function, re-exported so the composition-shape
+/// declaration (§10.1's crate graph) stays honest even for callers that
+/// only need [`hrw_owner`] directly rather than a resolved
+/// [`RoutingPlan`] — [`DaemonHandle::routing_plan`] below is the real,
+/// composed seam (§5.2–5.3, issue #52): it resolves [`route_write`]
+/// against the [`MembershipView`] built at boot (`build_membership_view`,
+/// private), not a bare candidate list a caller has to
+/// assemble itself. **Not called from the OTLP accept path yet** — module
+/// docs' "What is explicitly deferred" section explains why (no peer
+/// `Transport` exists to Forward the routed write through).
 pub use duckspout_replication::hrw_owner;
+pub use duckspout_replication::routing::{MembershipView, RoutingPlan, route_write};
 
 /// Everything that can go wrong composing or booting the daemon. Every
 /// variant is a boot-time failure — nothing here is a runtime data-path
@@ -174,6 +210,44 @@ struct DaemonCore {
     clock: SystemClock,
     drain_stalled: AtomicBool,
     ready: AtomicBool,
+    /// The ownership-routing membership view (§5.2, issue #52), built once
+    /// at boot from `cluster.seed_peers` (module docs of
+    /// [`build_membership_view`]). Advisory and static for the lifetime of
+    /// the process at v0.1 — there is no live registry (#53) to refresh it
+    /// from yet.
+    membership: MembershipView,
+    /// `cluster.rf` (§5.1, §5.11), read once at boot.
+    rf: u16,
+}
+
+/// Assembles the [`DaemonCore`] from `config` and every already-opened port
+/// ([`Daemon::boot`]'s own locals) — split out of `boot` purely to keep that
+/// function under the workspace's line-count ceiling; it composes nothing
+/// [`Daemon::boot`] didn't already decide. Builds the ownership-routing
+/// [`MembershipView`] (§5.2, issue #52; [`build_membership_view`]'s own doc
+/// comment) as its one piece of actual logic.
+fn assemble_core(
+    config: &DaemonConfig,
+    node_id: NodeId,
+    stager: Arc<Stager>,
+    seal_surface: Arc<EngineSealSurface<FsStorage>>,
+    drain: DrainCoordinator,
+    ledger: Arc<SharedLedger>,
+    clock: SystemClock,
+) -> Arc<DaemonCore> {
+    let membership = build_membership_view(config, &node_id);
+    Arc::new(DaemonCore {
+        node_id,
+        stager,
+        seal_surface,
+        drain,
+        ledger,
+        clock,
+        drain_stalled: AtomicBool::new(false),
+        ready: AtomicBool::new(false),
+        membership,
+        rf: config.cluster.rf,
+    })
 }
 
 impl DaemonCore {
@@ -305,6 +379,19 @@ impl DaemonHandle {
     pub fn node_id(&self) -> &NodeId {
         &self.0.node_id
     }
+
+    /// Resolves the ownership-routing decision for `partition` (§5.2–5.3,
+    /// issue #52): the ring owner, the RF replica set, and whether this
+    /// node is that owner — [`route_write`] against the [`MembershipView`]
+    /// built at boot (`build_membership_view`, private) and `cluster.rf`.
+    ///
+    /// `None` only when the membership view is somehow empty — unreachable
+    /// past a real [`Daemon::boot`], which always seeds it with this node's
+    /// own id (`build_membership_view`'s own doc comment).
+    #[must_use]
+    pub fn routing_plan(&self, partition: &PartitionId) -> Option<RoutingPlan> {
+        route_write(partition, &self.0.node_id, &self.0.membership, self.0.rf)
+    }
 }
 
 /// A booted-but-not-yet-serving daemon: every port is wired and both
@@ -412,16 +499,15 @@ impl Daemon {
         )?
         .into_server();
 
-        let core = Arc::new(DaemonCore {
+        let core = assemble_core(
+            config,
             node_id,
-            stager: Arc::clone(&stager),
+            Arc::clone(&stager),
             seal_surface,
             drain,
             ledger,
             clock,
-            drain_stalled: AtomicBool::new(false),
-            ready: AtomicBool::new(false),
-        });
+        );
 
         // --- Listeners ---
         let (otlp_listener, otlp_addr) = bind_listener("otlp", config.node.otlp_listen).await?;
@@ -648,6 +734,108 @@ fn otlp_logs_drain_plan() -> DatasetDrainPlan {
     DatasetDrainPlan::from_declaration(&declaration, "ts")
 }
 
+/// Builds this node's [`MembershipView`] (§5.2, issue #52) from
+/// `cluster.seed_peers` plus `self_node` — the only membership source at
+/// v0.1, per `docs/design/replication.md` §5.2 ("seeded at bootstrap by
+/// `cluster.seed_peers`... superseded by the registry once reachable") and
+/// [`duckspout_replication::routing`]'s own module docs (the registry does
+/// not exist yet, issue #53). `self_node` is always included, so
+/// [`route_write`] never sees an empty view — even a lone, unconfigured
+/// node routes every partition to itself.
+///
+/// A duplicate peer entry (repeated in config, or one that happens to
+/// resolve to `self_node`'s own id) is folded rather than kept twice —
+/// [`MembershipView::new`] itself enforces distinctness on construction now
+/// (ACPR #196 MEDIUM-3), so this function no longer needs its own
+/// containment check to keep that invariant true.
+fn build_membership_view(config: &DaemonConfig, self_node: &NodeId) -> MembershipView {
+    let mut candidates = vec![self_node.clone()];
+    candidates.extend(
+        config
+            .cluster
+            .seed_peers
+            .iter()
+            .map(|raw| seed_peer_node_id(raw)),
+    );
+    MembershipView::new(candidates)
+}
+
+/// Renders one `cluster.seed_peers` entry as the [`NodeId`] its own boot
+/// will present as — matching [`system::detect_node_id`]'s
+/// `<hostname>/<incarnation>` convention. `cluster.seed_peers` entries are
+/// dial addresses (`host`, `host:port`, or `[ipv6]:port`, §9.1.3):
+///
+/// - A bracketed literal (`[::1]:7946`, `[fe80::1]`) has its brackets and
+///   any trailing `:<port>` stripped, leaving the bare address as the host.
+/// - An unbracketed entry has a trailing `:<port>` stripped only when
+///   exactly one `:` is present and the suffix after it is all ASCII
+///   digits — `host:port` and `10.0.0.1:7946` both qualify. An unbracketed
+///   entry with MORE than one `:` (`::1`, `fe80::1`, `2001:db8::1234`) is
+///   left untouched: a bare IPv6 literal's last hextet can itself be
+///   all-digit, and naively stripping "the part after the last colon"
+///   there produces a wrong, truncated host (ACPR #196 MEDIUM-4 — this
+///   function previously did exactly that, silently corrupting every bare
+///   IPv6 seed address). Bare (unbracketed) IPv6 seed addresses are
+///   therefore not a supported dial form here — use the bracketed form
+///   (`docs/operations.md` §9.1.3) to pair an IPv6 literal with a port.
+///
+/// The fixed v0.1 incarnation ([`system::V01_FIXED_INCARNATION`]) is
+/// appended after host extraction — no real per-peer incarnation is
+/// knowable from config alone; `FenceBoot`'s real draw is issue #53's.
+///
+/// This derivation is a REQUIREMENT, not merely advisory best-effort
+/// (ACPR #196 MEDIUM-5): every node in the cluster computes its OWN ring
+/// view from its OWN `cluster.seed_peers`, so a seed's host must match
+/// character-for-character what the peer it names will itself produce via
+/// [`system::detect_node_id`] (its own kernel hostname). A mismatch — a
+/// Kubernetes `StatefulSet` DNS name (`ds-0.ds.ns.svc`) differing from the
+/// pod's bare `hostname` (`ds-0`), or a seed given as a raw IP the peer
+/// never presents as its own identity — is not a transient, self-correcting
+/// divergence of the kind §5.2's "two nodes briefly holding different views
+/// cannot corrupt anything" license covers: it is a PERMANENT structural
+/// mismatch where no two nodes ever agree on any partition's owner,
+/// forwards address a `NodeId` nothing answers to, receipts never arrive,
+/// and writes sit below the RF floor indefinitely. No boot-time validation
+/// catches this yet (there is no peer-identity handshake to confirm a seed
+/// against) — an operator must configure `cluster.seed_peers` entries whose
+/// host portion is exactly each peer's own kernel hostname.
+fn seed_peer_node_id(raw: &str) -> NodeId {
+    NodeId::new(format!(
+        "{}/{}",
+        strip_seed_peer_port(raw),
+        system::V01_FIXED_INCARNATION
+    ))
+}
+
+/// The host-extraction half of [`seed_peer_node_id`] — split out so its unit
+/// tests can exercise the parsing directly without going through `NodeId`
+/// formatting.
+fn strip_seed_peer_port(raw: &str) -> &str {
+    if let Some(rest) = raw.strip_prefix('[') {
+        // Bracketed IPv6, with or without a trailing port: "[::1]:7946" or
+        // "[::1]". The bracketed literal itself is the host either way.
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        return raw;
+    }
+    match raw.rsplit_once(':') {
+        // Exactly one `:` and an all-digit suffix: an unambiguous
+        // `host:port` or `ipv4:port` form.
+        Some((host, port))
+            if !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && !host.contains(':') =>
+        {
+            host
+        }
+        // Zero or two-plus colons: no port to strip (a bare hostname), or a
+        // bare IPv6 literal this function does not attempt to split (module
+        // docs) — leave it untouched either way.
+        _ => raw,
+    }
+}
+
 /// The ingest roller's obligation (`duckspout-staging/src/seal.rs` module
 /// docs): note every window that is closed but not yet marked so. A live
 /// window strictly below its `(dataset, partition)`'s persistent high-water
@@ -774,4 +962,64 @@ fn catalog_uri_with_secret(
         return Ok(dsn.to_owned());
     }
     Ok(format!("{dsn} password={password}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `host:port` and `ipv4:port` — the two documented, unambiguous forms
+    /// (§9.1.3) — strip the port. `seed_peer_node_id`'s own doc comment for
+    /// the full contract (ACPR #196 MEDIUM-4).
+    #[test]
+    fn strips_the_port_from_an_unambiguous_host_or_ipv4_form() {
+        assert_eq!(strip_seed_peer_port("peer-a:7946"), "peer-a");
+        assert_eq!(strip_seed_peer_port("10.0.0.1:7946"), "10.0.0.1");
+    }
+
+    /// A bracketed IPv6 literal, with or without a trailing port, yields
+    /// the bare address as host — the one supported IPv6 dial form.
+    #[test]
+    fn bracketed_ipv6_yields_the_bare_address() {
+        assert_eq!(strip_seed_peer_port("[::1]:7946"), "::1");
+        assert_eq!(strip_seed_peer_port("[fe80::1]:7946"), "fe80::1");
+        assert_eq!(
+            strip_seed_peer_port("[2001:db8::1234]:7946"),
+            "2001:db8::1234"
+        );
+        assert_eq!(strip_seed_peer_port("[::1]"), "::1");
+    }
+
+    /// ACPR #196 MEDIUM-4 scratch-repro re-verification: a bare (unbracketed)
+    /// IPv6 literal is left completely untouched, never mistaken for a
+    /// `host:port` pair — before this fix, `::1` was corrupted to `:`
+    /// (port `1` stripped), `fe80::1` to `fe80:` (port `1` stripped), and
+    /// `2001:db8::1234` to `2001:db8:` (port `1234` stripped), because the
+    /// old check only looked at whether the LAST colon's suffix was
+    /// all-digit, which a bare IPv6 literal's last hextet often is.
+    #[test]
+    fn bare_ipv6_literals_are_never_mistaken_for_host_colon_port() {
+        assert_eq!(strip_seed_peer_port("::1"), "::1");
+        assert_eq!(strip_seed_peer_port("fe80::1"), "fe80::1");
+        assert_eq!(strip_seed_peer_port("2001:db8::1234"), "2001:db8::1234");
+    }
+
+    /// A bare hostname with no port at all is left untouched.
+    #[test]
+    fn a_bare_hostname_with_no_port_is_untouched() {
+        assert_eq!(strip_seed_peer_port("peer-a"), "peer-a");
+    }
+
+    /// `seed_peer_node_id` itself appends the fixed v0.1 incarnation after
+    /// host extraction, over both the unambiguous and the IPv6 forms.
+    #[test]
+    fn seed_peer_node_id_appends_the_fixed_incarnation() {
+        assert_eq!(seed_peer_node_id("peer-a:7946"), NodeId::new("peer-a/1"));
+        assert_eq!(
+            seed_peer_node_id("10.0.0.1:7946"),
+            NodeId::new("10.0.0.1/1")
+        );
+        assert_eq!(seed_peer_node_id("[::1]:7946"), NodeId::new("::1/1"));
+        assert_eq!(seed_peer_node_id("::1"), NodeId::new("::1/1"));
+    }
 }
