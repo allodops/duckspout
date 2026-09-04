@@ -44,20 +44,36 @@
 //!   is the seam a caller uses to hand this module's decision to the drain
 //!   side (`duckspout-drain`, via daemon composition) — this crate cannot
 //!   depend on `duckspout-drain` directly (ADR-0008, both protocol crates).
-//! - **The churn-boundary supplement part's actual sealing** (§5.6 step 5).
-//!   [`compute_residue`] is the pure coverage-arithmetic half — "validates
-//!   disjoint per-(origin, seq) coverage against the winner's manifest" is
-//!   ALREADY enforced generically by
+//! - **The churn-boundary supplement part's actual sealing and commit**
+//!   (§5.6 step 5). [`compute_residue`] is the pure coverage-arithmetic half
+//!   — it computes the correct residue coverage a supplement part would
+//!   need to submit. **Corrected here, honestly (ACPR #199 HIGH-4): no
+//!   existing guard validates that submission today.** An earlier revision
+//!   of this doc (and this PR's own description, and issue #198) claimed
+//!   the "validates disjoint per-(origin, seq) coverage against the
+//!   winner's manifest" step was ALREADY enforced generically by
 //!   `duckspout_watermark::WatermarkLedger::record_commit`'s
-//!   `CoverageOverlap` guard (any manifest's coverage, `PartKind::Supplement`
-//!   included, is checked against everything already committed) — but
-//!   actually sealing a residue-restricted subset of a window's staged rows
-//!   needs `duckspout_types::SealSurface`/`SealRequest` machinery this
-//!   module has no access to and that does not exist yet (`SealRequest`
-//!   today seals a whole window, never an origin/seq-restricted subset).
-//!   This PR names the follow-up for that `duckspout-drain`-side work
-//!   explicitly (see its own description) rather than inventing an
-//!   untested stub here.
+//!   `CoverageOverlap` guard. That is false for two independent, structural
+//!   reasons, confirmed via an executed scratch test: (1)
+//!   [`duckspout_types::WindowManifest`] (frozen for the v1 series, §12.2)
+//!   has **no `part_kind` field at all** — `record_commit` has no way to
+//!   even identify a manifest as a `Supplement` versus a `Primary` part;
+//!   (2) a supplement is, by definition, a SECOND manifest for an
+//!   already-committed `window_id`, and `record_commit`'s dense-next
+//!   contiguity check runs **before** any coverage-overlap check —
+//!   `CoverageOverlap` is never reached; the commit is rejected with
+//!   `AdvanceError::WindowNotNext` first. So [`compute_residue`] computes a
+//!   value that **cannot currently be submitted through any existing code
+//!   path** — the actual `part_kind` field, the dense-next exemption for
+//!   supplements, and the `UNIQUE(partition, window_id, part_kind)` +
+//!   disjoint-coverage guard §5.6 step 5 specifies do not exist anywhere in
+//!   this codebase yet. Building that (which likely also needs its own
+//!   settled-decision amendment for the frozen manifest format, §12.2,
+//!   s§9.6) plus the `duckspout_types::SealSurface`/`SealRequest` machinery
+//!   to seal only an origin/seq-restricted subset of a window (`SealRequest`
+//!   today always seals the whole window) is tracked in issue #198, item 1
+//!   — genuine new `duckspout-drain`/`duckspout-types` scope, not a small
+//!   addition to this PR.
 //!
 //! # Cross-check against the P model
 //!
@@ -77,10 +93,11 @@
 //! where the real system's granularity legitimately differs from the P
 //! model's abstraction).
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use duckspout_types::{NodeId, OriginSeqRange, PartitionId, TakeoverDrainSignal};
 
+use crate::boot::BootOutcome;
 use crate::routing::{MembershipView, RoutingPlan, route_write};
 
 /// The resolved ownership-transition decision for one `(partition,
@@ -119,6 +136,34 @@ impl TakeoverDecision {
     #[must_use]
     pub fn is_genuine_takeover(&self) -> bool {
         self.old_owner == self.dead_owner
+    }
+
+    /// Whether this decision names a genuine takeover whose new owner (this
+    /// call's own `self_node`, exactly when [`Self::self_is_new_owner`]) has
+    /// **no** prior replica copy to drain from at all — the case
+    /// [`TakeoverTracker::should_trigger`] refuses to trigger a
+    /// [`TakeoverDrainSignal`] for, and whose correct downstream path is
+    /// `DeclareLoss` (`duckspout_watermark::loss`), not `TakeoverDrain`'s
+    /// (module docs, ACPR #199 HIGH-3).
+    ///
+    /// **By construction, this can only be true at RF = 1.** HRW ranks each
+    /// candidate independently of the others (`crate::hrw`'s own pure,
+    /// per-candidate hash) — removing one candidate from the walk can never
+    /// reorder the RELATIVE ranking of the survivors. So the new owner
+    /// among survivors is always the previous **rank-2** candidate overall
+    /// (rank 1 was the dead owner). Whenever `rf >= 2`, `old_plan.replicas`
+    /// already held the top-`rf` ranked candidates, rank 2 included, which
+    /// is exactly [`Self::self_was_replica_before`]'s condition when
+    /// `self_node` is that new owner — so this predicate can only be `true`
+    /// when `rf == 1` (`old_plan.replicas` held only rank 1, the dead
+    /// owner, and rank 2 never appeared in it). At `rf == 1` the dead owner
+    /// genuinely was the sole holder of the partition's data: nothing else
+    /// in the cluster has a copy, which is precisely `DeclareLoss`'s own
+    /// domain ("every replica of an undrained range is gone," §5.8) rather
+    /// than a state-transfer-free takeover.
+    #[must_use]
+    pub fn requires_declare_loss(&self) -> bool {
+        self.is_genuine_takeover() && self.self_is_new_owner && !self.self_was_replica_before
     }
 
     /// The [`TakeoverDrainSignal`] this decision authorizes — only
@@ -179,15 +224,24 @@ pub fn resolve_takeover(
 /// one trigger per `(partition, dead_owner)` pair, mirroring
 /// [`crate::claims::ClaimTracker`]'s structural role for `ClaimAdvertise`
 /// and the P model's inline `!(fwd.key in committed)` check
-/// (`p/Replication/Node.p`'s `eForward` handler; module docs above). Keyed
-/// by `dead_owner` too, not just `partition`, so a LATER, DIFFERENT node's
-/// death for the same partition (a cascading failure — this node was the
-/// takeover winner once already, and now the ring walk excludes a second
-/// dead node too) still triggers a fresh drain-trigger call rather than
-/// being silently absorbed by the first takeover's record.
+/// (`p/Replication/Node.p`'s `eForward` handler; module docs above).
+///
+/// **Keyed by the FULL `(partition, dead_owner)` pair, not partition alone
+/// (ACPR #199 MEDIUM-5).** An earlier revision stored `HashMap<PartitionId,
+/// NodeId>` — one remembered `dead_owner` per partition — while its own doc
+/// comment already claimed the pair-keyed guarantee this predates: a
+/// cascading failure (the tracked owner dies and triggers; a SECOND,
+/// different node then dies for the same partition; a stale or reordered
+/// advisory-membership-view — §5.2's own explicitly-tolerated case —
+/// re-presents the FIRST decision after the map entry was overwritten by
+/// the second) would silently re-trigger a duplicate signal for the first
+/// dead owner, since the map has room for only one `dead_owner` per
+/// partition at a time. A [`std::collections::HashSet`] of the pair itself
+/// has no such capacity limit: every `(partition, dead_owner)` this tracker
+/// has ever marked stays marked for the tracker's whole lifetime.
 #[derive(Debug, Clone, Default)]
 pub struct TakeoverTracker {
-    triggered: HashMap<PartitionId, NodeId>,
+    triggered: HashSet<(PartitionId, NodeId)>,
 }
 
 impl TakeoverTracker {
@@ -201,30 +255,56 @@ impl TakeoverTracker {
     /// Whether `decision` should raise a [`TakeoverDrainSignal`] right now:
     /// a genuine takeover (module docs,
     /// [`TakeoverDecision::is_genuine_takeover`]), the local node is the
-    /// winner, `boot_permits_ownership` reports this node's own boot state
-    /// allows ownership actions
-    /// (`crate::boot::BootOutcome::permits_ownership_actions` — the Rust
-    /// analog of the P model's `!degraded` conjunct), and this exact
-    /// `(partition, dead_owner)` pair has not already been triggered
+    /// winner, the local node actually holds a prior replica copy to drain
+    /// from ([`TakeoverDecision::self_was_replica_before`] — ACPR #199
+    /// HIGH-3, below), `boot` reports this node's own boot state allows
+    /// ownership actions ([`crate::boot::BootOutcome::permits_ownership_actions`]
+    /// — the Rust analog of the P model's `!degraded` conjunct), and this
+    /// exact `(partition, dead_owner)` pair has not already been triggered
     /// through this tracker. A pure query — it does not itself commit to
     /// "triggered"; call [`TakeoverTracker::mark_triggered`] only after the
     /// caller's own [`duckspout_types::TakeoverDrainTrigger::trigger`] call
     /// actually succeeds, matching [`crate::claims::ClaimTracker`]'s own
     /// query/mutation split (a failed trigger call must leave this
     /// retryable, not permanently swallowed).
+    ///
+    /// **`self_was_replica_before`, stated and never consulted (ACPR #199
+    /// HIGH-3), now closed:** an earlier revision of this method computed
+    /// [`TakeoverDecision::self_was_replica_before`] on every decision but
+    /// never read it here — meaning a node that held NO copy of the dead
+    /// owner's partition at all (the RF = 1 case: the dead owner was the
+    /// sole holder) could still be told to raise a
+    /// [`TakeoverDrainSignal`], whose own doc comment requires the new
+    /// owner to "drain the dead owner's undrained window(s) from its OWN
+    /// ALREADY-REPLICATED COPY" — a copy that node does not have. This
+    /// directly undermined §5.6 step 4's own `NoAckedLoss` argument
+    /// ("anything the dead node acked is... within some live replica's
+    /// receipted prefix" — only true for a node that WAS in that replica
+    /// set) and is the exact "computed but never consulted" shape ACPR
+    /// #197 found in `NoOwnershipWhileDegraded`. Takes `&BootOutcome`
+    /// directly rather than a bare `bool` (ACPR #199 MEDIUM-6): a caller
+    /// cannot bypass the `NoOwnershipWhileDegraded` gate by simply passing
+    /// `true`, since this method calls
+    /// [`crate::boot::BootOutcome::permits_ownership_actions`] itself.
+    ///
+    /// **What a `false` return means when
+    /// [`TakeoverDecision::requires_declare_loss`] is `true`:** nothing —
+    /// deliberately. See that method's own doc comment: this is
+    /// `DeclareLoss` territory, and the caller's downstream path is that
+    /// ceremony (`duckspout_watermark::loss`), not a retry of this gate —
+    /// no amount of re-evaluating `should_trigger` will ever flip this
+    /// decision to `true`, because `self_was_replica_before` is a fact
+    /// about the past (whether `self_node` was in `old_plan.replicas`),
+    /// not a transient condition that resolves itself.
     #[must_use]
-    pub fn should_trigger(
-        &self,
-        decision: &TakeoverDecision,
-        boot_permits_ownership: bool,
-    ) -> bool {
+    pub fn should_trigger(&self, decision: &TakeoverDecision, boot: &BootOutcome) -> bool {
         decision.is_genuine_takeover()
             && decision.self_is_new_owner
-            && boot_permits_ownership
-            && !matches!(
-                self.triggered.get(&decision.partition),
-                Some(recorded) if *recorded == decision.dead_owner
-            )
+            && decision.self_was_replica_before
+            && boot.permits_ownership_actions()
+            && !self
+                .triggered
+                .contains(&(decision.partition.clone(), decision.dead_owner.clone()))
     }
 
     /// Commits `(partition, dead_owner)` as triggered — call this ONLY
@@ -232,7 +312,7 @@ impl TakeoverTracker {
     /// [`duckspout_types::TakeoverDrainTrigger::trigger`] call for this
     /// exact signal has actually succeeded (module docs).
     pub fn mark_triggered(&mut self, partition: PartitionId, dead_owner: NodeId) {
-        self.triggered.insert(partition, dead_owner);
+        self.triggered.insert((partition, dead_owner));
     }
 }
 
@@ -250,11 +330,21 @@ impl TakeoverTracker {
 /// absent from `window_coverage` contribute nothing (there is no local
 /// coverage to subtract from).
 ///
-/// The actual disjointness-against-the-winner's-manifest VALIDATION this
-/// residue must satisfy inside the commit transaction is already enforced
-/// generically by `duckspout_watermark::WatermarkLedger::record_commit`'s
-/// `CoverageOverlap` guard — this function computes what a caller SHOULD
-/// submit as a supplement part's coverage, it is not itself the guard.
+/// This function computes what a caller SHOULD submit as a supplement
+/// part's coverage; it is not itself a guard, and — corrected here honestly
+/// (ACPR #199 HIGH-4) — **no guard actually enforcing the
+/// disjointness-against-the-winner's-manifest VALIDATION this residue would
+/// need to satisfy exists anywhere in this codebase today.** An earlier
+/// revision of this doc claimed
+/// `duckspout_watermark::WatermarkLedger::record_commit`'s `CoverageOverlap`
+/// guard "already enforces" it generically; that is false — `record_commit`
+/// has no `PartKind` field on `WindowManifest` to even recognize a
+/// supplement, and its dense-next contiguity check rejects a second
+/// manifest for an already-committed window (`AdvanceError::WindowNotNext`)
+/// before `CoverageOverlap` is ever reached. This function's own output
+/// therefore cannot currently be submitted through any existing commit
+/// path — see the module docs above and issue #198 (item 1) for the actual
+/// gap and what closing it needs.
 #[must_use]
 pub fn compute_residue(
     window_coverage: &[OriginSeqRange],
@@ -303,6 +393,7 @@ pub fn compute_residue(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fencing::Incarnation;
 
     fn nodes(names: &[&str]) -> Vec<NodeId> {
         names.iter().map(|name| NodeId::new(*name)).collect()
@@ -310,6 +401,22 @@ mod tests {
 
     fn view(names: &[&str]) -> MembershipView {
         MembershipView::new(nodes(names))
+    }
+
+    /// A boot state that permits ownership actions — the common case most
+    /// tests below gate `should_trigger` on.
+    fn active_boot() -> BootOutcome {
+        BootOutcome::Active {
+            incarnation: Incarnation(1),
+        }
+    }
+
+    /// A boot state that does NOT permit ownership actions (§7
+    /// `DegradedBoot`).
+    fn degraded_boot() -> BootOutcome {
+        BootOutcome::Degraded {
+            incarnation: Incarnation(1),
+        }
     }
 
     /// `TestTakeoverDrain`'s own topology (`p/Replication/TestDriver.p`):
@@ -438,9 +545,9 @@ mod tests {
         .expect("resolves");
 
         let mut tracker = TakeoverTracker::new();
-        assert!(tracker.should_trigger(&decision, true));
+        assert!(tracker.should_trigger(&decision, &active_boot()));
         tracker.mark_triggered(decision.partition.clone(), decision.dead_owner.clone());
-        assert!(!tracker.should_trigger(&decision, true));
+        assert!(!tracker.should_trigger(&decision, &active_boot()));
     }
 
     /// A SECOND, different node dying for the same partition re-triggers —
@@ -458,7 +565,7 @@ mod tests {
         )
         .expect("resolves");
         let mut tracker = TakeoverTracker::new();
-        assert!(tracker.should_trigger(&first, true));
+        assert!(tracker.should_trigger(&first, &active_boot()));
         tracker.mark_triggered(first.partition.clone(), first.dead_owner.clone());
 
         // A cascading second death: the membership now excludes "owner"
@@ -472,7 +579,53 @@ mod tests {
             2,
         )
         .expect("resolves");
-        assert!(tracker.should_trigger(&second, true));
+        assert!(tracker.should_trigger(&second, &active_boot()));
+    }
+
+    /// ACPR #199 MEDIUM-5 scratch-repro re-verification: after a cascading
+    /// second death for the SAME partition (as above) is marked triggered
+    /// too, a stale or reordered advisory-membership-view re-presentation
+    /// of the FIRST decision (§5.2's own explicitly-tolerated case) must
+    /// still be recognized as already-triggered, not re-fired. Before the
+    /// fix (`HashMap<PartitionId, NodeId>`, one `dead_owner` remembered per
+    /// partition), marking the second death's `(p0, "replica")` pair
+    /// OVERWROTE the map's `p0` entry, so re-presenting the first decision
+    /// (`(p0, "owner")`) would have found no matching entry at all and
+    /// wrongly re-triggered.
+    #[test]
+    fn marking_a_cascading_second_death_does_not_forget_the_first() {
+        let membership = view(&["owner", "replica", "third"]);
+        let first = resolve_takeover(
+            &PartitionId::new("p0"),
+            &NodeId::new("owner"),
+            &NodeId::new("replica"),
+            &membership,
+            3,
+        )
+        .expect("resolves");
+        let mut tracker = TakeoverTracker::new();
+        assert!(tracker.should_trigger(&first, &active_boot()));
+        tracker.mark_triggered(first.partition.clone(), first.dead_owner.clone());
+
+        let after_first = view(&["replica", "third"]);
+        let second = resolve_takeover(
+            &PartitionId::new("p0"),
+            &NodeId::new("replica"),
+            &NodeId::new("third"),
+            &after_first,
+            2,
+        )
+        .expect("resolves");
+        assert!(tracker.should_trigger(&second, &active_boot()));
+        tracker.mark_triggered(second.partition.clone(), second.dead_owner.clone());
+
+        // A stale advisory view re-presents the FIRST decision again --
+        // must still be recognized as already-triggered.
+        assert!(
+            !tracker.should_trigger(&first, &active_boot()),
+            "marking the second, different dead_owner for the same \
+             partition must not forget the first's own triggered record"
+        );
     }
 
     /// `TakeoverTracker::should_trigger` refuses to fire while this node's
@@ -492,7 +645,8 @@ mod tests {
         )
         .expect("resolves");
         let tracker = TakeoverTracker::new();
-        assert!(!tracker.should_trigger(&decision, false));
+        assert!(!tracker.should_trigger(&decision, &degraded_boot()));
+        assert!(!tracker.should_trigger(&decision, &BootOutcome::Waiting));
     }
 
     /// A decision where the local node is NOT the new owner never triggers
@@ -512,7 +666,77 @@ mod tests {
         .expect("resolves");
         assert!(!decision.self_is_new_owner);
         let tracker = TakeoverTracker::new();
-        assert!(!tracker.should_trigger(&decision, true));
+        assert!(!tracker.should_trigger(&decision, &active_boot()));
+    }
+
+    /// ACPR #199 HIGH-3 scratch-repro re-verification: membership
+    /// `["owner", "bystander"]`, RF = 1, `owner` dies, `self = bystander`
+    /// who was never a replica of this partition at all (RF = 1 means only
+    /// `owner` ever held it) — `should_trigger` must now return `false`,
+    /// even though the decision is otherwise a textbook genuine, self-
+    /// winning, boot-permitted takeover. Before the fix, this returned
+    /// `true`, telling `bystander` to raise a `TakeoverDrainSignal` it has
+    /// no local replicated copy to satisfy.
+    #[test]
+    fn a_new_owner_with_no_prior_replica_copy_never_triggers() {
+        let membership = view(&["owner", "bystander"]);
+        let decision = resolve_takeover(
+            &PartitionId::new("p0"),
+            &NodeId::new("owner"),
+            &NodeId::new("bystander"),
+            &membership,
+            1,
+        )
+        .expect("two candidates resolve");
+        assert!(decision.is_genuine_takeover());
+        assert!(decision.self_is_new_owner);
+        assert!(
+            !decision.self_was_replica_before,
+            "RF=1 means bystander never held a copy"
+        );
+
+        let tracker = TakeoverTracker::new();
+        assert!(
+            !tracker.should_trigger(&decision, &active_boot()),
+            "a new owner with no prior replica copy must never trigger a \
+             TakeoverDrainSignal it cannot satisfy from local storage"
+        );
+        assert!(
+            decision.requires_declare_loss(),
+            "this is exactly the RF=1 sole-holder-died case DeclareLoss \
+             exists for, not a state-transfer-free takeover"
+        );
+    }
+
+    /// The mirror of the previous test at `rf >= 2`: by HRW's rank-
+    /// preserving construction (`TakeoverDecision::requires_declare_loss`'s
+    /// own doc comment), the new owner among survivors is always the
+    /// previous rank-2 candidate, which `rf >= 2` already put in
+    /// `old_plan.replicas` — so `requires_declare_loss` must be `false`
+    /// whenever a genuine takeover resolves at `rf >= 2`, regardless of
+    /// which specific candidates are involved.
+    #[test]
+    fn requires_declare_loss_is_false_for_a_genuine_takeover_at_rf_two() {
+        let membership = view(&["owner", "replica", "third"]);
+        let partition = PartitionId::new("p0");
+        let owner = crate::hrw::hrw_owner(&partition, membership.candidates())
+            .expect("nonempty")
+            .clone();
+        let survivors: Vec<NodeId> = membership
+            .candidates()
+            .iter()
+            .filter(|node| **node != owner)
+            .cloned()
+            .collect();
+        let new_owner = crate::hrw::hrw_owner(&partition, &survivors)
+            .expect("nonempty")
+            .clone();
+        let decision = resolve_takeover(&partition, &owner, &new_owner, &membership, 2)
+            .expect("three candidates resolve");
+        assert!(decision.is_genuine_takeover());
+        assert!(decision.self_is_new_owner);
+        assert!(decision.self_was_replica_before);
+        assert!(!decision.requires_declare_loss());
     }
 
     /// `TakeoverDecision::signal` maps the decision onto the wire shape a

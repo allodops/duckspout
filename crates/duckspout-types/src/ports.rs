@@ -1006,11 +1006,20 @@ pub trait Registry: Send + Sync {
 /// A [`LossLedgerCommitter::commit_loss`] failure. Every variant is a
 /// not-durable outcome — the ledger row is not recorded and the watermark
 /// has not moved.
+///
+/// **Honestly, this has exactly one variant today (ACPR #199 LOW-8(b)):** an
+/// earlier revision of this doc claimed it "mirrors [`LakeError`]'s own
+/// split between [backend-invariant and transient]" — [`LakeError`] draws
+/// that split across THREE variants (`NotImplemented`, `Misconfigured`,
+/// `Backend`) plus its own [`CommitOutcome`] carrying the transient half
+/// separately; this type has only [`LossCommitError::Backend`], so no such
+/// split exists here yet. Nothing wrong with that on its own — `commit_loss`
+/// is a single durable write, not `commit_files`'s three-valued outcome —
+/// but the doc should not claim a structural parallel that isn't there.
 #[derive(Debug, thiserror::Error)]
 pub enum LossCommitError {
     /// A backend-invariant failure — misconfiguration or an unimplemented
-    /// backend, mirroring [`LakeError`]'s own split between this and a
-    /// transient commit outcome.
+    /// backend.
     #[error("loss-ledger commit backend: {0}")]
     Backend(String),
 }
@@ -1049,13 +1058,45 @@ pub trait LossLedgerCommitter: Send + Sync {
     /// performs no guard evaluation of its own, exactly as [`ReplicaLog`]
     /// and [`Registry`] perform none of theirs.
     ///
+    /// **Atomicity is scoped to exactly ONE row, not the whole ceremony
+    /// (ACPR #199 LOW-7).** `check_declare_loss` accepts a request naming
+    /// several ranges and refuses or approves it as one all-or-nothing
+    /// decision — but that decision covers only the CHECK. Once approved, a
+    /// caller submitting an N-range `DeclareLoss` request calls this method
+    /// once per range, i.e. N separate durable transactions; a failure
+    /// after some have already committed leaves those ranges permanently
+    /// ledgered and the rest not, with no rollback path back to "as if the
+    /// whole ceremony never happened." This is likely an acceptable
+    /// consequence given `DeclareLoss` is already an exceptional,
+    /// operator-invoked ceremony (§5.8) — an operator can simply retry the
+    /// remaining, not-yet-ledgered ranges — but it is a real, disclosed
+    /// property of this port's contract, not something a caller should
+    /// assume away from the request-level "all-or-nothing" wording in
+    /// `check_declare_loss`'s own docs (which is honest about scoping to
+    /// the CHECK, not the commit). A future revision could accept
+    /// `Vec<LossLedgerRow>` for genuine multi-range commit atomicity; that
+    /// is not this port's contract today.
+    ///
     /// # Errors
     ///
     /// [`LossCommitError`] only for backend-invariant failures; a
-    /// transient rejection is expected to fold into a retry at the caller
-    /// (the ceremony is operator-driven and idempotent: re-declaring the
-    /// same exact range after a failed attempt is safe — `record_loss`'s
-    /// own coverage union is naturally idempotent for a repeated row).
+    /// transient rejection is expected to fold into a retry at the caller.
+    /// **What "idempotent" covers here, honestly (ACPR #199 LOW-8(c)):**
+    /// `duckspout_watermark::WatermarkLedger::record_loss`'s own
+    /// IN-MEMORY coverage union is naturally idempotent for a repeated
+    /// row — recording the same range twice folds to the same coverage
+    /// state. That is NOT the same claim as this durable PORT being
+    /// idempotent: [`row`](LossLedgerRow) carries a `declared_at_ms` the
+    /// caller supplies fresh on each retry, so a naive implementation that
+    /// simply `INSERT`s the row would durably persist a SECOND permanent
+    /// ledger entry for the same declared range on retry after a failure
+    /// whose durable effect was actually unknown (the same "was it durable"
+    /// ambiguity [`LakeCommitter::commit_files`]'s own `Indeterminate`
+    /// outcome exists to resolve — this port has no such three-valued
+    /// outcome and does not resolve it). This is an open question a
+    /// concrete implementation must address (e.g. an upsert keyed on the
+    /// declared range, or a read-back before retry), not something this
+    /// port's contract currently settles.
     fn commit_loss(
         &self,
         row: LossLedgerRow,

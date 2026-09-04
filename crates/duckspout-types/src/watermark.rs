@@ -112,14 +112,26 @@ pub struct LossLedgerRow {
 /// filtered membership view, §5.6's detection timeline) — this crate reads
 /// no such state itself; determining liveness is `duckspout-replication`'s
 /// domain, not this one's.
+///
+/// **`partition` is load-bearing (ACPR #199 HIGH-1):** an earlier revision
+/// of this type carried no partition field at all, so
+/// `check_declare_loss`'s refusal guard could only match on `origin` —
+/// a multi-partition `DeclareLoss` request whose caller supplied coverage
+/// scoped to only SOME of the request's partitions would be silently
+/// approved for a range in an unscoped partition even when a live replica
+/// there still fully covered it, because the guard had no field to notice
+/// the mismatch with. `partition` closes that hole: the guard now matches
+/// on `(partition, origin)`, exactly as the ranges themselves are scoped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaCoverage {
     /// The live node advertising this coverage.
     pub node: NodeId,
+    /// The partition this coverage answers for.
+    pub partition: PartitionId,
     /// The origin whose sequence range this coverage answers for.
     pub origin: NodeId,
     /// The highest contiguous seq `node` advertises as durably held for
-    /// `origin` within the queried partition.
+    /// `origin` within `partition`.
     pub replicated_thru: u64,
 }
 

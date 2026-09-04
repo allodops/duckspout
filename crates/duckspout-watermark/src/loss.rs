@@ -109,22 +109,46 @@ pub enum LossRefusal {
 /// [`crate::ledger::WatermarkLedger::advance_for`] as a pure preview ahead of
 /// its own commit.
 ///
-/// `live_coverage` is scoped to exactly the ranges' partitions by the
-/// caller; a `ReplicaCoverage` entry for an unrelated partition is simply
-/// never matched (this function reads no partition field off
-/// `ReplicaCoverage` itself — module docs explain why: the caller already
-/// queried it per-partition).
+/// `live_coverage` may freely mix entries for partitions other than the
+/// ones named in `request.ranges` (a caller's live-coverage snapshot need
+/// not be pre-filtered) — this function matches every entry on
+/// `(partition, origin)` itself (ACPR #199 HIGH-1: an earlier revision
+/// matched on `origin` alone, trusting the caller to have pre-scoped
+/// `live_coverage` to the request's partitions; `ReplicaCoverage` then
+/// carried no partition field at all, so a multi-partition request whose
+/// caller happened to supply coverage for only SOME of its partitions was
+/// silently approved for ranges in the unscoped partitions even when a live
+/// replica there fully covered them — the guard had nothing to notice the
+/// mismatch with).
 ///
-/// A range is "still recoverable" when some entry in `live_coverage` shares
-/// its `origin` and advertises `replicated_thru >= last_seq` — i.e. the live
-/// replica's own contiguous coverage already reaches (or exceeds) the
-/// requested range's upper end. A replica only partially overlapping the
-/// range (covering less than `last_seq`) does not, on its own, prove the
-/// FULL range recoverable — but per `PeerApply`'s `GapFreedom`
-/// (`docs/design/replication.md` §5.4), a replica's advertised
-/// `replicated_thru` is by construction a contiguous prefix from seq 1, so
-/// `replicated_thru >= last_seq` implies the replica holds every seq in
-/// `first_seq..=last_seq`, not merely `last_seq` itself.
+/// A range is "still recoverable" when the UNION of every live replica's
+/// advertised coverage for its exact `(partition, origin)` reaches any seq
+/// within `first_seq..=last_seq` — not merely when a SINGLE replica's
+/// `replicated_thru` covers the range's entire upper end (ACPR #199
+/// HIGH-2: an earlier revision refused only on that narrower condition,
+/// which under-refused in two ways: (a) a live replica covering a STRICT
+/// SUBRANGE of the declared range — e.g. holding seqs 6..=8 of a declared
+/// 6..=10 — proves 6..=8 still recoverable, so the whole declaration must
+/// be refused rather than silently approved wholesale; the operator must
+/// re-submit a range narrowed to the genuinely unrecoverable part, exactly
+/// as any other still-recoverable range is refused today; (b) coverage
+/// assembled from more than one live replica, each covering only PART of
+/// the range, previously blocked nothing at all, since the old guard only
+/// ever asked whether one single entry alone reached `last_seq`).
+///
+/// Computing the union is simplified by an invariant `PeerApply`'s
+/// `GapFreedom` (`docs/design/replication.md` §5.4) guarantees: a replica's
+/// advertised `replicated_thru` is by construction a contiguous prefix from
+/// seq 1 (never a mid-stream range), so any one replica's coverage is
+/// exactly `1..=replicated_thru` and the UNION of several replicas'
+/// coverage for the same `(partition, origin)` is exactly `1..=` their
+/// **maximum** `replicated_thru` — the shorter prefixes contribute nothing
+/// a longer one doesn't already include. So refusal reduces to: take the
+/// highest `replicated_thru` any live entry advertises for the range's
+/// `(partition, origin)`; the range is still recoverable, and the whole
+/// request refused, whenever that maximum is `>= first_seq` (i.e. the union
+/// prefix reaches into the declared range at all, not necessarily past its
+/// end).
 ///
 /// # Errors
 ///
@@ -150,9 +174,16 @@ pub fn check_declare_loss(
                 last_seq: range.last_seq,
             });
         }
+        // The union of every live replica's prefix coverage for this exact
+        // (partition, origin) is the single highest replicated_thru any of
+        // them advertises (module docs: each is a prefix from seq 1, so the
+        // shorter ones are subsumed). Refuse the moment that union reaches
+        // INTO the declared range at all -- not only past its far end.
         if let Some(covering) = live_coverage
             .iter()
-            .find(|c| c.origin == range.origin && c.replicated_thru >= range.last_seq)
+            .filter(|c| c.partition == range.partition && c.origin == range.origin)
+            .max_by_key(|c| c.replicated_thru)
+            && covering.replicated_thru >= range.first_seq
         {
             return Err(LossRefusal::StillRecoverable {
                 index,
@@ -190,16 +221,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn loss_rows_round_trip_through_serde() {
-        let row = LossLedgerRow {
-            range: range("t0-s0", "node-a", 6, 7),
-            declared_at_ms: 1_700_000_000_000,
-        };
-        let json = serde_json::to_string(&row).expect("serializes");
-        let back: LossLedgerRow = serde_json::from_str(&json).expect("deserializes");
-        assert_eq!(back, row);
-    }
+    // `loss_rows_round_trip_through_serde` lives in
+    // `duckspout_types::watermark` only (ACPR #199 LOW-8(a)): this module
+    // re-exports `LossLedgerRow` verbatim with no shape change, so the same
+    // serde round-trip test existing here too was a pure duplicate, not a
+    // second thing being tested.
 
     /// The literal consent parameter is required — a request with every
     /// range perfectly valid and unrecoverable is still refused when
@@ -242,6 +268,7 @@ mod tests {
         let req = request(vec![range("p", "o1", 6, 7)], true);
         let coverage = [ReplicaCoverage {
             node: NodeId::new("replica-a"),
+            partition: PartitionId::new("p"),
             origin: NodeId::new("o1"),
             replicated_thru: 10,
         }];
@@ -259,20 +286,92 @@ mod tests {
         );
     }
 
-    /// A live replica that only PARTIALLY covers the requested range (its
-    /// `replicated_thru` falls short of `last_seq`) does not block the
-    /// declaration — the range genuinely is not fully recoverable from that
-    /// replica alone. Would catch an off-by-one or `>` vs `>=` inversion
-    /// that either over- or under-refuses.
+    /// A live replica whose coverage does not reach INTO the requested range
+    /// at all (its `replicated_thru` falls short of `first_seq`, not just
+    /// `last_seq`) does not block the declaration — genuinely nothing about
+    /// this range is recoverable from that replica. Would catch an
+    /// off-by-one or `>` vs `>=` inversion that either over- or
+    /// under-refuses at the range's near end.
     #[test]
-    fn a_replica_short_of_the_requested_range_does_not_block_it() {
+    fn a_replica_entirely_short_of_the_requested_range_does_not_block_it() {
         let req = request(vec![range("p", "o1", 6, 10)], true);
         let coverage = [ReplicaCoverage {
             node: NodeId::new("replica-a"),
+            partition: PartitionId::new("p"),
+            origin: NodeId::new("o1"),
+            replicated_thru: 5,
+        }];
+        assert_eq!(check_declare_loss(&req, &coverage), Ok(()));
+    }
+
+    /// ACPR #199 HIGH-2 scratch-repro re-verification: a live replica
+    /// covering a STRICT SUBRANGE of the declared range (holds through seq
+    /// 8 of a declared 6..=10) must refuse the declaration — seqs 6..=8 are
+    /// still genuinely recoverable from that replica, even though it does
+    /// not cover the range's full upper end. Before the fix, this exact
+    /// scenario (`a_replica_short_of_the_requested_range_does_not_block_it`)
+    /// was asserted `Ok(())` — the wrong, permissive behavior this test
+    /// replaces.
+    #[test]
+    fn a_replica_covering_only_a_subrange_still_refuses_the_whole_range() {
+        let req = request(vec![range("p", "o1", 6, 10)], true);
+        let coverage = [ReplicaCoverage {
+            node: NodeId::new("replica-a"),
+            partition: PartitionId::new("p"),
             origin: NodeId::new("o1"),
             replicated_thru: 8,
         }];
-        assert_eq!(check_declare_loss(&req, &coverage), Ok(()));
+        assert_eq!(
+            check_declare_loss(&req, &coverage),
+            Err(LossRefusal::StillRecoverable {
+                index: 0,
+                partition: PartitionId::new("p"),
+                origin: NodeId::new("o1"),
+                first_seq: 6,
+                last_seq: 10,
+                covering_node: NodeId::new("replica-a"),
+                covering_thru: 8,
+            })
+        );
+    }
+
+    /// ACPR #199 HIGH-2: the UNION of two live replicas, each covering only
+    /// PART of the declared range on its own, still refuses — the guard
+    /// must consider every matching entry, not just the first or a single
+    /// one. Replica A's prefix (1..=7) covers the range's near end;
+    /// replica B's longer prefix (1..=9) covers nearly all of it; neither
+    /// alone reaches `last_seq` (10), but the higher of the two
+    /// (`replicated_thru = 9`) still reaches into the range at seq 6, so
+    /// the declaration must be refused citing that replica.
+    #[test]
+    fn the_union_of_multiple_partial_replicas_still_refuses() {
+        let req = request(vec![range("p", "o1", 6, 10)], true);
+        let coverage = [
+            ReplicaCoverage {
+                node: NodeId::new("replica-a"),
+                partition: PartitionId::new("p"),
+                origin: NodeId::new("o1"),
+                replicated_thru: 7,
+            },
+            ReplicaCoverage {
+                node: NodeId::new("replica-b"),
+                partition: PartitionId::new("p"),
+                origin: NodeId::new("o1"),
+                replicated_thru: 9,
+            },
+        ];
+        assert_eq!(
+            check_declare_loss(&req, &coverage),
+            Err(LossRefusal::StillRecoverable {
+                index: 0,
+                partition: PartitionId::new("p"),
+                origin: NodeId::new("o1"),
+                first_seq: 6,
+                last_seq: 10,
+                covering_node: NodeId::new("replica-b"),
+                covering_thru: 9,
+            })
+        );
     }
 
     /// Coverage for a DIFFERENT origin never blocks a declaration — the
@@ -283,10 +382,110 @@ mod tests {
         let req = request(vec![range("p", "o1", 1, 5)], true);
         let coverage = [ReplicaCoverage {
             node: NodeId::new("replica-a"),
+            partition: PartitionId::new("p"),
             origin: NodeId::new("o2"),
             replicated_thru: 100,
         }];
         assert_eq!(check_declare_loss(&req, &coverage), Ok(()));
+    }
+
+    /// ACPR #199 HIGH-1 scratch-repro re-verification. The same origin
+    /// (accepting node `o1`) writes to two DIFFERENT partitions, each with
+    /// its OWN independent `(partition, origin)` seq counter (§4.2.4) — so
+    /// `o1`'s true `replicated_thru` genuinely differs between `p1` (a low
+    /// value) and `p2` (a high one). Before `ReplicaCoverage` carried a
+    /// `partition` field, a caller had no way to represent BOTH true values
+    /// in one snapshot at all: any assembly keyed on origin alone (the only
+    /// key the old type offered) could hold at most one `replicated_thru`
+    /// per origin, so gathering live coverage for a multi-partition request
+    /// meant one partition's true value silently overwrote the other's.
+    /// Reproducing that exact collapse — `live_coverage` holding only `p1`'s
+    /// low true value under `o1`, `p2`'s high true value lost — the guard
+    /// used to see `thru = 3` for BOTH ranges and wrongly approve declaring
+    /// `p2`'s genuinely-still-recoverable `50..=60` lost (`thru = 3` never
+    /// reaches anywhere near it). With `partition` on the type, the SAME
+    /// live snapshot can now hold both true values distinctly and the guard
+    /// refuses both ranges correctly.
+    #[test]
+    fn a_shared_origin_across_two_partitions_no_longer_collapses_to_one_thru() {
+        let req = request(
+            vec![range("p1", "o1", 1, 3), range("p2", "o1", 50, 60)],
+            true,
+        );
+
+        // The pre-fix collapse: only p1's true value survives (whichever
+        // partition's coverage a same-origin-keyed assembly happened to
+        // write last), p2's is gone from the snapshot entirely.
+        let collapsed = [ReplicaCoverage {
+            node: NodeId::new("replica-a"),
+            partition: PartitionId::new("p1"),
+            origin: NodeId::new("o1"),
+            replicated_thru: 3,
+        }];
+        assert_eq!(
+            check_declare_loss(&req, &collapsed),
+            Err(LossRefusal::StillRecoverable {
+                index: 0,
+                partition: PartitionId::new("p1"),
+                origin: NodeId::new("o1"),
+                first_seq: 1,
+                last_seq: 3,
+                covering_node: NodeId::new("replica-a"),
+                covering_thru: 3,
+            }),
+            "p1's own true coverage must still refuse p1's range"
+        );
+
+        // The fix: both partitions' true coverage coexist in one snapshot,
+        // each correctly scoped by the new `partition` field.
+        let both = [
+            ReplicaCoverage {
+                node: NodeId::new("replica-a"),
+                partition: PartitionId::new("p1"),
+                origin: NodeId::new("o1"),
+                replicated_thru: 3,
+            },
+            ReplicaCoverage {
+                node: NodeId::new("replica-b"),
+                partition: PartitionId::new("p2"),
+                origin: NodeId::new("o1"),
+                replicated_thru: 100,
+            },
+        ];
+        assert_eq!(
+            check_declare_loss(&req, &both),
+            Err(LossRefusal::StillRecoverable {
+                index: 0,
+                partition: PartitionId::new("p1"),
+                origin: NodeId::new("o1"),
+                first_seq: 1,
+                last_seq: 3,
+                covering_node: NodeId::new("replica-a"),
+                covering_thru: 3,
+            }),
+            "the request is refused as a whole at the first still-recoverable \
+             range (p1, all-or-nothing) -- p2's own refusal is checked next"
+        );
+        // Isolate p2 alone to prove its now-representable true coverage (a
+        // value that literally could not coexist with p1's in the old,
+        // origin-only-keyed type) is itself correctly consulted and refuses
+        // the declaration -- this is the exact false negative the ACPR
+        // scratch test found: before the fix, this value was structurally
+        // unrepresentable alongside p1's and was lost, wrongly approving
+        // p2's still-fully-recoverable 50..=60.
+        let p2_only_request = request(vec![range("p2", "o1", 50, 60)], true);
+        assert_eq!(
+            check_declare_loss(&p2_only_request, &both),
+            Err(LossRefusal::StillRecoverable {
+                index: 0,
+                partition: PartitionId::new("p2"),
+                origin: NodeId::new("o1"),
+                first_seq: 50,
+                last_seq: 60,
+                covering_node: NodeId::new("replica-b"),
+                covering_thru: 100,
+            })
+        );
     }
 
     /// A malformed range (0-based, or inverted) is refused before any live-
@@ -326,6 +525,7 @@ mod tests {
         let req = request(vec![range("p", "o1", 1, 5), range("p", "o2", 1, 5)], true);
         let coverage = [ReplicaCoverage {
             node: NodeId::new("replica-a"),
+            partition: PartitionId::new("p"),
             origin: NodeId::new("o2"),
             replicated_thru: 5,
         }];
