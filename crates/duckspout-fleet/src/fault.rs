@@ -343,9 +343,13 @@ pub async fn run_network_partition(
     tokio::time::sleep(delay).await;
 
     let before: Vec<LinkStats> = links.iter().map(|link| link.stats()).collect();
-    for link in links {
-        link.set(LinkConditions::dropped());
-    }
+    // Held, not assigned: this window lifts only its own conditions when
+    // `holds` is dropped below, even if another armed window is holding one
+    // of these same links (`crate::link`'s module docs).
+    let holds: Vec<_> = links
+        .iter()
+        .map(|link| link.hold(LinkConditions::dropped()))
+        .collect();
     log.started(
         fault_id,
         FaultKind::NetworkPartition,
@@ -359,9 +363,7 @@ pub async fn run_network_partition(
     tokio::time::sleep(duration).await;
 
     let during = link_deltas(links, &before);
-    for link in links {
-        link.restore();
-    }
+    drop(holds);
     log.ended(
         fault_id,
         FaultKind::NetworkPartition,
@@ -408,7 +410,7 @@ pub async fn run_network_degradation(
     tokio::time::sleep(delay).await;
 
     let before = link.stats();
-    link.set(conditions);
+    let hold = link.hold(conditions);
     log.started(
         fault_id,
         FaultKind::NetworkDegradation,
@@ -423,7 +425,7 @@ pub async fn run_network_degradation(
     tokio::time::sleep(duration).await;
 
     let during = link.stats().since(before);
-    link.restore();
+    drop(hold);
     log.ended(
         fault_id,
         FaultKind::NetworkDegradation,
@@ -448,6 +450,21 @@ pub async fn run_network_degradation(
 /// evidence for a judge (#208), NOT a verdict: this injector never fails
 /// the fleet run over what it observed there (§8.4: the fleet misbehaves
 /// freely during the run and is convicted afterward from journals).
+///
+/// # Why the `/status` sample is taken BEFORE the link changes
+///
+/// [`observed_drain_stalled`] is bounded but real blocking I/O — up to 2 s
+/// against a node that accepts the connection and never answers. A phase's
+/// journaled `at_ms` is stamped when [`FaultLog::record`] writes it, so
+/// sampling between the real link change and the journal line would put up
+/// to 2 s of skew between "when the cut really happened" and "when the
+/// journal says it happened" (an ACPR finding on issue #204, MEDIUM-2:
+/// measured at ~2002 ms against a `SIGSTOP`ped target). Both phases below
+/// therefore sample first, into a local, then change the link, then journal
+/// immediately — so `at_ms` is the moment of the real network effect. The
+/// sampled disclosure is correspondingly the node's status from just before
+/// each edge, which is exactly what "did this node's drain stall across the
+/// window" wants to compare.
 ///
 /// # The `Ended` phase is the end of the INJECTED CONDITION, not of the
 /// system's degradation
@@ -491,23 +508,29 @@ pub async fn run_catalog_outage(
     tokio::time::sleep(delay).await;
 
     let before = catalog_link.stats();
-    catalog_link.set(LinkConditions::dropped());
+    // Sample, THEN cut, THEN journal (module docs above on the skew this
+    // ordering closes).
+    let drain_stalled_at_start = observed_drain_stalled(target).await;
+    let hold = catalog_link.hold(LinkConditions::dropped());
     log.started(
         fault_id,
         FaultKind::CatalogOutage,
         &target_node,
         Some(serde_json::json!({
             "link": catalog_link.label(),
-            "drain_stalled": observed_drain_stalled(target).await,
+            "drain_stalled": drain_stalled_at_start,
             "node_journal_lines": node_journal_line_count(&target.journal_path),
         })),
     );
 
     tokio::time::sleep(duration).await;
 
-    let during = catalog_link.stats().since(before);
     let drain_stalled = observed_drain_stalled(target).await;
-    catalog_link.restore();
+    // The traffic delta is read immediately before the link is restored, so
+    // it covers exactly the interval the two journaled timestamps bound —
+    // not a window that ends 2 s before its own `Ended` line.
+    let during = catalog_link.stats().since(before);
+    drop(hold);
     log.ended(
         fault_id,
         FaultKind::CatalogOutage,
@@ -611,19 +634,20 @@ pub async fn run_discovery_flap(
 
     let mut cycles_completed = 0_u32;
     for _ in 0..cycles {
-        catalog_link.set(LinkConditions::dropped());
-        tokio::time::sleep(down).await;
-        catalog_link.restore();
+        // Each cycle's down phase is its own hold, released at the end of
+        // the phase — so a cycle can never lift a condition some OTHER
+        // armed window (a catalog outage over the same link, say) is
+        // holding, and cannot leave one of its own behind either
+        // (`crate::link`'s module docs; an ACPR finding on issue #204).
+        {
+            let _down = catalog_link.hold(LinkConditions::dropped());
+            tokio::time::sleep(down).await;
+        }
         tokio::time::sleep(up).await;
         cycles_completed += 1;
     }
 
     let during = catalog_link.stats().since(before);
-    // Belt and braces: the loop above always ends on a restore, but a
-    // `cycles` of 0 never entered it at all — the link must be left passing
-    // either way, or every later fault in the schedule would run against a
-    // link this one silently left broken.
-    catalog_link.restore();
     log.ended(
         fault_id,
         FaultKind::DiscoveryFlap,
@@ -786,9 +810,15 @@ pub async fn run_membership_join(
 
 /// Runs one real Flight-server-kill-mid-stream fault (§8.4, issue #204):
 /// opens a REAL Arrow Flight `DoGet` against `target`'s real Flight server,
-/// waits until the stream has genuinely started producing data, `SIGKILL`s
-/// the node, and then keeps reading the stream to journal what the client
-/// actually observed.
+/// reads the stream's FIRST `FlightData` message — which
+/// `FlightDataEncoderBuilder` always emits as the Arrow schema, so this is
+/// "the server has really begun writing this stream", not "a data batch has
+/// arrived" (an ACPR finding on issue #204, LOW-10: the pre-fix wording
+/// claimed the latter) — then `SIGKILL`s the node and keeps reading the
+/// stream to journal what the client actually observed. Killing after that
+/// first message is still a strictly stronger fault than killing before any
+/// read: it is what puts the server in the flow-control state the next
+/// section relies on.
 ///
 /// # Why this lands mid-stream deterministically
 ///
@@ -1350,6 +1380,194 @@ mod tests {
         let lines = window_lines(&path, "catalog-outage-0");
         assert!(lines[1]["detail"]["drain_stalled"].is_null());
         assert!(lines[2]["detail"]["drain_stalled"].is_null());
+    }
+
+    /// A real listener that accepts `/status` connections and NEVER answers
+    /// — what [`observed_drain_stalled`]'s own 2 s bound exists for (a
+    /// `SIGSTOP`ped node accepts the connection and never replies), and the
+    /// precondition the timestamp-skew test below needs.
+    async fn spawn_never_answering_status_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                // Held open, never written to: the client blocks until its
+                // own timeout rather than seeing a closed connection.
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    /// Wall clock in Unix milliseconds — the same clock
+    /// [`crate::faultlog::FaultLog::record`] stamps `at_ms` from, so the two
+    /// are directly comparable.
+    fn now_unix_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    }
+
+    /// The HIGH-1 ACPR finding on issue #204, through the REAL injectors:
+    /// `--fault-catalog-outage-node N` and `--fault-discovery-flap-node N`
+    /// resolve to the SAME catalog link and `crate::run_network_faults` runs
+    /// them concurrently. The flap's per-cycle up phase must not lift the
+    /// outage's cut — the pre-fix `set`/`restore` pair was last-writer-wins,
+    /// so real traffic crossed a link the outage window still journaled as
+    /// cut.
+    #[tokio::test]
+    async fn a_concurrent_flap_cannot_lift_a_catalog_outages_cut() {
+        let port = link::test_support::spawn_echo_server().await;
+        let link = FaultLink::bind("n0-catalog", "127.0.0.1", port)
+            .await
+            .unwrap();
+        // Status port 1 is never listening (this file's own convention), so
+        // the disclosure samples fail fast and journal `null`.
+        let spec = spec_with_status_port("shared-link-node", 1);
+        let (path, log) = scratch_faultlog("shared-link");
+
+        let (outage, flap, crossings) = tokio::join!(
+            run_catalog_outage(
+                "catalog-outage-0",
+                &spec,
+                &link,
+                Duration::ZERO,
+                Duration::from_millis(900),
+                &log,
+            ),
+            run_discovery_flap(
+                "discovery-flap-0",
+                &spec,
+                &link,
+                Duration::from_millis(100),
+                FlapSchedule {
+                    cycles: 4,
+                    down: Duration::from_millis(50),
+                    up: Duration::from_millis(50),
+                },
+                &log,
+            ),
+            async {
+                let mut crossings = 0_u32;
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if link::test_support::echo_round_trip(&link, b"probe")
+                        .await
+                        .is_ok()
+                    {
+                        crossings += 1;
+                    }
+                }
+                crossings
+            }
+        );
+        outage.unwrap();
+        flap.unwrap();
+
+        assert_eq!(
+            crossings,
+            0,
+            "no byte may cross while the catalog-outage window is open, even as an overlapping \
+             discovery flap ends each of its own down phases: {:#?}",
+            window_lines(&path, "catalog-outage-0")
+        );
+        // And the link is genuinely usable once BOTH windows are done.
+        link::test_support::echo_round_trip(&link, b"after")
+            .await
+            .expect("the link must pass once every window has released its hold");
+    }
+
+    /// The MEDIUM-2 ACPR finding on issue #204: a fault window's journaled
+    /// `at_ms` must be the moment the real network effect changed, not the
+    /// moment a bounded blocking `/status` probe finished. Against a target
+    /// that accepts but never answers, [`observed_drain_stalled`] blocks for
+    /// its full 2 s bound — the pre-fix code cut the link, THEN blocked,
+    /// THEN journaled `Started`, putting ~2 s between the real cut and its
+    /// own timestamp. Measured here against the real link: the moment
+    /// traffic actually stops crossing versus the timestamp the journal
+    /// claims for it.
+    #[tokio::test]
+    async fn catalog_outage_stamps_started_at_the_real_cut_not_after_the_status_probe() {
+        let port = link::test_support::spawn_echo_server().await;
+        let link = FaultLink::bind("n0-catalog", "127.0.0.1", port)
+            .await
+            .unwrap();
+        let status_port = spawn_never_answering_status_server().await;
+        let spec = spec_with_status_port("slow-status-node", status_port);
+        let (path, log) = scratch_faultlog("catalog-outage-timestamp");
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher_done = std::sync::Arc::clone(&done);
+        let (outage, first_refusal_ms) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                async {
+                    let result = run_catalog_outage(
+                        "catalog-outage-0",
+                        &spec,
+                        &link,
+                        Duration::ZERO,
+                        Duration::from_millis(400),
+                        &log,
+                    )
+                    .await;
+                    done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    result
+                },
+                async {
+                    let mut first_refusal_ms = None;
+                    while !watcher_done.load(std::sync::atomic::Ordering::Relaxed) {
+                        if link::test_support::echo_round_trip(&link, b"probe")
+                            .await
+                            .is_err()
+                            && first_refusal_ms.is_none()
+                        {
+                            first_refusal_ms = Some(now_unix_ms());
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    first_refusal_ms
+                },
+            )
+        })
+        .await
+        .expect("the outage window must complete well within 30s");
+        outage.unwrap();
+        let first_refusal_ms = first_refusal_ms.expect("the outage must really have cut traffic");
+
+        let lines = window_lines(&path, "catalog-outage-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        let started_at = lines[1]["at_ms"].as_u64().unwrap();
+        let skew = started_at.abs_diff(first_refusal_ms);
+        assert!(
+            skew < 1_000,
+            "the Started timestamp must correspond to the real cut, not to the end of a 2s \
+             blocking status probe: journaled {started_at}, traffic actually stopped at \
+             {first_refusal_ms} ({skew}ms apart): {lines:#?}"
+        );
+
+        // The mirror half, on the Ended side: the journaled traffic delta
+        // must cover the whole imposed window, not stop 2s short of its own
+        // `Ended` line. Every refusal this link ever counted happened inside
+        // the window (it passes before and after), so the link's own total
+        // and the journaled delta must agree — give or take one connection
+        // attempt racing the release itself.
+        let journaled_refused = lines[2]["detail"]["link_traffic_during_window"]["conns_refused"]
+            .as_u64()
+            .unwrap();
+        let really_refused = link.stats().conns_refused;
+        assert!(
+            journaled_refused + 1 >= really_refused,
+            "the Ended line's traffic delta must cover the whole window: journaled \
+             {journaled_refused} refusals, the link really refused {really_refused}: {lines:#?}"
+        );
     }
 
     /// Discovery flapping really oscillates the link — every configured

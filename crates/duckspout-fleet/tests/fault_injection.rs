@@ -26,10 +26,14 @@
 //! user=duckspout`), **not** the `postgres://user@host/db` URI form
 //! `duckspout-fleet --postgres-dsn`'s own CLI default documents — issue
 //! #212 (filed while verifying this file): `DuckLake`'s real `ATTACH` does
-//! not parse the URI form at all and silently falls through to treating
-//! the whole string as a local file path, so this test also passes
-//! `--skip-backend-check` (the fleet's own TCP-probe DSN parser only
-//! understands the URI form, and the probe is not this test's concern).
+//! not parse the URI form at all and silently falls through to treating the
+//! whole string as a local file path. `host`/`port` must name a real TCP
+//! address (not a Unix-socket directory): every scenario here runs the
+//! fleet's own backend-reachability probe, which this issue taught to read
+//! the keyword form (`crate::dsn`), so the probe now covers this file too
+//! instead of being skipped past — an ACPR finding (LOW-9: the
+//! `--skip-backend-check` this file used to pass was justified by a
+//! limitation issue #204 itself removed).
 //! `duckspout-fleet`'s own `--postgres-password` CLI default
 //! (`duckspout-dev`) matches `deploy/compose/compose.yaml`'s dev
 //! credential, so only the DSN itself needs overriding via env var.
@@ -44,10 +48,10 @@
 //! single-node fleet — module docs of `crate::fault` for exactly what a
 //! multi-node fleet would be needed for and is NOT yet verified here: a
 //! peer actually rejecting the resumed incarnation). #204's faults hold to
-//! the same bound, with one deliberate exception: the membership-churn
-//! test boots a SECOND node — but only after the first is already up and
-//! has initialized the catalog, which is exactly the sequencing #213's
-//! race does not apply to (it is about CONCURRENT cold boots).
+//! the same bound, with one deliberate exception: the membership-JOIN test
+//! boots a SECOND node — but only after the first is already up and has
+//! initialized the catalog, which is exactly the sequencing #213's race
+//! does not apply to (it is about CONCURRENT cold boots).
 //!
 //! **Every scenario runs under its OWN tenant** (`--tenant`, the real
 //! `X-Scope-OrgID` admission header), unique per scenario and per
@@ -157,16 +161,19 @@ fn shared_work_dir() -> PathBuf {
 }
 
 /// The arguments every scenario in this file shares (module docs above for
-/// `--nodes 1`, `--local-lake` and `--skip-backend-check`), plus `extra`.
-/// One home for them so a scenario's own arguments are the only thing that
-/// differs between tests.
+/// `--nodes 1` and `--local-lake`), plus `extra`. One home for them so a
+/// scenario's own arguments are the only thing that differs between tests.
+///
+/// The backend-reachability probe deliberately runs (no
+/// `--skip-backend-check`): it can read the keyword-form DSN this file uses
+/// as of issue #204, so leaving it on is real coverage of the probe against
+/// the real Postgres these tests already require.
 fn fleet_command(work_dir: &Path, postgres_dsn: &str, scenario: &str, extra: &[&str]) -> Command {
     let mut command = Command::new(fleet_bin());
     command.args([
         "--nodes",
         "1",
         "--local-lake",
-        "--skip-backend-check",
         "--postgres-dsn",
         postgres_dsn,
         "--postgres-password",
@@ -700,17 +707,48 @@ fn flight_kill_mid_stream_gives_the_client_a_typed_error_not_a_truncated_result(
     );
 }
 
-/// §8.4's membership churn, end to end and BOTH directions in one run: a
-/// running node leaves gracefully under load (a real `SIGTERM`, not a
-/// crash), and a provisioned-but-unbooted node really joins under load and
-/// is confirmed ready. `fault::run_membership_join`'s own docs carry what
-/// "join" can and cannot mean while membership is static config.
+/// §8.4's membership churn, LEAVE half: a running node leaves gracefully
+/// under load — a real `SIGTERM` and the daemon's own §9.1.2 shutdown, not
+/// a crash.
+///
+/// # Why leave and join are two scenarios, not one (an ACPR finding on
+/// issue #204, MEDIUM-6)
+///
+/// They used to share one run, with `--fault-churn-leave-node 0` firing at
+/// t≈3s and `--fault-churn-join` at t≈4s (the process faults run
+/// SEQUENTIALLY — `crate::run_process_faults` — so the join only starts
+/// once the leave has completed). With `--nodes 1` the sole load target is
+/// the node that left, so by the time the join fired there was nothing left
+/// alive to be "under load": every remaining batch simply failed at the
+/// connection, and the join-under-load half was vacuous — the same class of
+/// vacuity ACPR already caught in #203 for the kill/`SIGSTOP` scenarios.
+/// Splitting them lets each half fire while load is genuinely flowing, and
+/// keeps `--nodes 1` (this file's own module docs: a second CONCURRENTLY
+/// cold-booting node races `DuckLake`'s metadata init, issue #213).
+///
+/// # The load-vs-fault arithmetic
+///
+/// `(LOAD_BATCHES - 1) * LOAD_INTERVAL_MS` ≈ 59×200 ms ≈ 11.8 s of load
+/// wall clock, against a leave that fires at `LEAVE_DELAY_SECS` = 3 s —
+/// and it is verified after the run rather than assumed, from node-0's own
+/// real journal sliced at the leave's own journaled `node_journal_lines`
+/// anchor.
 #[test]
-fn membership_churn_leaves_gracefully_and_joins_a_real_new_node_under_load() {
+fn membership_leave_departs_gracefully_while_load_is_still_flowing() {
+    const LOAD_BATCHES: u32 = 60;
+    const LOAD_INTERVAL_MS: u32 = 200;
+    const LEAVE_DELAY_SECS: u32 = 3;
+
     let Some(postgres_dsn) = postgres_dsn_from_env() else {
         eprintln!("fault_injection: DUCKSPOUT_FLEET_TEST_POSTGRES_DSN unset — skipping");
         return;
     };
+    const {
+        assert!(
+            (LOAD_BATCHES - 1) * LOAD_INTERVAL_MS > LEAVE_DELAY_SECS * 1_000,
+            "the load pass must still be running when the leave fires"
+        );
+    }
     let _guard = POSTGRES_CATALOG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -719,23 +757,20 @@ fn membership_churn_leaves_gracefully_and_joins_a_real_new_node_under_load() {
     let status = fleet_command(
         &work_dir,
         &postgres_dsn,
-        "membership-churn",
+        "membership-leave",
         &[
             "--load-batches",
-            "60",
+            &LOAD_BATCHES.to_string(),
             "--load-batch-size",
             "10",
             "--load-interval-ms",
-            "200",
+            &LOAD_INTERVAL_MS.to_string(),
             "--settle-timeout-secs",
             "15",
             "--fault-churn-leave-node",
             "0",
             "--fault-churn-leave-delay-secs",
-            "3",
-            "--fault-churn-join",
-            "--fault-churn-join-delay-secs",
-            "1",
+            &LEAVE_DELAY_SECS.to_string(),
         ],
     )
     .status()
@@ -753,6 +788,97 @@ fn membership_churn_leaves_gracefully_and_joins_a_real_new_node_under_load() {
         "the leaving node must actually have left: {leave:#?}"
     );
 
+    // The vacuity teeth: node-0's own `Accept` count at the moment the
+    // `SIGTERM` was sent (`Started`'s journaled `node_journal_lines` is an
+    // exact seq anchor into the append-only journal, the same technique the
+    // SIGSTOP scenario above uses). Some batches must already have landed —
+    // load was really flowing — and strictly fewer than all of them, or the
+    // load pass had already finished and "under load" would be a fiction.
+    let started_anchor =
+        usize::try_from(leave[1]["detail"]["node_journal_lines"].as_u64().unwrap()).unwrap();
+    let journal = node0_journal(&work_dir);
+    assert!(
+        started_anchor <= journal.len(),
+        "the journal must only ever grow: anchor {started_anchor} exceeds final length {}",
+        journal.len()
+    );
+    let accepts_before_leave = journal[..started_anchor]
+        .iter()
+        .filter(|line| line["event"] == "Accept")
+        .count();
+    assert!(
+        accepts_before_leave > 0,
+        "load must already have been flowing when the leave fired: node-0 journaled no Accept at \
+         all before the SIGTERM (anchor {started_anchor} of {} lines)",
+        journal.len()
+    );
+    assert!(
+        accepts_before_leave < LOAD_BATCHES as usize,
+        "the leave must land while load is STILL flowing: node-0 had accepted \
+         {accepts_before_leave} of {LOAD_BATCHES} batches by the time the SIGTERM was sent — \
+         reaching {LOAD_BATCHES} would mean the load pass had already finished"
+    );
+}
+
+/// §8.4's membership churn, JOIN half: a provisioned-but-unbooted node
+/// really joins mid-run, under load, and is confirmed ready.
+/// `fault::run_membership_join`'s own docs carry what "join" can and cannot
+/// mean while membership is static config. The leave scenario above carries
+/// why these are two runs.
+///
+/// # The load-vs-fault arithmetic
+///
+/// The join fires at `JOIN_DELAY_SECS` = 1 s, while the load pass's own
+/// wall-clock floor is `(LOAD_BATCHES - 1) * LOAD_INTERVAL_MS` ≈ 11.8 s —
+/// and nothing in this scenario kills the load target, so the proof that
+/// load really was in flight at t≈1 s is that node 0 accepted ALL
+/// `LOAD_BATCHES` batches: a pass that admitted every one of 60 batches
+/// spaced 200 ms apart necessarily spanned ≈11.8 s of wall clock, which
+/// strictly contains the join's own 1 s mark. A load pass that had died,
+/// stalled, or finished early would show fewer.
+#[test]
+fn membership_join_boots_a_real_new_node_while_load_is_still_flowing() {
+    const LOAD_BATCHES: u32 = 60;
+    const LOAD_INTERVAL_MS: u32 = 200;
+    const JOIN_DELAY_SECS: u32 = 1;
+
+    let Some(postgres_dsn) = postgres_dsn_from_env() else {
+        eprintln!("fault_injection: DUCKSPOUT_FLEET_TEST_POSTGRES_DSN unset — skipping");
+        return;
+    };
+    const {
+        assert!(
+            (LOAD_BATCHES - 1) * LOAD_INTERVAL_MS > JOIN_DELAY_SECS * 1_000,
+            "the load pass must still be running when the join fires"
+        );
+    }
+    let _guard = POSTGRES_CATALOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let work_dir = shared_work_dir();
+
+    let status = fleet_command(
+        &work_dir,
+        &postgres_dsn,
+        "membership-join",
+        &[
+            "--load-batches",
+            &LOAD_BATCHES.to_string(),
+            "--load-batch-size",
+            "10",
+            "--load-interval-ms",
+            &LOAD_INTERVAL_MS.to_string(),
+            "--settle-timeout-secs",
+            "15",
+            "--fault-churn-join",
+            "--fault-churn-join-delay-secs",
+            &JOIN_DELAY_SECS.to_string(),
+        ],
+    )
+    .status()
+    .expect("spawning duckspout-fleet");
+    eprintln!("duckspout-fleet exited with {status} (not asserted on — see module docs)");
+
     let join = window_lines(&work_dir, "membership-join-0");
     assert_eq!(phases(&join), vec!["armed", "started", "ended"]);
     assert_eq!(
@@ -762,6 +888,19 @@ fn membership_churn_leaves_gracefully_and_joins_a_real_new_node_under_load() {
     assert!(
         work_dir.join("node-1").join("journal.ndjson").exists(),
         "the joined node must have written its own real D-6 journal"
+    );
+
+    // The vacuity teeth (module docs above for the arithmetic): every batch
+    // of a 60×200ms pass was admitted by the node the join happened
+    // alongside, so load was genuinely in flight across the join's 1s mark.
+    let accepts = node0_journal(&work_dir)
+        .iter()
+        .filter(|line| line["event"] == "Accept")
+        .count();
+    assert!(
+        accepts >= LOAD_BATCHES as usize,
+        "the join must happen under sustained load: node-0 accepted only {accepts} of \
+         {LOAD_BATCHES} batches, so the load pass did not span the join at all"
     );
 }
 

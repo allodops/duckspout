@@ -430,6 +430,14 @@ const EXIT_OK: i32 = 0;
 const EXIT_HARD_FAILURE: i32 = 1;
 const EXIT_DRAIN_UNCONFIRMED: i32 = 2;
 
+/// [`run`]'s failure message when [`all_batches_accepted`] says no. It names
+/// what is actually measured — WHOLE-RUN acceptance, never acceptance scoped
+/// to a fault window (an ACPR finding on issue #204, MEDIUM-5; module docs
+/// of [`ingest_faulted_nodes`] carry the full reasoning).
+const ALL_ACCEPTED_FAILURE: &str = "at least one node did not fully accept its drive-load batches across the WHOLE run (see \
+     summary above); this runner measures whole-run acceptance, not acceptance scoped to a fault \
+     window — the window-scoped verdict is the judge's, from journals (§8.4)";
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt::init();
@@ -550,7 +558,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     report_work_dir(&work_dir);
 
     if !all_accepted {
-        bail!("at least one node did not fully accept its drive-load batches (see summary above)");
+        bail!(ALL_ACCEPTED_FAILURE);
     }
     if !drain_confirmed {
         tracing::warn!(
@@ -593,13 +601,30 @@ fn all_batches_accepted(cli: &Cli, load_results: &[load::LoadResult]) -> bool {
 /// node asked to leave, a node whose Flight server was killed.
 ///
 /// Deliberately NOT every fault-targeted node: `--fault-catalog-outage-node`
-/// and `--fault-discovery-flap-node` only touch a node's CATALOG link, and
-/// §8.4's own predicate for those two fault classes is that "ingest must
-/// continue undegraded" while "drains stall and disclose". Exempting them
-/// here would erase the one runner-level signal that predicate has — so a
-/// catalog outage that does degrade ingest still shows up as a red smoke
-/// run, with the authoritative verdict still the judge's, from journals
-/// (§8.4).
+/// and `--fault-discovery-flap-node` only touch a node's CATALOG link, which
+/// §8.4 pairs with "ingest must continue undegraded" while "drains stall and
+/// disclose". Exempting them here would erase the one runner-level signal
+/// related to that predicate — so a catalog-faulted node whose ingest
+/// degrades still shows up as a red smoke run.
+///
+/// # What the resulting check actually measures (an ACPR finding, MEDIUM-5)
+///
+/// [`all_batches_accepted`] is computed over the WHOLE run's batch counts,
+/// so what a catalog-faulted node is held to here is "every batch of the
+/// whole drive-load pass was accepted" — a STRICTER bar than §8.4's
+/// during-the-window predicate, not the same one. The difference is real
+/// and disclosed rather than papered over: [`fault::run_catalog_outage`]'s
+/// own docs record that `libpq` does not reconnect a session cut mid-window,
+/// so a node can ingest perfectly during the outage and degrade only
+/// afterwards — and this check would still fail the run for it.
+///
+/// That strictness is kept deliberately. Scoping the check to the window
+/// would need per-batch timing correlated against the window's own journaled
+/// bounds, which is the judge's job (#205–#208, judging from journals after
+/// the run) and not this runner's; and doing it here would NARROW a live
+/// check, which is exactly the move this repo's constitution names as an
+/// offense (§11). So the check stays whole-run and the wording — here, and
+/// in [`run`]'s own failure message — says whole-run.
 fn ingest_faulted_nodes(cli: &Cli) -> std::collections::BTreeSet<u16> {
     [
         cli.fault_kill_node,
@@ -721,7 +746,12 @@ struct FaultRun<'a> {
 /// - **Network faults** ([`run_network_faults`]) touch only shared state (a
 ///   [`link::FaultLink`] handle and a [`NodeSpec`]), so they run
 ///   concurrently with each other too — a real chaos schedule overlaps its
-///   windows, and each one journals its own start/end regardless.
+///   windows, and each one journals its own start/end regardless. Two
+///   windows can legitimately land on the SAME link (`--fault-catalog-
+///   outage-node N` and `--fault-discovery-flap-node N` share node N's
+///   catalog link, which [`link_needs`] builds once): they compose through
+///   `crate::link`'s refcounted holds, so neither can lift the other's
+///   condition — see that module's own docs.
 /// - **Process faults** ([`run_process_faults`]) each need `&mut` on a
 ///   running child, so they run sequentially, in the fixed order below.
 ///   Each one's own `--fault-*-delay-secs` is measured from when its turn
@@ -1890,10 +1920,11 @@ mod tests {
     }
 
     /// The catalog-only faults are deliberately NOT exempted from the
-    /// batch-acceptance check (module docs of [`ingest_faulted_nodes`]):
-    /// §8.4's own predicate for them is that ingest continues undegraded,
-    /// so erasing that signal would make the fault unfalsifiable at the
-    /// runner level.
+    /// whole-run batch-acceptance check (module docs of
+    /// [`ingest_faulted_nodes`], including exactly how that check differs
+    /// from §8.4's during-the-window predicate): exempting them would erase
+    /// the one runner-level signal related to "ingest must continue
+    /// undegraded".
     #[test]
     fn ingest_faulted_nodes_covers_ingest_faults_only() {
         let mut cli = base_cli("exempt-set");

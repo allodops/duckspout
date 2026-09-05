@@ -19,6 +19,25 @@
 //! given. Both forms are handled here, so both the probe and the fault
 //! links work against either.
 //!
+//! # Fail closed, in both forms
+//!
+//! Both branches reject an unparseable port rather than substituting
+//! [`DEFAULT_PORT`] for it (an ACPR finding on issue #204, MEDIUM-4: the URI
+//! branch used to substitute silently while the keyword branch errored on
+//! the same input). That is not cosmetic symmetry: `crate::main`'s
+//! `build_fault_links` chooses a catalog fault link's UPSTREAM from this
+//! parse, while the node's own connection string keeps whatever it was
+//! given — so a silently-defaulted port can point the fault link and the
+//! real node at two different servers, and the "fault" becomes a
+//! misconfiguration.
+//!
+//! IPv6 host forms are rejected outright for the same reason, rather than
+//! misparsed: `postgres://user@[::1]/db` used to yield the host `"[:"` and
+//! port 5432. Supporting them properly would also mean teaching
+//! [`crate::link::FaultLink`]'s plain `"host:port"` upstream string to
+//! bracket a literal; until a fleet actually needs an IPv6 catalog, a clear
+//! error is the honest answer.
+//!
 //! # The keyword-form limitation, stated
 //!
 //! libpq's keyword form allows single-quoted values with embedded spaces
@@ -40,8 +59,9 @@ const DEFAULT_PORT: u16 = 5432;
 ///
 /// # Errors
 ///
-/// If `dsn` is neither form (no `://`, and no `key=value` tokens), or its
-/// keyword form carries an unparseable `port`.
+/// If `dsn` is neither form (no `://`, and no `key=value` tokens), if its
+/// port is not a number in EITHER form, or if its URI form carries a
+/// bracketed IPv6 host (module docs).
 pub fn postgres_host_port(dsn: &str) -> anyhow::Result<(String, u16)> {
     if let Some((_, rest)) = dsn.split_once("://") {
         // Authority ends at the first '/' (database path) or '?' (params);
@@ -51,8 +71,27 @@ pub fn postgres_host_port(dsn: &str) -> anyhow::Result<(String, u16)> {
         // right host).
         let authority = rest.split(['/', '?']).next().unwrap_or(rest);
         let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        // A bracketed IPv6 literal (`[::1]:5432`) would otherwise parse to
+        // the host `"[:"` — silently, and silently wrong (module docs).
+        if host_port.starts_with('[') || host_port.matches(':').count() > 1 {
+            bail!(
+                "postgres DSN {dsn:?} names an IPv6 host, which this fleet runner does not \
+                 support: its fault links address their upstream as a plain \"host:port\" string \
+                 (crate::link), which cannot carry one — use an IPv4 address or a hostname"
+            );
+        }
         return Ok(match host_port.rsplit_once(':') {
-            Some((host, port)) => (host.to_owned(), port.parse().unwrap_or(DEFAULT_PORT)),
+            // Fails closed rather than silently substituting the default:
+            // the fault link's upstream comes from THIS parse while the
+            // node's own connection string keeps the original value, so a
+            // quietly-defaulted port can point the two at different
+            // servers (module docs; matches the keyword branch below).
+            Some((host, port)) => (
+                host.to_owned(),
+                port.parse().with_context(|| {
+                    format!("postgres DSN {dsn:?} has a non-numeric port {port:?}")
+                })?,
+            ),
             None => (host_port.to_owned(), DEFAULT_PORT),
         });
     }
@@ -201,6 +240,42 @@ mod tests {
     #[test]
     fn keyword_form_with_a_non_numeric_port_is_rejected() {
         assert!(postgres_host_port("host=db port=main").is_err());
+    }
+
+    /// The MEDIUM-4 ACPR finding on issue #204: the URI branch used to
+    /// substitute [`DEFAULT_PORT`] for an unparseable port — silently
+    /// pointing a catalog fault link at 5432 while the node's own DSN still
+    /// carried the original string. Both branches must fail closed on the
+    /// same input (module docs).
+    #[test]
+    fn uri_form_with_a_non_numeric_port_is_rejected() {
+        let error = postgres_host_port("postgres://duckspout@127.0.0.1:main/db")
+            .expect_err("a non-numeric URI port must not be silently defaulted");
+        assert!(
+            format!("{error:#}").contains("non-numeric port"),
+            "the error must name the real problem: {error:#}"
+        );
+        assert!(postgres_host_port("postgres://db:54x2/x").is_err());
+        assert!(postgres_host_port("postgres://db:/x").is_err());
+    }
+
+    /// A bracketed IPv6 host used to parse to the host `"[:"` and port
+    /// 5432 — silently wrong. Rejected with a clear error instead (module
+    /// docs on why this crate cannot carry one end to end).
+    #[test]
+    fn uri_form_rejects_an_ipv6_host_rather_than_misparsing_it() {
+        for dsn in [
+            "postgres://user@[::1]/db",
+            "postgres://[::1]:5432/db",
+            "postgres://user@[2001:db8::1]:5432/db",
+        ] {
+            let error =
+                postgres_host_port(dsn).expect_err("an IPv6 DSN must be rejected, not misparsed");
+            assert!(
+                format!("{error:#}").contains("IPv6"),
+                "the error must name the real problem for {dsn:?}: {error:#}"
+            );
+        }
     }
 
     #[test]

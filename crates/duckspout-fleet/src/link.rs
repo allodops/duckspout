@@ -53,6 +53,28 @@
 //! that wants "the peer hangs" can use a large [`LinkCondition::Delay`]
 //! instead, which stalls the byte path without tearing it down.
 //!
+//! # Overlapping fault windows: conditions are HELD, never assigned
+//!
+//! Two armed faults can legitimately share one link — `--fault-catalog-
+//! outage-node 1` and `--fault-discovery-flap-node 1` both condition node
+//! 1's catalog link, and `crate::main`'s `run_network_faults` runs every
+//! armed window CONCURRENTLY (a real chaos schedule overlaps its windows).
+//! A last-writer-wins `set`/`restore` pair would let the flap's per-cycle
+//! restore lift the outage's cut while the outage window is still journaled
+//! open — the journal would claim a cut that is not in effect, which is the
+//! one thing a start/end-journaled window must never do (an ACPR finding on
+//! issue #204, HIGH-1).
+//!
+//! So a condition is not assigned, it is **held**: [`FaultLink::hold`]
+//! returns a [`LinkHold`], and the link's effective condition is the
+//! most restrictive condition across every hold currently outstanding
+//! ([`LinkCondition::most_restrictive`]). A window lifts only its OWN hold,
+//! and the link relaxes only when the LAST hold covering it is released.
+//! Refcounting rather than making the overlapping flag combinations
+//! mutually exclusive is the deliberate choice: §8.4's schedule is meant to
+//! overlap windows, and each new fault class would otherwise need another
+//! hand-maintained exclusion rule.
+//!
 //! # What a proxy cannot reproduce (stated, not papered over)
 //!
 //! - **Half-open / asymmetric CONNECTIVITY.** Per-direction conditions here
@@ -73,6 +95,7 @@
 //!   crate creates are the real network edges that DO exist — client→node
 //!   ingest, node→Postgres catalog, node→S3/`MinIO` lake.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,7 +127,28 @@ pub enum LinkCondition {
     BandwidthCap { bytes_per_sec: u64 },
 }
 
+/// The byte pump's read/forward chunk size — also the reference size
+/// [`LinkCondition::most_restrictive`] compares two pacing conditions at.
+const CHUNK: usize = 16 * 1024;
+
 impl LinkCondition {
+    /// Which of two conditions held on the same direction at the same time
+    /// actually applies: the more restrictive one, so a window can never be
+    /// relaxed by another window's condition (module docs).
+    ///
+    /// `Drop` dominates everything (a link nobody may cross is not made
+    /// crossable by a second fault that merely slows it); otherwise the
+    /// condition that holds a full [`CHUNK`] longer wins, which orders
+    /// `Pass` (no hold) below every delay and every cap, and orders a delay
+    /// against a cap by their real effect on one forwarded chunk.
+    fn most_restrictive(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Drop, _) | (_, Self::Drop) => Self::Drop,
+            _ if other.pace(CHUNK) > self.pace(CHUNK) => other,
+            _ => self,
+        }
+    }
+
     /// How long to hold a chunk of `bytes` bytes before forwarding it.
     fn pace(self, bytes: usize) -> Duration {
         match self {
@@ -169,6 +213,19 @@ impl LinkConditions {
     fn either_dropped(self) -> bool {
         self.client_to_server == LinkCondition::Drop || self.server_to_client == LinkCondition::Drop
     }
+
+    /// Both directions' [`LinkCondition::most_restrictive`] — how two
+    /// simultaneously-held windows compose on one link (module docs).
+    fn most_restrictive(self, other: Self) -> Self {
+        Self {
+            client_to_server: self
+                .client_to_server
+                .most_restrictive(other.client_to_server),
+            server_to_client: self
+                .server_to_client
+                .most_restrictive(other.server_to_client),
+        }
+    }
 }
 
 /// A snapshot of one link's real traffic counters — the evidence a fault
@@ -183,7 +240,7 @@ pub struct LinkStats {
     /// Connections closed immediately on accept because the link was
     /// dropped at that moment.
     pub conns_refused: u64,
-    /// Established proxied connections torn down by a [`FaultLink::set`]
+    /// Established proxied connections torn down by a [`FaultLink::hold`]
     /// that dropped the link while they were live.
     pub conns_cut: u64,
     /// Bytes actually forwarded client→server, ever.
@@ -212,12 +269,33 @@ impl LinkStats {
     }
 }
 
+/// Every condition currently HELD on one link, by hold id (module docs:
+/// overlapping fault windows compose, they do not overwrite each other).
+#[derive(Default)]
+struct HoldTable {
+    /// Never reused, so a released hold's id can never lift a later one.
+    next_id: u64,
+    active: BTreeMap<u64, LinkConditions>,
+}
+
+impl HoldTable {
+    /// The condition actually in force: the most restrictive across every
+    /// outstanding hold, and [`LinkConditions::pass`] when there are none.
+    fn effective(&self) -> LinkConditions {
+        self.active
+            .values()
+            .copied()
+            .fold(LinkConditions::pass(), LinkConditions::most_restrictive)
+    }
+}
+
 /// The live state every accept/pump task shares with the [`FaultLink`]
 /// handle the fault injectors hold.
 struct LinkState {
-    conditions: std::sync::Mutex<LinkConditions>,
-    /// Bumped by every [`FaultLink::set`] that drops the link; every live
-    /// pump task watches it and tears its connection down when it changes.
+    holds: std::sync::Mutex<HoldTable>,
+    /// Bumped whenever a new [`LinkHold`] drops the link that was not
+    /// already dropped; every live pump task watches it and tears its
+    /// connection down when it changes.
     cut_epoch: watch::Sender<u64>,
     conns_accepted: AtomicU64,
     conns_refused: AtomicU64,
@@ -228,10 +306,10 @@ struct LinkState {
 
 impl LinkState {
     fn conditions(&self) -> LinkConditions {
-        *self
-            .conditions
+        self.holds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .effective()
     }
 
     fn stats(&self) -> LinkStats {
@@ -292,7 +370,7 @@ impl FaultLink {
             .with_context(|| format!("reading fault link {label}'s own address"))?;
         let upstream = format!("{upstream_host}:{upstream_port}");
         let state = Arc::new(LinkState {
-            conditions: std::sync::Mutex::new(LinkConditions::pass()),
+            holds: std::sync::Mutex::new(HoldTable::default()),
             cut_epoch: watch::channel(0).0,
             conns_accepted: AtomicU64::new(0),
             conns_refused: AtomicU64::new(0),
@@ -339,27 +417,57 @@ impl FaultLink {
         self.state.stats()
     }
 
-    /// Applies `conditions` from now on. If either direction is
-    /// [`LinkCondition::Drop`], every currently-established connection is
-    /// also torn down (module docs: the fault's effect must start inside
-    /// its own journaled window, not merely apply to connections opened
-    /// after it).
-    pub fn set(&self, conditions: LinkConditions) {
-        *self
+    /// Holds `conditions` on this link until the returned [`LinkHold`] is
+    /// dropped — the ONLY way to condition a link (module docs: a window
+    /// lifts its own hold, never another window's).
+    ///
+    /// If this hold makes the link dropped when it was not already, every
+    /// currently-established connection is also torn down (module docs: the
+    /// fault's effect must start inside its own journaled window, not
+    /// merely apply to connections opened after it).
+    #[must_use = "the condition is lifted as soon as the hold is dropped"]
+    pub fn hold(&self, conditions: LinkConditions) -> LinkHold {
+        let mut table = self
             .state
-            .conditions
+            .holds
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = conditions;
-        if conditions.either_dropped() {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = table.next_id;
+        table.next_id += 1;
+        let was_dropped = table.effective().either_dropped();
+        table.active.insert(id, conditions);
+        let now_dropped = table.effective().either_dropped();
+        drop(table);
+        if now_dropped && !was_dropped {
             self.state.cut_epoch.send_modify(|epoch| *epoch += 1);
         }
+        LinkHold {
+            state: Arc::clone(&self.state),
+            id,
+        }
     }
+}
 
-    /// Restores [`LinkConditions::pass`] — the end of a fault window's
-    /// injected condition (never a claim the system has recovered from it;
-    /// `crate::fault`'s own module docs).
-    pub fn restore(&self) {
-        self.set(LinkConditions::pass());
+/// One fault window's outstanding condition on one link. Dropping it lifts
+/// exactly that window's own condition — the link relaxes only once the
+/// LAST hold on it is gone (module docs), never as a side effect of another
+/// window ending, and never a claim the system has recovered from the fault
+/// (`crate::fault`'s own module docs).
+pub struct LinkHold {
+    state: Arc<LinkState>,
+    id: u64,
+}
+
+impl Drop for LinkHold {
+    fn drop(&mut self) {
+        self.state
+            .holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .remove(&self.id);
+        // No `cut_epoch` bump: releasing a hold can only ever RELAX the
+        // link, and a relaxation must not tear down live connections.
     }
 }
 
@@ -396,8 +504,18 @@ async fn accept_loop(
     }
 }
 
-/// Pumps one accepted connection in both directions until either side
-/// closes or a [`FaultLink::set`] cuts the link.
+/// Pumps one accepted connection in both directions until BOTH directions
+/// have ended, or a [`FaultLink::hold`] cuts the link.
+///
+/// The two directions are joined, not raced: one direction reaching EOF
+/// half-closes only that peer's write half and leaves the other direction
+/// pumping (see [`pump`]). Racing them — first future to finish tears the
+/// whole connection down — makes a legal HTTP/1.1 half-close (a client that
+/// sends its request, shuts down its write half, and then reads) destroy
+/// the response still in flight the other way, on an UNFAULTED link: the
+/// links are bound for the whole run, so an unfaulted node's byte path has
+/// to be a faithful pump, not merely a mostly-faithful one (an ACPR finding
+/// on issue #204, MEDIUM-3).
 async fn proxy_connection(
     client: TcpStream,
     upstream: &str,
@@ -422,10 +540,7 @@ async fn proxy_connection(
         Direction::ServerToClient,
         Arc::clone(state),
     );
-    tokio::select! {
-        () = to_server => {}
-        () = to_client => {}
-    }
+    tokio::join!(to_server, to_client);
     if *state.cut_epoch.borrow() != epoch_at_start {
         state.conns_cut.fetch_add(1, Ordering::Relaxed);
     }
@@ -433,15 +548,19 @@ async fn proxy_connection(
 }
 
 /// One direction's byte pump: read a chunk, apply the current condition to
-/// it, forward it, count it. Returns as soon as the stream ends, a write
-/// fails, or the link is cut.
+/// it, forward it, count it. Returns when this direction's stream ends, a
+/// write fails, or the link is cut.
+///
+/// On a clean end of THIS direction (EOF from `from`), the peer's write
+/// half is shut down — propagating the half-close as a half-close, so the
+/// other direction keeps pumping until it ends on its own
+/// ([`proxy_connection`]'s docs on the ACPR finding this closes).
 async fn pump(
     mut from: tokio::net::tcp::OwnedReadHalf,
     mut to: tokio::net::tcp::OwnedWriteHalf,
     direction: Direction,
     state: Arc<LinkState>,
 ) {
-    const CHUNK: usize = 16 * 1024;
     let mut cut = state.cut_epoch.subscribe();
     let mut buf = vec![0_u8; CHUNK];
     loop {
@@ -451,7 +570,14 @@ async fn pump(
             read = from.read(&mut buf) => read,
         };
         let n = match read {
-            Ok(0) | Err(_) => return,
+            Ok(0) => {
+                // A half-close, forwarded as one: the upstream sees the
+                // FIN it would have seen without this proxy in the path,
+                // and this connection's OTHER direction stays open.
+                let _ = to.shutdown().await;
+                return;
+            }
+            Err(_) => return,
             Ok(n) => n,
         };
         let condition = match direction {
@@ -572,7 +698,7 @@ mod tests {
         let link = FaultLink::bind("test-drop", "127.0.0.1", port)
             .await
             .unwrap();
-        link.set(LinkConditions::dropped());
+        let _dropped = link.hold(LinkConditions::dropped());
 
         let result = echo_round_trip(&link, b"duckspout").await;
         assert!(
@@ -604,7 +730,7 @@ mod tests {
         stream.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"before");
 
-        link.set(LinkConditions::dropped());
+        let _dropped = link.hold(LinkConditions::dropped());
 
         // The cut closes the proxied connection: the next read observes EOF
         // (or a reset), never more echoed data.
@@ -626,23 +752,173 @@ mod tests {
         );
     }
 
-    /// Restoring a link makes it a faithful byte pump again — the `Ended`
-    /// phase of a partition window must genuinely lift the condition, or
-    /// every later fault in the schedule would run against a still-broken
-    /// link.
+    /// Releasing a link's last hold makes it a faithful byte pump again —
+    /// the `Ended` phase of a partition window must genuinely lift the
+    /// condition, or every later fault in the schedule would run against a
+    /// still-broken link.
     #[tokio::test]
-    async fn restoring_a_dropped_link_lets_traffic_through_again() {
+    async fn releasing_the_last_hold_lets_traffic_through_again() {
         let port = spawn_echo_server().await;
         let link = FaultLink::bind("test-restore", "127.0.0.1", port)
             .await
             .unwrap();
-        link.set(LinkConditions::dropped());
+        let dropped = link.hold(LinkConditions::dropped());
         assert!(echo_round_trip(&link, b"nope").await.is_err());
 
-        link.restore();
+        drop(dropped);
         echo_round_trip(&link, b"again")
             .await
             .expect("a restored link must carry real traffic again");
+    }
+
+    /// The HIGH-1 ACPR finding on issue #204, at the mechanism level: two
+    /// fault windows sharing one link (e.g. `--fault-catalog-outage-node 1`
+    /// and `--fault-discovery-flap-node 1`, which resolve to the SAME
+    /// catalog link and run concurrently) must not corrupt each other. The
+    /// pre-fix `set`/`restore` pair was last-writer-wins, so the flap's
+    /// per-cycle `restore()` lifted the outage's cut while the outage
+    /// window was still journaled open — traffic really crossed a link the
+    /// journal claimed was cut.
+    #[tokio::test]
+    async fn a_released_hold_does_not_lift_another_windows_still_held_drop() {
+        let port = spawn_echo_server().await;
+        let link = FaultLink::bind("test-two-windows", "127.0.0.1", port)
+            .await
+            .unwrap();
+
+        let outage = link.hold(LinkConditions::dropped());
+        {
+            // A second, overlapping window on the same link, released
+            // FIRST — exactly the flap's per-cycle up phase.
+            let _flap_cycle = link.hold(LinkConditions::dropped());
+        }
+        assert!(
+            echo_round_trip(&link, b"nope").await.is_err(),
+            "a second window's release must not lift a window that is still holding the link"
+        );
+
+        drop(outage);
+        echo_round_trip(&link, b"again")
+            .await
+            .expect("the link must pass once its LAST hold is released");
+    }
+
+    /// The composition rule two overlapping windows resolve through: the
+    /// most restrictive condition wins per direction, so no window is ever
+    /// relaxed by another window's weaker condition.
+    #[test]
+    fn the_most_restrictive_held_condition_wins_per_direction() {
+        let mut table = HoldTable::default();
+        table.active.insert(
+            0,
+            LinkConditions {
+                client_to_server: LinkCondition::Delay { ms: 10 },
+                server_to_client: LinkCondition::Pass,
+            },
+        );
+        assert_eq!(
+            table.effective().client_to_server,
+            LinkCondition::Delay { ms: 10 }
+        );
+
+        table.active.insert(
+            1,
+            LinkConditions {
+                client_to_server: LinkCondition::Pass,
+                server_to_client: LinkCondition::Drop,
+            },
+        );
+        let effective = table.effective();
+        assert_eq!(
+            effective.client_to_server,
+            LinkCondition::Delay { ms: 10 },
+            "a second window's Pass must not relax the first window's delay"
+        );
+        assert_eq!(
+            effective.server_to_client,
+            LinkCondition::Drop,
+            "Drop dominates every other condition"
+        );
+
+        // A slower cap beats a faster one; releasing it falls back to the
+        // condition still held, never to Pass.
+        table.active.clear();
+        table.active.insert(
+            0,
+            LinkConditions {
+                client_to_server: LinkCondition::BandwidthCap {
+                    bytes_per_sec: 1_000_000,
+                },
+                server_to_client: LinkCondition::Pass,
+            },
+        );
+        table.active.insert(
+            1,
+            LinkConditions {
+                client_to_server: LinkCondition::BandwidthCap { bytes_per_sec: 10 },
+                server_to_client: LinkCondition::Pass,
+            },
+        );
+        assert_eq!(
+            table.effective().client_to_server,
+            LinkCondition::BandwidthCap { bytes_per_sec: 10 }
+        );
+        table.active.remove(&1);
+        assert_eq!(
+            table.effective().client_to_server,
+            LinkCondition::BandwidthCap {
+                bytes_per_sec: 1_000_000
+            }
+        );
+        table.active.remove(&0);
+        assert_eq!(table.effective(), LinkConditions::pass());
+    }
+
+    /// The MEDIUM-3 ACPR finding on issue #204: a `Pass` link must be a
+    /// faithful byte pump for a legal HTTP/1.1 half-close too — a client
+    /// that sends its request, shuts down its write half, and then reads
+    /// must still receive the upstream's reply. The pre-fix pump raced the
+    /// two directions and tore the whole connection down on the FIRST EOF,
+    /// destroying a response still in flight the other way — on an
+    /// UNFAULTED link, which every fault-linked node uses for its whole
+    /// run.
+    #[tokio::test]
+    async fn a_half_closed_client_still_receives_the_upstreams_reply() {
+        // An upstream that only replies AFTER it sees the request's EOF —
+        // the shape a half-close is for.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    if stream.read_to_end(&mut request).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(b"reply-after-eof").await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let link = FaultLink::bind("test-half-close", "127.0.0.1", port)
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(link.listen_addr()).await.unwrap();
+        stream.write_all(b"request").await.unwrap();
+        // FIN on the request direction only — the response direction is
+        // still open and still expected to carry the reply.
+        stream.shutdown().await.unwrap();
+
+        let mut back = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut back))
+            .await
+            .expect("the reply must arrive well within 5s");
+        read.expect("reading the upstream's reply");
+        assert_eq!(
+            back, b"reply-after-eof",
+            "a half-close must not tear down the direction still carrying data"
+        );
     }
 
     /// A one-direction delay is real, measurable added latency — and it is
@@ -661,7 +937,7 @@ mod tests {
             "an unconditioned round trip must be fast, took {fast:?}"
         );
 
-        link.set(LinkConditions {
+        let _delayed = link.hold(LinkConditions {
             client_to_server: LinkCondition::Pass,
             server_to_client: LinkCondition::Delay { ms: 400 },
         });
@@ -681,7 +957,7 @@ mod tests {
         let link = FaultLink::bind("test-bandwidth", "127.0.0.1", port)
             .await
             .unwrap();
-        link.set(LinkConditions {
+        let _capped = link.hold(LinkConditions {
             // 8 KiB through a 16 KiB/s cap ≈ 0.5s on the request leg alone.
             client_to_server: LinkCondition::BandwidthCap {
                 bytes_per_sec: 16 * 1024,
