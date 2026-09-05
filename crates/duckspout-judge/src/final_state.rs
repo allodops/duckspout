@@ -56,8 +56,24 @@
 //! interface, if one is ever needed for a non-loadgen-generated dataset,
 //! is out of scope here.
 
-use std::collections::HashSet;
+//! # The changelog latest view (#206)
+//!
+//! [`LatestView`] is this module's second read-back surface: the
+//! `<dataset>_latest` argmax view (§7.7) a changelog dataset serves, which
+//! `crate::predicates::latest_view` compares against the fold of the acked
+//! changelog. It is deliberately a WHOLE-VIEW query (`dataset` in, the
+//! served key→value map out) rather than the per-record probe
+//! [`FinalSystemState::contains`] is: a per-key probe could only ever find
+//! keys the judge already expected, and `LatestViewCorrect` is violated just
+//! as badly by a key the view serves that the fold says was deleted (a
+//! resurrected tombstone) as by one it fails to serve. The whole-view shape
+//! is also the one a real backend actually has — `SELECT * FROM
+//! ds.<dataset>_latest` is one query, where `contains` is one round trip per
+//! record (this module's MEDIUM-5 honesty note above).
 
+use std::collections::{BTreeMap, HashSet};
+
+use duckspout_types::DatasetId;
 use serde::Deserialize;
 
 /// A final-system read-back query failed (ACPR finding MEDIUM-5(b)):
@@ -184,6 +200,95 @@ impl InMemoryFinalState {
     }
 }
 
+/// A `<dataset>_latest` read-back failed (the [`QueryError`] analogue for
+/// [`LatestView`]).
+///
+/// A separate type rather than a reuse of [`QueryError`]: that error names
+/// the subject of a failed probe as `(tenant, record_key)`, which a
+/// whole-view query simply does not have — bending its fields to mean
+/// something else at one call site is how error messages start lying. Both
+/// exist for the same reason (module docs' MEDIUM-5(b)): a failed query is
+/// not proof of absence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("latest-view query for dataset {dataset} failed: {reason}")]
+pub struct ViewQueryError {
+    /// The dataset whose view could not be read.
+    pub dataset: DatasetId,
+    /// A human-readable reason (a real backend's own error, stringified).
+    pub reason: String,
+}
+
+/// The served `<dataset>_latest` view of a changelog dataset (§7.7).
+pub trait LatestView {
+    /// Every key the view serves for `dataset`, with its served value —
+    /// tombstoned keys are ABSENT from the map, exactly as they are absent
+    /// from the view (§7.7: "tombstones make keys absent from the view").
+    ///
+    /// # Errors
+    ///
+    /// A [`ViewQueryError`] iff the query itself failed — never merely
+    /// because the view is empty (an empty view is `Ok` of an empty map).
+    fn view(&self, dataset: &DatasetId) -> Result<BTreeMap<String, String>, ViewQueryError>;
+}
+
+/// A test double: the exact served view per dataset. A dataset with no
+/// entry serves an EMPTY view rather than failing — "the dataset exists and
+/// currently shows nothing" is a real, and violating, state when the fold
+/// says it should show something, so defaulting to an error here would let
+/// a genuinely empty view escape as `NoVerdict` instead of `Violation`.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryLatestView {
+    views: BTreeMap<DatasetId, BTreeMap<String, String>>,
+}
+
+impl InMemoryLatestView {
+    /// An empty view set: every dataset serves nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets `dataset`'s served view to `rows` — builder-style, for compact
+    /// test/fixture setup.
+    #[must_use]
+    pub fn with_view(
+        mut self,
+        dataset: &str,
+        rows: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.views
+            .insert(DatasetId::new(dataset), rows.into_iter().collect());
+        self
+    }
+
+    /// Builds a latest-view double from a fixture file's JSON text — the
+    /// judge binary's `--latest-view-fixture` flag, the `<dataset>_latest`
+    /// counterpart of [`InMemoryFinalState::from_fixture_json`] and, like
+    /// it, a DEV/TEST stand-in for a real read-back (module docs).
+    ///
+    /// Shape: `{"views": {"<dataset>": {"<key>": "<value>", …}, …}}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`serde_json`] decode error.
+    pub fn from_fixture_json(text: &str) -> Result<Self, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct FixtureFile {
+            views: BTreeMap<DatasetId, BTreeMap<String, String>>,
+        }
+        let fixture: FixtureFile = serde_json::from_str(text)?;
+        Ok(Self {
+            views: fixture.views,
+        })
+    }
+}
+
+impl LatestView for InMemoryLatestView {
+    fn view(&self, dataset: &DatasetId) -> Result<BTreeMap<String, String>, ViewQueryError> {
+        Ok(self.views.get(dataset).cloned().unwrap_or_default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +345,45 @@ mod tests {
     #[test]
     fn from_fixture_json_rejects_malformed_input() {
         assert!(InMemoryFinalState::from_fixture_json("not json").is_err());
+    }
+
+    #[test]
+    fn an_unknown_dataset_serves_an_empty_view_rather_than_failing() {
+        // Deliberate (this type's own docs): an empty served view is a
+        // real, violating state when the fold expects rows, so it must
+        // reach the predicate as data, not as a query failure that would
+        // downgrade a genuine violation to NoVerdict.
+        let view = InMemoryLatestView::new();
+        assert_eq!(view.view(&DatasetId::new("nope")), Ok(BTreeMap::new()));
+    }
+
+    #[test]
+    fn with_view_serves_exactly_the_rows_given() {
+        let view = InMemoryLatestView::new().with_view(
+            "dim",
+            [
+                ("k1".to_owned(), "v1".to_owned()),
+                ("k2".to_owned(), "v2".to_owned()),
+            ],
+        );
+        let served = view.view(&DatasetId::new("dim")).expect("query");
+        assert_eq!(served.get("k1").map(String::as_str), Some("v1"));
+        assert_eq!(served.len(), 2);
+    }
+
+    #[test]
+    fn latest_view_from_fixture_json_decodes_views() {
+        let view = InMemoryLatestView::from_fixture_json(
+            r#"{"views":{"dim_users":{"u1":"alice","u2":"bob"}}}"#,
+        )
+        .expect("decodes");
+        let served = view.view(&DatasetId::new("dim_users")).expect("query");
+        assert_eq!(served.get("u2").map(String::as_str), Some("bob"));
+        assert_eq!(served.len(), 2);
+    }
+
+    #[test]
+    fn latest_view_from_fixture_json_rejects_malformed_input() {
+        assert!(InMemoryLatestView::from_fixture_json("not json").is_err());
     }
 }

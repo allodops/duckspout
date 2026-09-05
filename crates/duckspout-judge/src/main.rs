@@ -7,41 +7,41 @@
 //! Seeded-violation replays must convict, and a run whose armed injectors
 //! never fired is vacuous — `NoVerdict`, never `Pass` (§8.3).
 //!
-//! This binary is now a thin `clap` wrapper: the actual pipeline
-//! (ingest → loadgen run-summary vacuity check → predicate) lives in
+//! This binary is a thin `clap` wrapper: the actual pipeline
+//! (ingest → loadgen run-summary vacuity check → every predicate) lives in
 //! `duckspout_judge::runner`, split out specifically so it is directly
 //! testable (ACPR finding MEDIUM-HIGH-4) without spawning a subprocess.
 //!
-//! # #205: what's wired for real here, and what's deferred
+//! # What's wired for real here, and what's deferred
 //!
-//! Journal ingestion (`duckspout_judge::journal`) is real: malformed input
-//! fails closed, exactly as the checking logic below relies on. The
-//! zero-acked-lost predicate (`duckspout_judge::predicates::zero_acked_lost`)
-//! is real and unit-tested against a `FinalSystemState` test double
-//! (`duckspout_judge::final_state`). What is NOT wired is a REAL final-system
-//! backend: `duckspout-fleet` has no real multi-node run to judge yet
-//! (§8.4's distributed tier lands at v0.2; #203/#204's fault-schedule work
-//! hasn't landed), so there is nothing to query for real in this PR. Passing
-//! `--final-state-fixture` runs the real predicate against a JSON test
-//! double (`duckspout_judge::final_state`'s own module docs) — a DEV/TEST
-//! convenience that exercises the real Pass/Violation/NoVerdict contract
-//! end-to-end; omitting it reports `NoVerdict` honestly, since a judge with
-//! no backend to check against has proven nothing (not "no fault fired",
-//! §8.3's vacuity discipline, but the same posture: an unproven claim of
-//! passing is never reported as passing).
+//! Journal and read-log ingestion (`duckspout_judge::journal`,
+//! `duckspout_judge::read_log`) are real: malformed input fails closed,
+//! exactly as the checking logic relies on. All three predicates
+//! (`zero_acked_lost`, `watermark_honesty`, `latest_view`) are real and
+//! unit-tested. What is NOT wired is a REAL backend behind either read-back
+//! surface (`FinalSystemState`, `LatestView`): `duckspout-fleet` has no real
+//! multi-node run to judge yet (§8.4's distributed tier lands at v0.2;
+//! #204/#208's work is where a real fleet run and a real query client
+//! appear), so there is nothing to query for real. The `--*-fixture` flags
+//! run the real predicates against JSON test doubles
+//! (`duckspout_judge::final_state`'s own module docs) — a DEV/TEST
+//! convenience that exercises the real Pass/Violation/NoVerdict contract end
+//! to end; omitting one reports `NoVerdict` for that predicate honestly,
+//! since a judge with no backend to check against has proven nothing.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
 use clap::Parser;
-use duckspout_judge::predicates::zero_acked_lost::ZeroAckedLostVerdict;
 use duckspout_judge::runner::{RunArgs, RunOutcome, run};
 use duckspout_judge::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION;
+use duckspout_judge::verdict::Verdict;
 
 /// The judge's exit contract (§8.4), stable for every caller:
 /// `0` = Pass, `2` = Violation, `3` = `NoVerdict` (inconclusive or vacuous).
 const EXIT_CONTRACT: &str = "Exit codes: 0 = Pass · 2 = Violation · 3 = NoVerdict\n\
+    Every predicate runs on every invocation; the run passes only if all of them do.\n\
     A vacuous run (armed fault injectors that never fired, §8.3) is NoVerdict, never Pass.";
 
 /// CTK judge (§8.4): grades a fleet run's journals.
@@ -60,6 +60,21 @@ struct Cli {
     #[arg(long)]
     final_state_fixture: Option<PathBuf>,
 
+    /// The query client's served-read log (`duckspout_judge::read_log`): one
+    /// NDJSON object per read issued, with what it was served and at which
+    /// `complete_through`. Omitted: watermark honesty reports `NoVerdict`
+    /// for its query-side half rather than passing a run whose answers
+    /// nobody recorded.
+    #[arg(long)]
+    read_log: Option<PathBuf>,
+
+    /// DEV/TEST ONLY: a `LatestView` fixture JSON
+    /// (`duckspout_judge::final_state`) standing in for a real
+    /// `<dataset>_latest` read-back. Omitted: latest-view reports
+    /// `NoVerdict`.
+    #[arg(long)]
+    latest_view_fixture: Option<PathBuf>,
+
     /// Ceiling on the fraction of a loadgen's resolved requests that came
     /// back `Ambiguous` before its run summary is treated as unreliable
     /// evidence (ACPR finding HIGH-1; reasoning:
@@ -73,6 +88,8 @@ fn main() {
     let outcome = run(&RunArgs {
         journals: cli.journal,
         final_state_fixture: cli.final_state_fixture,
+        read_log: cli.read_log,
+        latest_view_fixture: cli.latest_view_fixture,
         max_ambiguous_fraction: cli.max_ambiguous_fraction,
     });
     report(&outcome);
@@ -85,7 +102,7 @@ fn report(outcome: &RunOutcome) {
     match outcome {
         RunOutcome::IngestionFailed(err) => {
             eprintln!(
-                "duckspout-judge: journal ingestion failed: {err} — NoVerdict \
+                "duckspout-judge: evidence ingestion failed: {err} — NoVerdict \
                  (ambiguity fails closed, §8.4)"
             );
         }
@@ -99,36 +116,36 @@ fn report(outcome: &RunOutcome) {
                 eprintln!("  {finding}");
             }
         }
-        RunOutcome::NoBackend {
+        RunOutcome::Judged {
             journal_count,
             line_count,
+            reports,
         } => {
             eprintln!(
                 "duckspout-judge: {journal_count} journal(s) parsed OK ({line_count} record(s)); \
-                 no final-system backend wired yet (§8.4's real hot/lake read-back lands with the \
-                 distributed tier's fleet wiring, #205's own scope note) — NoVerdict"
+                 {} predicate(s) judged:",
+                reports.len()
             );
-        }
-        RunOutcome::FixtureInvalid(err) => {
-            eprintln!("duckspout-judge: final-state fixture invalid: {err} — NoVerdict");
-        }
-        RunOutcome::Predicate(ZeroAckedLostVerdict::Pass { checked }) => {
-            eprintln!("duckspout-judge: zero-acked-lost PASS ({checked} acked request(s) checked)");
-        }
-        RunOutcome::Predicate(ZeroAckedLostVerdict::Violation(findings)) => {
-            eprintln!(
-                "duckspout-judge: zero-acked-lost VIOLATION ({} finding(s)):",
-                findings.len()
-            );
-            for finding in findings {
-                eprintln!(
-                    "  request {} (tenant {}): missing indices {:?}",
-                    finding.request_id, finding.tenant, finding.missing_indices
-                );
+            for report in reports {
+                match &report.verdict {
+                    Verdict::Pass { checked } => {
+                        eprintln!("  {} PASS ({checked} check(s))", report.predicate);
+                    }
+                    Verdict::Violation(findings) => {
+                        eprintln!(
+                            "  {} VIOLATION ({} finding(s)):",
+                            report.predicate,
+                            findings.len()
+                        );
+                        for finding in findings {
+                            eprintln!("    {finding}");
+                        }
+                    }
+                    Verdict::NoVerdict(reason) => {
+                        eprintln!("  {} NoVerdict: {reason}", report.predicate);
+                    }
+                }
             }
-        }
-        RunOutcome::Predicate(ZeroAckedLostVerdict::NoVerdict(reason)) => {
-            eprintln!("duckspout-judge: zero-acked-lost NoVerdict: {reason}");
         }
     }
 }
