@@ -1031,8 +1031,17 @@ dependencies = [
 name = "duckspout-loadgen"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "clap",
+ "duckspout-accept",
  "duckspout-types",
+ "opentelemetry-proto",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-types",
 ]
 
 [[package]]
