@@ -41,6 +41,24 @@
 //! What it does not do is sample: a subset-checked answer would silently
 //! stop being able to convict the rows it dropped.
 //!
+//! **A [`ReadRecord`] carries no ordering handle, and that costs a real
+//! guarantee (ACPR finding MEDIUM-3).** There is no seq, no position, and no
+//! other field placing a read relative to the journals' per-node dense
+//! sequences (D-6) — a deliberate consequence of this being a sidecar file
+//! rather than a journal (see above: §3 has no read action to ride). §8.4
+//! asks that no `complete` read be served over coverage that did not exist
+//! **at serving time**, and "serving time" is exactly what this shape cannot
+//! express: a read served BEFORE the commit that would justify it is
+//! indistinguishable, in this evidence, from one served after. So
+//! `crate::predicates::watermark_honesty` compares every read against the
+//! RUN-WIDE maximum coverage for its partition — the strongest rule this
+//! shape supports, and strictly weaker than §8.4's sentence. Closing that
+//! gap is a change to this wire format (the query client stamping an
+//! ordering handle the journals can be aligned against), not a change to the
+//! predicate; until then the weakening is disclosed rather than papered
+//! over. Note the asymmetry: ADVERTISEMENTS do ride journal lines and so do
+//! carry D-6's ordering, which that predicate exploits for same-node claims.
+//!
 //! # Wire shape
 //!
 //! ```json

@@ -61,12 +61,40 @@
 //! Both exclusions can only lose convictions, never manufacture them; and a
 //! run in which they exclude EVERYTHING checks nothing, which
 //! [`Verdict::pass`] turns into `NoVerdict` rather than a vacuous pass.
+//!
+//! # A record's identity, and a row's (ACPR finding HIGH-1)
+//!
+//! Two dimensions of `crate::journal::ChangelogEntry` are load-bearing here,
+//! and neither is interchangeable with the other:
+//!
+//! - **`partition` names a record.** `changelog_seq` is dense per
+//!   `(partition, origin)` (`docs/design/ingest.md`,
+//!   `docs/design/replication.md`), so one origin's records in two
+//!   partitions legitimately share a `changelog_seq`. The dedup slot is
+//!   therefore `(dataset, partition, origin, changelog_seq)`; keying it on
+//!   `(dataset, origin, changelog_seq)` would read two unrelated records as
+//!   one record acked twice with different content — a self-inflicted
+//!   `NoVerdict` on any multi-partition changelog run.
+//! - **`tenant` names a row.** `changelog_key` is unique only within a
+//!   tenant (`docs/design/data-model.md`: the partition key is
+//!   `(tenant_id, shard)` and `<dataset>_latest` is `tenant_id`-leading), so
+//!   the fold key is `(dataset, tenant, changelog_key)` and the read-back is
+//!   tenant-scoped too (`crate::final_state::ServedView`). Folding on the
+//!   bare key string would collapse two tenants' rows into one and convict a
+//!   correct fleet.
+//!
+//! `partition` deliberately does NOT join the fold key: for a changelog
+//! dataset `shard = hash(key_cols)` is fixed at declaration
+//! (`docs/design/data-model.md`), so one tenant's key always lands in one
+//! partition — adding it would be redundant on correct input and would split
+//! a single key's history into two independently-folded halves on incorrect
+//! input, hiding exactly the disagreement this predicate exists to find.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use duckspout_types::{DatasetId, NodeId, TraceEvent};
+use duckspout_types::{DatasetId, NodeId, PartitionId, TenantId, TraceEvent};
 
-use crate::final_state::LatestView;
+use crate::final_state::{LatestView, ServedView};
 use crate::journal::{ChangelogEntry, JournalSet};
 use crate::verdict::Verdict;
 
@@ -76,7 +104,10 @@ use crate::verdict::Verdict;
 pub struct LatestViewFinding {
     /// The changelog dataset.
     pub dataset: DatasetId,
-    /// The declared key.
+    /// The tenant whose row this is — part of the row's identity, not
+    /// context (module docs).
+    pub tenant: TenantId,
+    /// The declared key, unique within `tenant`.
     pub key: String,
     /// What folding this key's acked changelog in `(origin, seq)` order
     /// yields: `None` iff the winning entry is a tombstone (the key must be
@@ -90,6 +121,7 @@ impl std::fmt::Display for LatestViewFinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
             dataset,
+            tenant,
             key,
             expected,
             served,
@@ -97,21 +129,24 @@ impl std::fmt::Display for LatestViewFinding {
         match (expected, served) {
             (Some(expected), None) => write!(
                 f,
-                "{dataset} key {key:?}: the acked changelog folds to {expected:?}, but the \
-                 latest view does not serve this key at all"
+                "{dataset} tenant {tenant} key {key:?}: the acked changelog folds to \
+                 {expected:?}, but the latest view does not serve this key at all"
             ),
             (None, Some(served)) => write!(
                 f,
-                "{dataset} key {key:?}: the acked changelog's winning entry is a tombstone, but \
-                 the latest view still serves {served:?} — tombstones delete (§7.7)"
+                "{dataset} tenant {tenant} key {key:?}: the acked changelog's winning entry is a \
+                 tombstone, but the latest view still serves {served:?} — tombstones delete (§7.7)"
             ),
             (Some(expected), Some(served)) => write!(
                 f,
-                "{dataset} key {key:?}: the acked changelog folds to {expected:?}, but the \
-                 latest view serves {served:?}"
+                "{dataset} tenant {tenant} key {key:?}: the acked changelog folds to \
+                 {expected:?}, but the latest view serves {served:?}"
             ),
             // Unreachable: a finding is only recorded on a disagreement.
-            (None, None) => write!(f, "{dataset} key {key:?}: no disagreement (bug)"),
+            (None, None) => write!(
+                f,
+                "{dataset} tenant {tenant} key {key:?}: no disagreement (bug)"
+            ),
         }
     }
 }
@@ -122,6 +157,15 @@ pub type LatestViewVerdict = Verdict<LatestViewFinding>;
 /// The fold order's key: `(origin, seq)`, compared exactly as the sealed
 /// part's own `(key_cols, origin, seq)` sort compares them (module docs).
 type FoldOrder = (NodeId, u64);
+
+/// What names ONE changelog record: `changelog_seq` is dense per
+/// `(partition, origin)`, so the partition is part of the record's identity
+/// and not context (module docs, ACPR finding HIGH-1).
+type RecordSlot = (DatasetId, PartitionId, NodeId, u64);
+
+/// What names ONE row of `<dataset>_latest`: a declared key is unique only
+/// within a tenant (module docs, ACPR finding HIGH-1).
+type RowKey = (DatasetId, TenantId, String);
 
 /// Runs the predicate against `journals`' acked changelog entries and
 /// `view`'s read-back of each dataset's `<dataset>_latest`.
@@ -139,63 +183,35 @@ pub fn check<V: LatestView>(journals: &JournalSet, view: &V) -> LatestViewVerdic
         );
     }
 
-    // A `(dataset, origin, changelog_seq)` triple names ONE record. The
-    // same record legitimately reappears — §4.4.1's dedup replays an
-    // idempotent retry and acks it again with identical content — so an
-    // identical repeat is deduplicated. A repeat that DISAGREES is two
-    // different records claiming one sequence number, which makes the fold
-    // order itself ill-defined; there is no correct answer to compare the
-    // view against, so the run fails closed rather than folding whichever
-    // copy happened to be journaled first.
-    let mut by_record: BTreeMap<(DatasetId, NodeId, u64), &ChangelogEntry> = BTreeMap::new();
-    for entry in acked.iter().copied() {
-        let slot = (
-            entry.dataset.clone(),
-            entry.origin.clone(),
-            entry.changelog_seq,
-        );
-        if let Some(previous) = by_record.insert(slot, entry)
-            && previous != entry
-        {
-            return Verdict::NoVerdict(format!(
-                "changelog record ({}, origin {}, seq {}) was acked twice with DIFFERENT content \
-                 ({:?} vs {:?}) — the (origin, seq) fold order has no answer here, so this run \
-                 cannot be judged (ambiguity fails closed, §8.4)",
-                entry.dataset, entry.origin, entry.changelog_seq, previous, entry
-            ));
-        }
-    }
+    let by_record = match dedup_records(&acked) {
+        Ok(by_record) => by_record,
+        Err(reason) => return Verdict::NoVerdict(reason),
+    };
 
-    // Keys whose outcome is genuinely unknown (module docs): a
+    // Rows whose outcome is genuinely unknown (module docs): a
     // `ClientTimeout`-borne entry is the loadgen's own "don't know" bucket,
-    // so that key cannot be judged in either direction.
-    let unresolved_keys: BTreeSet<(DatasetId, String)> = journals
+    // so that row cannot be judged in either direction. Scoped per tenant
+    // like every other row identity here — one tenant's timed-out write must
+    // not silently un-judge another tenant's row that happens to share the
+    // key string.
+    let unresolved_rows: BTreeSet<RowKey> = journals
         .changelog_events(TraceEvent::ClientTimeout)
-        .map(|(_, entry)| (entry.dataset.clone(), entry.changelog_key.clone()))
+        .map(|(_, entry)| {
+            (
+                entry.dataset.clone(),
+                entry.tenant.clone(),
+                entry.changelog_key.clone(),
+            )
+        })
         .collect();
 
-    // The fold itself: per key, the entry with the greatest `(origin, seq)`
-    // wins; a winning tombstone means the key must be absent (§7.7).
-    let mut winners: BTreeMap<(DatasetId, String), (FoldOrder, Option<String>)> = BTreeMap::new();
-    for entry in by_record.values() {
-        let key = (entry.dataset.clone(), entry.changelog_key.clone());
-        let order: FoldOrder = (entry.origin.clone(), entry.changelog_seq);
-        let value = if entry.tombstone {
-            None
-        } else {
-            entry.value.clone()
-        };
-        match winners.get(&key) {
-            Some((seen, _)) if *seen >= order => {}
-            _ => {
-                winners.insert(key, (order, value));
-            }
-        }
-    }
+    let winners = fold_winners(&by_record);
 
-    let datasets: BTreeSet<DatasetId> =
-        winners.keys().map(|(dataset, _)| dataset.clone()).collect();
-    let mut served_views = BTreeMap::new();
+    let datasets: BTreeSet<DatasetId> = winners
+        .keys()
+        .map(|(dataset, _, _)| dataset.clone())
+        .collect();
+    let mut served_views: BTreeMap<DatasetId, ServedView> = BTreeMap::new();
     for dataset in datasets {
         match view.view(&dataset) {
             Ok(rows) => {
@@ -212,18 +228,20 @@ pub fn check<V: LatestView>(journals: &JournalSet, view: &V) -> LatestViewVerdic
 
     let mut checked = 0usize;
     let mut findings = Vec::new();
-    for ((dataset, key), (_, expected)) in &winners {
-        if unresolved_keys.contains(&(dataset.clone(), key.clone())) {
+    for (row @ (dataset, tenant, key), (_, expected)) in &winners {
+        if unresolved_rows.contains(row) {
             continue;
         }
         checked += 1;
         let served = served_views
             .get(dataset)
+            .and_then(|view| view.get(tenant))
             .and_then(|rows| rows.get(key))
             .cloned();
         if &served != expected {
             findings.push(LatestViewFinding {
                 dataset: dataset.clone(),
+                tenant: tenant.clone(),
                 key: key.clone(),
                 expected: expected.clone(),
                 served,
@@ -234,13 +252,79 @@ pub fn check<V: LatestView>(journals: &JournalSet, view: &V) -> LatestViewVerdic
     if findings.is_empty() {
         Verdict::pass(
             checked,
-            "every acked changelog key was also written by a request that timed out, so no key's \
+            "every acked changelog row was also written by a request that timed out, so no row's \
              correct latest value is knowable from this run's evidence — nothing was checked \
              (§8.4 vacuity teeth)",
         )
     } else {
         Verdict::Violation(findings)
     }
+}
+
+/// Collapses the acked entries onto one entry per RECORD, or the reason the
+/// run cannot be judged at all.
+///
+/// A `(dataset, partition, origin, changelog_seq)` quad names ONE record
+/// (module docs' HIGH-1 note: the sequence is dense per
+/// `(partition, origin)`, so the partition is part of the identity). The same
+/// record legitimately reappears — §4.4.1's dedup replays an idempotent retry
+/// and acks it again with identical content — so an identical repeat is
+/// deduplicated. A repeat that DISAGREES is two different records claiming
+/// one sequence number, which makes the fold order itself ill-defined; there
+/// is no correct answer to compare the view against, so the run fails closed
+/// rather than folding whichever copy happened to be journaled first.
+fn dedup_records<'a>(
+    acked: &[&'a ChangelogEntry],
+) -> Result<BTreeMap<RecordSlot, &'a ChangelogEntry>, String> {
+    let mut by_record: BTreeMap<RecordSlot, &ChangelogEntry> = BTreeMap::new();
+    for entry in acked.iter().copied() {
+        let slot = (
+            entry.dataset.clone(),
+            entry.partition.clone(),
+            entry.origin.clone(),
+            entry.changelog_seq,
+        );
+        if let Some(previous) = by_record.insert(slot, entry)
+            && previous != entry
+        {
+            return Err(format!(
+                "changelog record ({}, partition {}, origin {}, seq {}) was acked twice with \
+                 DIFFERENT content ({:?} vs {:?}) — the (origin, seq) fold order has no answer \
+                 here, so this run cannot be judged (ambiguity fails closed, §8.4)",
+                entry.dataset, entry.partition, entry.origin, entry.changelog_seq, previous, entry
+            ));
+        }
+    }
+    Ok(by_record)
+}
+
+/// The fold itself: per row, the entry with the greatest `(origin, seq)`
+/// wins; a winning tombstone means the key must be absent from the view
+/// (§7.7), which is what the `None` value means here.
+fn fold_winners(
+    by_record: &BTreeMap<RecordSlot, &ChangelogEntry>,
+) -> BTreeMap<RowKey, (FoldOrder, Option<String>)> {
+    let mut winners: BTreeMap<RowKey, (FoldOrder, Option<String>)> = BTreeMap::new();
+    for entry in by_record.values() {
+        let key = (
+            entry.dataset.clone(),
+            entry.tenant.clone(),
+            entry.changelog_key.clone(),
+        );
+        let order: FoldOrder = (entry.origin.clone(), entry.changelog_seq);
+        let value = if entry.tombstone {
+            None
+        } else {
+            entry.value.clone()
+        };
+        match winners.get(&key) {
+            Some((seen, _)) if *seen >= order => {}
+            _ => {
+                winners.insert(key, (order, value));
+            }
+        }
+    }
+    winners
 }
 
 #[cfg(test)]
@@ -251,15 +335,37 @@ mod tests {
     use crate::final_state::{InMemoryLatestView, LatestView, ViewQueryError};
     use crate::journal::JournalLine;
 
+    /// The tenant every single-tenant test uses, and the partition its
+    /// keys hash to (`shard = hash(key_cols)`, `docs/design/data-model.md`).
+    const TENANT: &str = "tenant-a";
+    const PARTITION: &str = "tenant-a.0";
+
     /// The changelog entry a test journals, without the envelope around it.
     #[derive(Clone, Copy)]
     struct Entry<'a> {
         dataset: &'a str,
+        partition: &'a str,
+        tenant: &'a str,
         key: &'a str,
         origin: &'a str,
         changelog_seq: u64,
         /// `None` is a tombstone.
         value: Option<&'a str>,
+    }
+
+    impl<'a> Entry<'a> {
+        /// The common case: dataset `dim`, one tenant, one partition.
+        fn new(key: &'a str, origin: &'a str, changelog_seq: u64, value: Option<&'a str>) -> Self {
+            Self {
+                dataset: "dim",
+                partition: PARTITION,
+                tenant: TENANT,
+                key,
+                origin,
+                changelog_seq,
+                value,
+            }
+        }
     }
 
     /// One journaled changelog entry, on the given event.
@@ -274,6 +380,8 @@ mod tests {
             watermark: None,
             changelog: Some(ChangelogEntry {
                 dataset: DatasetId::new(entry.dataset),
+                partition: PartitionId::new(entry.partition),
+                tenant: TenantId::new(entry.tenant),
                 changelog_key: entry.key.to_owned(),
                 origin: NodeId::new(entry.origin),
                 changelog_seq: entry.changelog_seq,
@@ -295,19 +403,15 @@ mod tests {
             "loadgen-0",
             seq,
             TraceEvent::ClientAck,
-            Entry {
-                dataset: "dim",
-                key,
-                origin,
-                changelog_seq,
-                value,
-            },
+            Entry::new(key, origin, changelog_seq, value),
         )
     }
 
+    /// The single-tenant view `acked` writes into.
     fn view_of(rows: &[(&str, &str)]) -> InMemoryLatestView {
         InMemoryLatestView::new().with_view(
             "dim",
+            TENANT,
             rows.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
         )
     }
@@ -428,25 +532,13 @@ mod tests {
                     "node-b",
                     0,
                     TraceEvent::ClientAck,
-                    Entry {
-                        dataset: "dim",
-                        key: "k1",
-                        origin: "n2",
-                        changelog_seq: 1,
-                        value: Some("b1"),
-                    },
+                    Entry::new("k1", "n2", 1, Some("b1")),
                 ),
                 entry_line(
                     "node-a",
                     0,
                     TraceEvent::ClientAck,
-                    Entry {
-                        dataset: "dim",
-                        key: "k1",
-                        origin: "n1",
-                        changelog_seq: 9,
-                        value: Some("a1"),
-                    },
+                    Entry::new("k1", "n1", 9, Some("a1")),
                 ),
             ],
         };
@@ -517,13 +609,7 @@ mod tests {
             "loadgen-0",
             1,
             TraceEvent::ClientTimeout,
-            Entry {
-                dataset: "dim",
-                key: "k2",
-                origin: "n1",
-                changelog_seq: 2,
-                value: Some("maybe"),
-            },
+            Entry::new("k2", "n1", 2, Some("maybe")),
         );
         let journals = JournalSet {
             lines: vec![acked(0, "k1", "n1", 1, Some("v1")), timeout],
@@ -552,13 +638,7 @@ mod tests {
                     "loadgen-0",
                     1,
                     TraceEvent::ClientTimeout,
-                    Entry {
-                        dataset: "dim",
-                        key: "k1",
-                        origin: "n1",
-                        changelog_seq: 1,
-                        value: Some("v1"),
-                    },
+                    Entry::new("k1", "n1", 1, Some("v1")),
                 ),
             ],
         };
@@ -612,7 +692,7 @@ mod tests {
     struct AlwaysFailingView;
 
     impl LatestView for AlwaysFailingView {
-        fn view(&self, dataset: &DatasetId) -> Result<BTreeMap<String, String>, ViewQueryError> {
+        fn view(&self, dataset: &DatasetId) -> Result<ServedView, ViewQueryError> {
             Err(ViewQueryError {
                 dataset: dataset.clone(),
                 reason: "simulated Flight stream failure".to_owned(),
@@ -642,10 +722,7 @@ mod tests {
                     TraceEvent::ClientAck,
                     Entry {
                         dataset: "other",
-                        key: "k1",
-                        origin: "n1",
-                        changelog_seq: 2,
-                        value: Some("other-v"),
+                        ..Entry::new("k1", "n1", 2, Some("other-v"))
                     },
                 ),
             ],
@@ -657,6 +734,163 @@ mod tests {
                 assert_eq!(findings[0].dataset, DatasetId::new("other"));
             }
             other => panic!("expected exactly the other dataset to be convicted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_partitions_sharing_one_changelog_seq_are_two_records_not_one_conflict() {
+        // ACPR finding HIGH-1(a), as the reviewer's repro: `changelog_seq`
+        // is dense per `(partition, origin)` (`docs/design/ingest.md`,
+        // `docs/design/replication.md`), so ONE origin writing into two
+        // partitions legitimately assigns seq 1 twice. A dedup slot keyed
+        // `(dataset, origin, changelog_seq)` reads that as "one record acked
+        // twice with different content" and permanently disables this
+        // predicate — a spurious `NoVerdict` on any multi-partition
+        // changelog run, which is exactly what "skipped ≠ passed" forbids
+        // being shrugged off.
+        let journals = JournalSet {
+            lines: vec![
+                entry_line(
+                    "loadgen-0",
+                    0,
+                    TraceEvent::ClientAck,
+                    Entry {
+                        partition: "tenant-a.0",
+                        ..Entry::new("k-in-shard-0", "n1", 1, Some("v-shard-0"))
+                    },
+                ),
+                entry_line(
+                    "loadgen-0",
+                    1,
+                    TraceEvent::ClientAck,
+                    Entry {
+                        partition: "tenant-a.1",
+                        ..Entry::new("k-in-shard-1", "n1", 1, Some("v-shard-1"))
+                    },
+                ),
+            ],
+        };
+        assert_eq!(
+            check(
+                &journals,
+                &view_of(&[("k-in-shard-0", "v-shard-0"), ("k-in-shard-1", "v-shard-1")])
+            ),
+            Verdict::Pass { checked: 2 },
+            "two partitions' records must be judged as two records, not collapsed into a conflict"
+        );
+        // …and the conflict rule still fires when it genuinely should: the
+        // SAME partition, origin and seq with different content.
+        let real_conflict = JournalSet {
+            lines: vec![
+                acked(0, "k1", "n1", 1, Some("v1")),
+                acked(1, "k1", "n1", 1, Some("DIFFERENT")),
+            ],
+        };
+        assert!(matches!(
+            check(&real_conflict, &view_of(&[("k1", "v1")])),
+            Verdict::NoVerdict(_)
+        ));
+    }
+
+    #[test]
+    fn two_tenants_sharing_one_changelog_key_are_two_rows_not_one() {
+        // ACPR finding HIGH-1(b), as the reviewer's repro: `changelog_key`
+        // is unique only within a tenant (`docs/design/data-model.md`: the
+        // partition key is `(tenant_id, shard)` and `<dataset>_latest` is
+        // `tenant_id`-leading). A fold keyed on the bare key string folds
+        // tenant-b's row on top of tenant-a's and then convicts a view that
+        // serves both correctly — a false conviction against a correct
+        // fleet.
+        let journals = JournalSet {
+            lines: vec![
+                entry_line(
+                    "loadgen-0",
+                    0,
+                    TraceEvent::ClientAck,
+                    Entry {
+                        tenant: "tenant-a",
+                        partition: "tenant-a.0",
+                        ..Entry::new("shared-key", "n1", 1, Some("a-value"))
+                    },
+                ),
+                entry_line(
+                    "loadgen-0",
+                    1,
+                    TraceEvent::ClientAck,
+                    Entry {
+                        tenant: "tenant-b",
+                        partition: "tenant-b.0",
+                        ..Entry::new("shared-key", "n1", 2, Some("b-value"))
+                    },
+                ),
+            ],
+        };
+        let correct = InMemoryLatestView::new()
+            .with_view(
+                "dim",
+                "tenant-a",
+                [("shared-key".to_owned(), "a-value".to_owned())],
+            )
+            .with_view(
+                "dim",
+                "tenant-b",
+                [("shared-key".to_owned(), "b-value".to_owned())],
+            );
+        assert_eq!(
+            check(&journals, &correct),
+            Verdict::Pass { checked: 2 },
+            "each tenant's row must be folded and compared on its own"
+        );
+        // …and a view that really did serve one tenant's value under the
+        // other's identity is still convicted, exactly once.
+        let crossed = InMemoryLatestView::new()
+            .with_view(
+                "dim",
+                "tenant-a",
+                [("shared-key".to_owned(), "a-value".to_owned())],
+            )
+            .with_view(
+                "dim",
+                "tenant-b",
+                [("shared-key".to_owned(), "a-value".to_owned())],
+            );
+        match check(&journals, &crossed) {
+            Verdict::Violation(findings) => {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].tenant, TenantId::new("tenant-b"));
+                assert_eq!(findings[0].expected.as_deref(), Some("b-value"));
+                assert_eq!(findings[0].served.as_deref(), Some("a-value"));
+            }
+            other => panic!("expected exactly tenant-b's row to be convicted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_tenants_timed_out_write_does_not_un_judge_another_tenants_row() {
+        // The tenant dimension applies to the exclusion set too: tenant-b's
+        // "don't know" bucket says nothing about tenant-a's row, and letting
+        // it exclude that row would silently stop this predicate from
+        // checking a row whose value IS knowable.
+        let journals = JournalSet {
+            lines: vec![
+                acked(0, "shared-key", "n1", 1, Some("a-value")),
+                entry_line(
+                    "loadgen-0",
+                    1,
+                    TraceEvent::ClientTimeout,
+                    Entry {
+                        tenant: "tenant-b",
+                        partition: "tenant-b.0",
+                        ..Entry::new("shared-key", "n1", 2, Some("maybe"))
+                    },
+                ),
+            ],
+        };
+        match check(&journals, &view_of(&[("shared-key", "STALE")])) {
+            Verdict::Violation(findings) => {
+                assert_eq!(findings[0].tenant, TenantId::new(TENANT));
+            }
+            other => panic!("tenant-a's row must still be judged, got {other:?}"),
         }
     }
 }

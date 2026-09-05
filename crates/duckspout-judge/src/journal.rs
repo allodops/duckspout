@@ -56,7 +56,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use duckspout_types::{DatasetId, NodeId, PartitionId, TraceEvent};
+use duckspout_types::{DatasetId, NodeId, PartitionId, TenantId, TraceEvent};
 use serde::Deserialize;
 
 /// The loadgen's payload identity, decoded structurally off a journal
@@ -103,6 +103,25 @@ pub struct RequestIdentity {
     /// whether the whole batch sits at or below a `complete_through`
     /// (`crate::predicates::watermark_honesty`'s coverage rule). `None`
     /// carries the same meaning as `partition`'s `None`: no evidence.
+    ///
+    /// **Producer requirement (ACPR finding LOW-2).** This field is only
+    /// half of the precedence rule: the OTHER half is the
+    /// [`WatermarkClaim`] a producer flattens onto the same ack line, and
+    /// which value it reads there is not a free choice. It must be the
+    /// OWNER'S OWN AUTHORITATIVE LEDGER VALUE for that partition —
+    /// `duckspout.watermarks`, which `docs/design/query.md` calls
+    /// "transactional, authoritative" and which only `LakeCommit` writes,
+    /// i.e. `duckspout-watermark`'s `WatermarkLedger` state the accepting
+    /// owner holds — and NEVER a cached or registry-sourced copy of it. The
+    /// registry's watermark row is explicitly advisory soft state
+    /// (`docs/trace-mapping.md`: `ClaimAdvertise` — "Advisory registry row,
+    /// Keep Rule 8"), so it may legitimately lag the real watermark; a
+    /// producer that disclosed a LAGGING value here would make a genuine
+    /// post-watermark straggler (already below the real watermark when it
+    /// was acked, and therefore outside every `complete` read's contract per
+    /// `docs/design/drain.md` §3) look like a record acked ahead of the
+    /// watermark — and `watermark_honesty` would falsely convict a correct
+    /// fleet for omitting it.
     #[serde(default)]
     pub max_event_time_ms: Option<i64>,
 }
@@ -136,17 +155,47 @@ pub struct WatermarkClaim {
 /// `seq` field (the journaling node's own dense trace sequence, D-6), which
 /// is a DIFFERENT number from the origin-assigned record sequence, and
 /// flattening two `seq` fields onto one line would collapse them.
+///
+/// # Why `partition` and `tenant` are both here (ACPR finding HIGH-1)
+///
+/// Neither is decoration; each fixes one direction of a real
+/// misidentification:
+///
+/// - `changelog_seq` is dense per-**`(partition, origin)`**
+///   (`docs/design/ingest.md`: "`seq` (dense per-(partition, origin)
+///   sequence)"; `docs/design/replication.md`: "stamped with
+///   `(origin_node, partition, seq)`"), NOT per origin. Two records one
+///   origin wrote in two different partitions legitimately carry the SAME
+///   `changelog_seq`, so `(dataset, origin, changelog_seq)` does not name a
+///   record — `(dataset, partition, origin, changelog_seq)` does.
+/// - `changelog_key` is unique only WITHIN a tenant: the partition key is
+///   `(tenant_id, shard)` and `<dataset>_latest` is a shared,
+///   `tenant_id`-leading table (`docs/design/data-model.md`), so two
+///   tenants' rows for one key string are two different rows.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ChangelogEntry {
     /// The changelog dataset this record belongs to — the dataset whose
     /// `<dataset>_latest` view (§7.7) the fold is compared against.
     pub dataset: DatasetId,
+    /// The partition this record was placed in — `(tenant_id, shard)`, with
+    /// `shard = hash(key_cols)` for a changelog dataset (mandatory,
+    /// `docs/design/data-model.md`). Required, and spelled exactly as
+    /// [`WatermarkClaim::partition`] is: both decode from the one top-level
+    /// `partition` field of the same flat journal line, so the two payload
+    /// shapes this PR introduces stay one wire convention rather than two.
+    pub partition: PartitionId,
+    /// The tenant this record belongs to (the leading half of `partition`'s
+    /// own `(tenant_id, shard)` key), and the scope in which
+    /// `changelog_key` below is unique.
+    pub tenant: TenantId,
     /// The declared key this record is a version of (§7.7's "latest row per
-    /// declared key").
+    /// declared key"), unique within `tenant` — not globally.
     pub changelog_key: String,
     /// The origin node that assigned `changelog_seq` (§4.2.4).
     pub origin: NodeId,
-    /// The origin-assigned sequence number of this record.
+    /// The origin-assigned sequence number of this record, dense per
+    /// `(partition, origin)` — see this type's own docs for why it is not a
+    /// per-origin identity.
     pub changelog_seq: u64,
     /// True iff this record is a tombstone (`_op = 'delete'`, §7.7):
     /// tombstones delete, so the key is absent from the served view.
@@ -824,17 +873,43 @@ mod tests {
     fn extracts_a_changelog_entry_from_a_client_ack_line() {
         let file = write_journal(
             "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
-             \"dataset\":\"dim_users\",\"changelog_key\":\"u1\",\"origin\":\"n1\",\
+             \"dataset\":\"dim_users\",\"partition\":\"tenant-a.3\",\"tenant\":\"tenant-a\",\
+             \"changelog_key\":\"u1\",\"origin\":\"n1\",\
              \"changelog_seq\":7,\"value\":\"alice\"}\n",
         );
         let lines = parse_journal_file(file.path()).expect("parses");
         let entry = lines[0].changelog.as_ref().expect("entry present");
         assert_eq!(entry.dataset, DatasetId::new("dim_users"));
+        assert_eq!(entry.partition, PartitionId::new("tenant-a.3"));
+        assert_eq!(entry.tenant, TenantId::new("tenant-a"));
         assert_eq!(entry.changelog_key, "u1");
         assert_eq!(entry.origin, NodeId::new("n1"));
         assert_eq!(entry.changelog_seq, 7);
         assert!(!entry.tombstone);
         assert_eq!(entry.value.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_changelog_entry_naming_no_partition_or_no_tenant_fails_closed() {
+        // ACPR finding HIGH-1: `changelog_seq` is dense per
+        // `(partition, origin)` and `changelog_key` is unique only within a
+        // tenant, so an entry missing either field cannot be placed in the
+        // fold at all. Accepting it — by defaulting the missing dimension —
+        // is exactly what collided two partitions' records onto one dedup
+        // slot and two tenants' rows onto one fold key; a half-formed entry
+        // must fail closed like every other half-formed payload here.
+        for line in [
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"tenant\":\"t\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":1,\"value\":\"v\"}\n",
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":1,\"value\":\"v\"}\n",
+        ] {
+            let file = write_journal(line);
+            let err = parse_journal_file(file.path()).expect_err("must fail closed");
+            assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+        }
     }
 
     #[test]
@@ -845,7 +920,8 @@ mod tests {
         // the envelope's line counter.
         let file = write_journal(
             "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
-             \"dataset\":\"d\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
              \"changelog_seq\":42,\"value\":\"v\"}\n",
         );
         let lines = parse_journal_file(file.path()).expect("parses");
@@ -863,7 +939,8 @@ mod tests {
         // reach a predicate.
         let file = write_journal(
             "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
-             \"dataset\":\"d\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
              \"changelog_seq\":1,\"tombstone\":true,\"value\":\"v\"}\n",
         );
         let err = parse_journal_file(file.path()).expect_err("must fail closed");
@@ -874,7 +951,8 @@ mod tests {
     fn a_non_tombstone_with_no_value_fails_closed() {
         let file = write_journal(
             "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
-             \"dataset\":\"d\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
              \"changelog_seq\":1}\n",
         );
         let err = parse_journal_file(file.path()).expect_err("must fail closed");
@@ -885,7 +963,8 @@ mod tests {
     fn a_tombstone_with_no_value_decodes_as_a_delete() {
         let file = write_journal(
             "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
-             \"dataset\":\"d\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
              \"changelog_seq\":1,\"tombstone\":true}\n",
         );
         let lines = parse_journal_file(file.path()).expect("parses");
@@ -932,10 +1011,12 @@ mod tests {
              {\"node\":\"n1\",\"seq\":1,\"event\":\"ClaimAdvertise\",\
              \"partition\":\"p\",\"complete_through_ms\":10}\n\
              {\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
-             \"dataset\":\"d\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
              \"changelog_seq\":1,\"value\":\"v\"}\n\
              {\"node\":\"loadgen-0\",\"seq\":1,\"event\":\"ClientTimeout\",\
-             \"dataset\":\"d\",\"changelog_key\":\"k2\",\"origin\":\"n1\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k2\",\"origin\":\"n1\",\
              \"changelog_seq\":2,\"value\":\"v2\"}\n",
         );
         let set = JournalSet {

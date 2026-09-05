@@ -40,6 +40,34 @@
 //! journaled advance behind it is precisely what this predicate exists to
 //! convict.)
 //!
+//! # "At serving time": what is enforced, and what is not (ACPR MEDIUM-3)
+//!
+//! §8.4's sentence quoted above says coverage must have existed **at serving
+//! time**. The journals are per-node dense sequences with no cross-node
+//! order (D-6), so "at serving time" is only ever decidable from evidence
+//! that carries an ordering handle. This module therefore uses two different
+//! bounds, and states plainly which is which:
+//!
+//! - **Reads are compared against the RUN-WIDE maximum coverage** for their
+//!   partition — strictly weaker than §8.4 asks. A [`ReadRecord`] carries no
+//!   seq, position, or any other ordering handle relative to the journals
+//!   (`crate::read_log`'s own limits section says so), so a read that was
+//!   served BEFORE the commit that would justify it is, by construction of
+//!   the evidence, indistinguishable from one served after. Convicting on
+//!   the run-wide bound is the strongest rule this evidence supports; a
+//!   tighter one would be guesswork, and a weaker one would let any
+//!   optimistic answer through. This is a disclosed gap, not a satisfied
+//!   requirement: closing it needs the read log to carry an ordering handle,
+//!   which is a change to the query client's wire shape, not to this judge.
+//! - **A node's OWN advertisements are compared against that node's OWN
+//!   PREFIX** of coverage, plus every other node's run-wide coverage. Here
+//!   D-6 does supply the ordering handle: within one node's journal, seq
+//!   order IS time order, so a commit the node journaled at a LATER seq
+//!   than its own advertisement provably had not happened yet when the
+//!   advertisement was made and cannot back it. Acquitting such an
+//!   advertisement via the run-wide maximum would discard evidence the
+//!   journals already hold ([`Coverage::bound_for_advertisement`]).
+//!
 //! # The assumption this rests on, stated
 //!
 //! Reading a bound off the journals means trusting that the journals are
@@ -64,12 +92,27 @@
 //! hostage to clock skew. This predicate therefore reads precedence off a
 //! SINGLE line: an ack that discloses both the record's own event-time edge
 //! (`max_event_time_ms`) and the partition watermark in force when the ack
-//! was issued (`complete_through_ms` on the same line — §7.6's freshness
-//! disclosure) proves, by itself, that the record was acked while the
-//! watermark was still behind it. Since the watermark only ever advances
+//! was issued (`complete_through_ms` on the same line) proves, by itself,
+//! that the record was acked while the watermark was still behind it. Since
+//! the watermark only ever advances
 //! (§3: `CommitWm`/`DeclareLoss` are its only writers), any later `complete`
 //! read at or above that record's event time must contain it. No
 //! cross-journal ordering is assumed anywhere.
+//!
+//! **Which watermark value that disclosure must carry (ACPR finding
+//! LOW-2).** It has to be the OWNER'S AUTHORITATIVE LEDGER value for the
+//! partition — `duckspout.watermarks`, which `docs/design/query.md` calls
+//! "transactional, authoritative" and which only `LakeCommit` writes, i.e.
+//! the `duckspout-watermark` `WatermarkLedger` state the accepting owner
+//! holds — and NEVER a cached or registry-sourced copy of it. The registry's
+//! watermark row is advisory soft state by construction
+//! (`docs/trace-mapping.md`: `ClaimAdvertise` — "Advisory registry row, Keep
+//! Rule 8") and may legitimately lag the real watermark; an ack disclosing a
+//! LAGGING value would make a legitimate post-watermark straggler look like
+//! a record acked ahead of the watermark, and this predicate would then
+//! convict a correct fleet for omitting it. The requirement is restated on
+//! the field itself (`crate::journal::RequestIdentity::max_event_time_ms`)
+//! so a future producer cannot wire the wrong source without reading it.
 //!
 //! The converse case is deliberately NOT convicted: an ack whose event time
 //! is at or below the watermark already in force is a **post-watermark
@@ -88,6 +131,19 @@
 //! missing-record rule rather than convicted on ranges the judge cannot
 //! resolve. Its coverage rules still apply — a declared loss excuses missing
 //! rows, never an unproven watermark.
+//!
+//! A `DeclareLoss` line that names NO partition excuses every partition:
+//! `DeclareLossRequest` is multi-partition while a journal line carries at
+//! most one `(partition, complete_through_ms)` pair, so a partitionless line
+//! is a realistic producer shape and "the ceremony happened, this evidence
+//! cannot say where" is the only honest reading of it. But an exclusion is
+//! not a check (ACPR finding MEDIUM-2): a read whose missing-record rule was
+//! switched off does not count toward that rule having run, exactly as
+//! `crate::predicates::latest_view` does not count a row it excluded. A run
+//! in which EVERY served read was excused therefore reports `NoVerdict` —
+//! the rule was disabled fleet-wide and certified nothing — instead of the
+//! `Pass` that a single partitionless line could otherwise buy for the whole
+//! run.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -218,13 +274,114 @@ impl OwedBatch<'_> {
     }
 }
 
+/// One watermark value, with the journal line that carried it — the node
+/// and its own dense seq (D-6) are part of the evidence, not diagnostics:
+/// they are what makes [`Coverage::bound_for_advertisement`]'s same-node
+/// ordering rule decidable (module docs' "at serving time" section).
+struct Claim<'a> {
+    node: &'a NodeId,
+    seq: u64,
+    event: TraceEvent,
+    watermark: &'a WatermarkClaim,
+}
+
+impl Claim<'_> {
+    /// True iff this claim is an ADVERTISEMENT — soft state that must be
+    /// backed by an advance — rather than the advance itself or an aborted
+    /// commit's would-have-been value (module docs' classification).
+    fn is_advertisement(&self) -> bool {
+        !COVERAGE_SOURCES.contains(&self.event) && self.event != TraceEvent::LakeCommitAbort
+    }
+}
+
+/// How much of §8.4's sentence this run actually exercised — three separate
+/// numbers because the sentence has three separately-skippable rules, and
+/// "skipped ≠ passed" applies to each ([`Tally::vacuity`]).
+#[derive(Default)]
+struct Tally {
+    /// Advertisements replayed against journaled coverage.
+    advertisements: usize,
+    /// Served `complete` reads whose coverage claim was checked.
+    reads: usize,
+    /// How many of those reads the missing-record rule actually RAN for — a
+    /// vacuity counter, not a third check count (module docs' declared-loss
+    /// section, ACPR finding MEDIUM-2).
+    missing_rule_reads: usize,
+}
+
+impl Tally {
+    /// The `NoVerdict` this run owes because one of §8.4's rules never ran,
+    /// or `None` if all three did. Called only when no finding was recorded,
+    /// so every "held" below is a real result rather than an absence.
+    fn vacuity(&self) -> Option<WatermarkHonestyVerdict> {
+        let Self {
+            advertisements,
+            reads,
+            missing_rule_reads,
+        } = *self;
+        if advertisements == 0 {
+            // The mirror of the reads guard below (ACPR finding MEDIUM-1).
+            // §8.4's sentence is "claimed vs. served", and with nothing
+            // advertised anywhere the CLAIMED half never ran: coverage
+            // derived from commits was never compared against anything a
+            // node told anyone. Reporting `Pass` off the served half alone
+            // would claim more than was checked, in exactly the way the
+            // reads guard already refuses to.
+            return Some(Verdict::NoVerdict(format!(
+                "{reads} served `complete` read(s) were replayed against the journals, but no \
+                 node advertised a watermark value anywhere in this run's evidence — the \
+                 claimed-vs-committed half of watermark honesty is uncertified (§8.4: skipped ≠ \
+                 passed)"
+            )));
+        }
+        if reads == 0 {
+            // §8.4's sentence has two halves, and only one of them ran. The
+            // claimed-vs-committed half genuinely held for every
+            // advertisement, but nothing was ever SERVED in this run's
+            // evidence, so "no `complete` read was served over coverage that
+            // did not exist" is uncertified. Reporting `Pass` would state
+            // more than was checked; the honest verdict names exactly what
+            // did and did not run (§8.4: skipped ≠ passed).
+            return Some(Verdict::NoVerdict(format!(
+                "{advertisements} advertised watermark value(s) were replayed against the \
+                 journals and every one was backed by journaled coverage, but no `complete` read \
+                 was served in this run's evidence — the query-side half of watermark honesty is \
+                 uncertified"
+            )));
+        }
+        if missing_rule_reads == 0 {
+            // Every served read sat in a partition a §5.8 ceremony had
+            // touched (or the ceremony named no partition at all, which
+            // excuses them all), so the missing-record rule was switched off
+            // for every read this run had. A declared loss legitimately
+            // excuses missing rows — but a run where it excuses ALL of them
+            // proved nothing about them, and must not buy a `Pass` on the
+            // strength of the two rules that did run (ACPR finding
+            // MEDIUM-2).
+            return Some(Verdict::NoVerdict(format!(
+                "{advertisements} advertisement(s) and {reads} served `complete` read(s) held, \
+                 but every one of those reads was in a partition a §5.8 DeclareLoss had touched, \
+                 so the missing-record rule never ran in this run — a declared loss excuses \
+                 missing rows, it does not certify that none were missing (§8.4: skipped ≠ \
+                 passed)"
+            )));
+        }
+        None
+    }
+}
+
 /// Runs the predicate against every watermark value in `journals` and every
 /// read in `reads` (the query client's log, `crate::read_log`).
 #[must_use]
 pub fn check(journals: &JournalSet, reads: &[ReadRecord]) -> WatermarkHonestyVerdict {
-    let claims: Vec<(&NodeId, TraceEvent, &WatermarkClaim)> = journals
+    let claims: Vec<Claim<'_>> = journals
         .watermark_claims()
-        .map(|(line, claim)| (&line.node, line.event, claim))
+        .map(|(line, watermark)| Claim {
+            node: &line.node,
+            seq: line.seq,
+            event: line.event,
+            watermark,
+        })
         .collect();
     if claims.is_empty() {
         return Verdict::NoVerdict(
@@ -234,32 +391,23 @@ pub fn check(journals: &JournalSet, reads: &[ReadRecord]) -> WatermarkHonestyVer
         );
     }
 
-    let coverage_bound = coverage_bounds(&claims);
-    let bound_of = |partition: &PartitionId| -> i64 {
-        coverage_bound
-            .get(partition)
-            .copied()
-            .unwrap_or(INITIAL_WATERMARK_MS)
-    };
+    let coverage = Coverage::of(&claims);
     let loss = LossScope::of(journals);
     let owed = owed_batches(journals);
 
-    let mut advertisements_checked = 0usize;
-    let mut reads_checked = 0usize;
+    let mut tally = Tally::default();
     let mut findings = Vec::new();
 
     // 1. Claimed: every advertisement must be backed by journaled coverage.
-    for (node, event, claim) in &claims {
-        if COVERAGE_SOURCES.contains(event) || *event == TraceEvent::LakeCommitAbort {
-            continue;
-        }
-        advertisements_checked += 1;
-        let bound = bound_of(&claim.partition);
-        if claim.complete_through_ms > bound {
+    for claim in claims.iter().filter(|claim| claim.is_advertisement()) {
+        tally.advertisements += 1;
+        let bound =
+            coverage.bound_for_advertisement(&claim.watermark.partition, claim.node, claim.seq);
+        if claim.watermark.complete_through_ms > bound {
             findings.push(WatermarkFinding::UnbackedAdvertisement {
-                node: (*node).clone(),
-                partition: claim.partition.clone(),
-                advertised_ms: claim.complete_through_ms,
+                node: claim.node.clone(),
+                partition: claim.watermark.partition.clone(),
+                advertised_ms: claim.watermark.complete_through_ms,
                 coverage_bound_ms: bound,
             });
         }
@@ -280,8 +428,8 @@ pub fn check(journals: &JournalSet, reads: &[ReadRecord]) -> WatermarkHonestyVer
             // about honesty — so it is neither a finding nor a check.
             continue;
         };
-        reads_checked += 1;
-        let bound = bound_of(&read.partition);
+        tally.reads += 1;
+        let bound = coverage.run_wide_bound(&read.partition);
         if *complete_through_ms > bound {
             findings.push(WatermarkFinding::UnprovenCoverage {
                 partition: read.partition.clone(),
@@ -290,6 +438,7 @@ pub fn check(journals: &JournalSet, reads: &[ReadRecord]) -> WatermarkHonestyVer
             });
         }
         if !loss.excuses(&read.partition) {
+            tally.missing_rule_reads += 1;
             findings.extend(missing_under_watermark(
                 read,
                 *complete_through_ms,
@@ -302,28 +451,15 @@ pub fn check(journals: &JournalSet, reads: &[ReadRecord]) -> WatermarkHonestyVer
     if !findings.is_empty() {
         return Verdict::Violation(findings);
     }
-    if reads_checked == 0 {
-        // §8.4's sentence has two halves, and only one of them ran. The
-        // claimed-vs-committed half genuinely held for every advertisement
-        // (a real result — a violation here would have been reported
-        // above), but nothing was ever SERVED in this run's evidence, so
-        // "no `complete` read was served over coverage that did not exist"
-        // is uncertified. Reporting `Pass` would state more than was
-        // checked; the honest verdict names exactly what did and did not
-        // run (§8.4: skipped ≠ passed).
-        return Verdict::NoVerdict(format!(
-            "{advertisements_checked} advertised watermark value(s) were replayed against the \
-             journals and every one was backed by journaled coverage, but no `complete` read was \
-             served in this run's evidence — the query-side half of watermark honesty is \
-             uncertified"
-        ));
+    if let Some(vacuous) = tally.vacuity() {
+        return vacuous;
     }
-    // `reads_checked > 0` here (the guard above), so this is always a real
-    // `Pass`; it still goes through `Verdict::pass` so that "a pass must
-    // have checked something" lives in exactly one place for every
-    // predicate (`crate::verdict`), never re-derived per call site.
+    // Every rule ran (the guard above), so this is always a real `Pass`; it
+    // still goes through `Verdict::pass` so that "a pass must have checked
+    // something" lives in exactly one place for every predicate
+    // (`crate::verdict`), never re-derived per call site.
     Verdict::pass(
-        advertisements_checked + reads_checked,
+        tally.advertisements + tally.reads,
         "nothing was checked — this run certifies nothing about watermark honesty (§8.4 vacuity \
          teeth)",
     )
@@ -333,22 +469,97 @@ pub fn check(journals: &JournalSet, reads: &[ReadRecord]) -> WatermarkHonestyVer
 /// docs).
 const INITIAL_WATERMARK_MS: i64 = 0;
 
-/// What the journals prove coverage actually reached, per partition — the
-/// greatest value any [`COVERAGE_SOURCES`] event carried (module docs).
-/// Partitions absent from the result sit at [`INITIAL_WATERMARK_MS`].
-fn coverage_bounds(
-    claims: &[(&NodeId, TraceEvent, &WatermarkClaim)],
-) -> BTreeMap<PartitionId, i64> {
-    let mut bounds: BTreeMap<PartitionId, i64> = BTreeMap::new();
-    for (_, event, claim) in claims {
-        if COVERAGE_SOURCES.contains(event) {
-            let bound = bounds
-                .entry(claim.partition.clone())
-                .or_insert(INITIAL_WATERMARK_MS);
-            *bound = (*bound).max(claim.complete_through_ms);
+/// What the journals prove coverage actually reached, indexed so BOTH bounds
+/// this predicate uses can be read off one structure (module docs' "at
+/// serving time" section): partition → node → that node's own
+/// [`COVERAGE_SOURCES`] lines, seq-ascending, each paired with the running
+/// maximum over that node's lines up to and including it.
+///
+/// The running maximum is what makes a prefix query a single lookup rather
+/// than a rescan, and it is monotone by construction, so
+/// [`slice::partition_point`] over the seqs lands directly on the answer.
+struct Coverage(BTreeMap<PartitionId, BTreeMap<NodeId, Vec<(u64, i64)>>>);
+
+impl Coverage {
+    fn of(claims: &[Claim<'_>]) -> Self {
+        let mut per_node: BTreeMap<PartitionId, BTreeMap<NodeId, Vec<(u64, i64)>>> =
+            BTreeMap::new();
+        for claim in claims
+            .iter()
+            .filter(|claim| COVERAGE_SOURCES.contains(&claim.event))
+        {
+            per_node
+                .entry(claim.watermark.partition.clone())
+                .or_default()
+                .entry(claim.node.clone())
+                .or_default()
+                .push((claim.seq, claim.watermark.complete_through_ms));
         }
+        // Ingestion order already puts each node's lines in seq order (D-6's
+        // density, enforced by `crate::journal`), but this structure's whole
+        // point is that seq order is load-bearing — so it is established
+        // here rather than assumed of the caller, and the running maximum is
+        // computed after sorting.
+        for by_node in per_node.values_mut() {
+            for lines in by_node.values_mut() {
+                lines.sort_unstable_by_key(|(seq, _)| *seq);
+                let mut running = INITIAL_WATERMARK_MS;
+                for (_, ms) in lines.iter_mut() {
+                    running = running.max(*ms);
+                    *ms = running;
+                }
+            }
+        }
+        Self(per_node)
     }
-    bounds
+
+    /// The greatest coverage ANY node established for `partition` anywhere
+    /// in the run — the bound a served READ is judged against, and the
+    /// deliberately weaker-than-§8.4 one (module docs: a [`ReadRecord`]
+    /// carries no ordering handle, so "at serving time" is not decidable for
+    /// reads from this evidence).
+    fn run_wide_bound(&self, partition: &PartitionId) -> i64 {
+        self.0
+            .get(partition)
+            .map_or(INITIAL_WATERMARK_MS, |by_node| {
+                by_node
+                    .values()
+                    .filter_map(|lines| lines.last().map(|(_, ms)| *ms))
+                    .max()
+                    .unwrap_or(INITIAL_WATERMARK_MS)
+            })
+    }
+
+    /// The bound `node`'s own advertisement at its journal seq `seq` is
+    /// judged against: everything every OTHER node ever committed for
+    /// `partition` (no cross-node order exists, so the run-wide value is the
+    /// only honest one there), but only what THIS node had committed
+    /// strictly BEFORE the line that made the claim.
+    ///
+    /// That asymmetry is the recovered evidence of ACPR finding MEDIUM-3(b):
+    /// within one node's journal, seq order is time order (D-6), so a commit
+    /// the node itself journaled at a later seq than its own advertisement
+    /// had not happened when the advertisement was made and cannot back it.
+    fn bound_for_advertisement(&self, partition: &PartitionId, node: &NodeId, seq: u64) -> i64 {
+        let Some(by_node) = self.0.get(partition) else {
+            return INITIAL_WATERMARK_MS;
+        };
+        let others = by_node
+            .iter()
+            .filter(|(other, _)| *other != node)
+            .filter_map(|(_, lines)| lines.last().map(|(_, ms)| *ms))
+            .max()
+            .unwrap_or(INITIAL_WATERMARK_MS);
+        let own_prefix = by_node.get(node).map_or(INITIAL_WATERMARK_MS, |lines| {
+            let before = lines.partition_point(|(line_seq, _)| *line_seq < seq);
+            if before == 0 {
+                INITIAL_WATERMARK_MS
+            } else {
+                lines[before - 1].1
+            }
+        });
+        others.max(own_prefix)
+    }
 }
 
 /// Where a §5.8 ceremony may legitimately excuse missing rows (module docs'
@@ -418,10 +629,21 @@ fn missing_under_watermark(
 
 /// Every acked batch whose records a later `complete` read provably owes
 /// (module docs' precedence rule): the ack must name its partition and its
-/// event-time edge, must disclose the watermark in force for that same
-/// partition when it was issued, and that watermark must still be BELOW the
-/// batch's event-time edge (otherwise the batch is a post-watermark
-/// straggler, outside every `complete` read's contract).
+/// event-time edge, must disclose the watermark in force when it was issued,
+/// and that watermark must still be BELOW the batch's event-time edge
+/// (otherwise the batch is a post-watermark straggler, outside every
+/// `complete` read's contract).
+///
+/// There is deliberately no check that the disclosed watermark is ABOUT the
+/// batch's partition (ACPR finding LOW-1): `RequestIdentity::partition` and
+/// `WatermarkClaim::partition` are decoded from the ONE top-level
+/// `partition` field of the same flat journal line (`crate::journal`
+/// structurally decodes both payloads out of a single line's `rest`), so on
+/// real input they are the same value and cannot disagree. A comparison here
+/// would be unreachable code that also implies a wire capability — an ack
+/// disclosing some OTHER partition's watermark — the format does not have;
+/// if such a disclosure is ever wanted, it needs its own field, and then a
+/// real check, not a silent no-op standing in for one.
 fn owed_batches(journals: &JournalSet) -> Vec<OwedBatch<'_>> {
     journals
         .identity_events(TraceEvent::ClientAck)
@@ -429,8 +651,7 @@ fn owed_batches(journals: &JournalSet) -> Vec<OwedBatch<'_>> {
             let partition = identity.partition.clone()?;
             let max_event_time_ms = identity.max_event_time_ms?;
             let disclosed = line.watermark.as_ref()?;
-            if disclosed.partition != partition
-                || disclosed.complete_through_ms >= max_event_time_ms
+            if disclosed.complete_through_ms >= max_event_time_ms
                 || identity.record_count == 0
                 || identity.tenant.starts_with(SYSTEM_TENANT_PREFIX)
             {
@@ -741,15 +962,19 @@ mod tests {
     fn an_ack_that_disclosed_no_watermark_establishes_no_precedence() {
         // Without the ack-time watermark there is no single-line proof that
         // the record was acked before coverage reached it, and this judge
-        // assumes no cross-journal ordering — so it must not convict.
+        // assumes no cross-journal ordering — so it must not convict. The
+        // separate `ClaimAdvertise` keeps the claimed-vs-committed half of
+        // the run non-vacuous, so what this test asserts is exactly the
+        // absence of a conviction and not the advertisement guard.
         let journals = JournalSet {
             lines: vec![
                 claim_line("n1", 0, TraceEvent::LakeCommitOk, "p", 2000),
+                claim_line("n1", 1, TraceEvent::ClaimAdvertise, "p", 2000),
                 ack_line(0, "t", "p", 0, 1, Some(1500), None),
             ],
         };
         let reads = vec![served("p", 2000, &[])];
-        assert_eq!(check(&journals, &reads), Verdict::Pass { checked: 1 });
+        assert_eq!(check(&journals, &reads), Verdict::Pass { checked: 2 });
     }
 
     #[test]
@@ -793,46 +1018,97 @@ mod tests {
     fn a_declared_loss_excuses_missing_rows_but_not_unproven_coverage() {
         // §5.8/§7.6: after the ceremony a `complete` read over the annulled
         // range legitimately omits rows — but the ceremony is not a licence
-        // to serve coverage no commit established.
+        // to serve coverage no commit established. `q` is an untouched
+        // partition whose own read exercises the missing-record rule for
+        // real, so the excusal on `p` is what this test isolates rather than
+        // the fleet-wide vacuity guard below.
         let journals = JournalSet {
             lines: vec![
                 claim_line("n1", 0, TraceEvent::LakeCommitOk, "p", 2000),
-                claim_line("n1", 1, TraceEvent::DeclareLoss, "p", 2000),
+                claim_line("n1", 1, TraceEvent::LakeCommitOk, "q", 2000),
+                claim_line("n1", 2, TraceEvent::DeclareLoss, "p", 2000),
                 ack_line(0, "t", "p", 0, 1, Some(1500), Some(1000)),
+                ack_line(1, "t", "q", 10, 1, Some(1500), Some(1000)),
             ],
         };
+        // `p`'s owed record is missing and excused; `q`'s is present.
         assert_eq!(
-            check(&journals, &[served("p", 2000, &[])]),
-            Verdict::Pass { checked: 2 }
+            check(
+                &journals,
+                &[
+                    served("p", 2000, &[]),
+                    served("q", 2000, &["loadgen-0-1000-10"]),
+                ]
+            ),
+            Verdict::Pass { checked: 4 }
         );
+        // …and `q`'s is convicted when it is missing, proving the excusal is
+        // scoped to `p` and not global.
+        assert!(matches!(
+            check(&journals, &[served("p", 2000, &[]), served("q", 2000, &[])]),
+            Verdict::Violation(_)
+        ));
         assert!(matches!(
             check(&journals, &[served("p", 9000, &[])]),
             Verdict::Violation(_)
         ));
     }
 
+    /// A `DeclareLoss` line that names no partition at all — the realistic
+    /// producer shape, since `DeclareLossRequest` is multi-partition while a
+    /// journal line carries at most one `(partition, complete_through_ms)`
+    /// pair.
+    fn partitionless_declare_loss(node: &str, seq: u64) -> JournalLine {
+        JournalLine {
+            source: PathBuf::from("test"),
+            line_no: usize::try_from(seq).expect("test seq fits in usize") + 1,
+            node: NodeId::new(node),
+            seq,
+            event: TraceEvent::DeclareLoss,
+            identity: None,
+            watermark: None,
+            changelog: None,
+        }
+    }
+
     #[test]
-    fn a_declared_loss_naming_no_partition_excuses_missing_rows_everywhere() {
+    fn a_declared_loss_naming_no_partition_excuses_every_read_and_is_no_verdict_not_pass() {
+        // ACPR finding MEDIUM-2, the reviewer's exact repro: one
+        // `LakeCommitOk`, one payloadless `DeclareLoss`, one ack owed under
+        // the watermark, one `complete` read missing it.
+        //
+        // Two facts, and the verdict has to carry both. (1) The exclusion is
+        // still right: with the ceremony's scope unknowable, `p`'s missing
+        // row is NOT convicted — reaching the vacuity guard at all proves
+        // no finding was recorded. (2) But `LossScope::unknown` switches
+        // `MissingUnderWatermark` off for EVERY partition in the run, so the
+        // rule was never exercised, and a run that certifies nothing about
+        // missing records must not report `Pass`. Would catch the excluded
+        // read still counting toward the check that the rule ran and buying
+        // the whole run a clean exit 0 — the "silently switched off
+        // fleet-wide" shape.
         let journals = JournalSet {
             lines: vec![
                 claim_line("n1", 0, TraceEvent::LakeCommitOk, "p", 2000),
-                JournalLine {
-                    source: PathBuf::from("test"),
-                    line_no: 2,
-                    node: NodeId::new("n1"),
-                    seq: 1,
-                    event: TraceEvent::DeclareLoss,
-                    identity: None,
-                    watermark: None,
-                    changelog: None,
-                },
+                partitionless_declare_loss("n1", 1),
                 ack_line(0, "t", "p", 0, 1, Some(1500), Some(1000)),
             ],
         };
-        assert_eq!(
-            check(&journals, &[served("p", 2000, &[])]),
-            Verdict::Pass { checked: 2 }
-        );
+        match check(&journals, &[served("p", 2000, &[])]) {
+            Verdict::NoVerdict(reason) => assert!(
+                reason.contains("missing-record rule never ran"),
+                "reason: {reason}"
+            ),
+            other => panic!(
+                "a run whose missing-record rule was disabled fleet-wide must not Pass: {other:?}"
+            ),
+        }
+        // The unproven-coverage rule is untouched by the ceremony, exactly as
+        // it is for a partition-scoped loss.
+        assert!(matches!(
+            check(&journals, &[served("p", 9000, &[])]),
+            Verdict::Violation(_)
+        ));
     }
 
     #[test]
@@ -898,5 +1174,112 @@ mod tests {
             check(&JournalSet::default(), &[]),
             Verdict::NoVerdict(_)
         ));
+    }
+
+    #[test]
+    fn a_run_with_served_reads_but_no_advertisement_at_all_is_no_verdict_not_pass() {
+        // ACPR finding MEDIUM-1: the mirror of the reads guard. Coverage was
+        // established by a commit and a `complete` read was served under it
+        // — but no node ever advertised a watermark to anyone, so the
+        // claimed-vs-committed half of §8.4's sentence never ran. Would
+        // catch the asymmetric guard that reported a clean `Pass` off the
+        // served half alone.
+        let journals = JournalSet {
+            lines: vec![claim_line("n1", 0, TraceEvent::LakeCommitOk, "p", 2000)],
+        };
+        match check(&journals, &[served("p", 2000, &[])]) {
+            Verdict::NoVerdict(reason) => {
+                assert!(reason.contains("no node advertised"), "reason: {reason}");
+            }
+            other => panic!(
+                "a run where nothing was ever advertised certifies only half of §8.4: {other:?}"
+            ),
+        }
+        // The symmetric case still behaves as before: an advertisement with
+        // no served read is the other half's `NoVerdict`.
+        let advertised_only = JournalSet {
+            lines: vec![
+                claim_line("n1", 0, TraceEvent::LakeCommitOk, "p", 2000),
+                claim_line("n1", 1, TraceEvent::ClaimAdvertise, "p", 2000),
+            ],
+        };
+        match check(&advertised_only, &[]) {
+            Verdict::NoVerdict(reason) => assert!(
+                reason.contains("no `complete` read was served"),
+                "reason: {reason}"
+            ),
+            other => panic!("expected the reads-side NoVerdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_same_node_advertisement_preceding_its_own_backing_commit_is_convicted() {
+        // ACPR finding MEDIUM-3(b), the reviewer's exact repro: n1 advertises
+        // p complete through 5000 at its OWN seq 0, and only journals the
+        // commit that would establish that coverage at its own seq 1. Within
+        // one node's journal seq order IS time order (D-6), so the commit
+        // provably had not happened when the claim was made — "at serving
+        // time" is decidable here, and acquitting the claim against the
+        // run-wide maximum would throw away evidence the journals already
+        // hold. Would catch exactly that: a bound taken as
+        // `max(coverage over the entire run)` reports `Pass` on this input.
+        let journals = JournalSet {
+            lines: vec![
+                claim_line("n1", 0, TraceEvent::ClaimAdvertise, "p", 5000),
+                claim_line("n1", 1, TraceEvent::LakeCommitOk, "p", 5000),
+            ],
+        };
+        match check(&journals, &[]) {
+            Verdict::Violation(findings) => assert_eq!(
+                findings,
+                vec![WatermarkFinding::UnbackedAdvertisement {
+                    node: NodeId::new("n1"),
+                    partition: PartitionId::new("p"),
+                    advertised_ms: 5000,
+                    // Nothing this node had committed BEFORE seq 0, and no
+                    // other node committed anything at all.
+                    coverage_bound_ms: 0,
+                }]
+            ),
+            other => panic!(
+                "an advertisement its own journal puts before its backing commit must be \
+                 convicted, got {other:?}"
+            ),
+        }
+        // The non-regression half: the same two lines in the honest order
+        // (commit first) are a clean advertisement.
+        let honest = JournalSet {
+            lines: vec![
+                claim_line("n1", 0, TraceEvent::LakeCommitOk, "p", 5000),
+                claim_line("n1", 1, TraceEvent::ClaimAdvertise, "p", 5000),
+            ],
+        };
+        assert_eq!(
+            check(&honest, &[served("p", 5000, &[])]),
+            Verdict::Pass { checked: 2 }
+        );
+    }
+
+    #[test]
+    fn another_nodes_commit_backs_an_advertisement_whatever_the_seq_order() {
+        // The limit of the MEDIUM-3(b) tightening, stated as a test: seqs
+        // are dense PER NODE and carry no cross-node order (D-6), so n2's
+        // commit at its own seq 1 says nothing about whether it preceded
+        // n1's advertisement at n1's seq 0. Convicting here would accuse a
+        // correct fleet on an ordering the evidence does not contain — the
+        // run-wide bound is the only honest one across nodes. Would catch
+        // the prefix rule being applied to every node's coverage instead of
+        // only the claiming node's own.
+        let journals = JournalSet {
+            lines: vec![
+                claim_line("n1", 0, TraceEvent::ClaimAdvertise, "p", 5000),
+                claim_line("n2", 0, TraceEvent::LakeCommitOk, "other", 0),
+                claim_line("n2", 1, TraceEvent::LakeCommitOk, "p", 5000),
+            ],
+        };
+        assert_eq!(
+            check(&journals, &[served("p", 5000, &[])]),
+            Verdict::Pass { checked: 2 }
+        );
     }
 }

@@ -30,9 +30,15 @@ const ACK_LINE: &str = "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\
 const COMMIT_LINE: &str = "{\"node\":\"n1\",\"seq\":0,\"event\":\"LakeCommitOk\",\
      \"partition\":\"t0-s0\",\"complete_through_ms\":2000}\n";
 
-/// A second loadgen ack, this one carrying a changelog entry.
+/// A second loadgen ack, this one carrying a changelog entry — with the
+/// partition that makes `(partition, origin, changelog_seq)` a record
+/// identity and the tenant that makes `changelog_key` a row identity (ACPR
+/// finding HIGH-1). Its partition is the changelog dataset's own
+/// `shard = hash(key_cols)` placement, deliberately NOT `t0-s0` (the event
+/// dataset's partition the other lines use).
 const CHANGELOG_ACK_LINE: &str = "{\"node\":\"loadgen-0\",\"seq\":1,\"event\":\"ClientAck\",\
-     \"dataset\":\"dim_users\",\"changelog_key\":\"u1\",\"origin\":\"n1\",\
+     \"dataset\":\"dim_users\",\"partition\":\"tenant-a.4\",\"tenant\":\"tenant-a\",\
+     \"changelog_key\":\"u1\",\"origin\":\"n1\",\
      \"changelog_seq\":7,\"value\":\"alice\"}\n";
 
 /// Every record key `ACK_LINE` covers.
@@ -41,8 +47,10 @@ const ACKED_KEYS: &str = "[\"loadgen-0-1000-0\",\"loadgen-0-1000-1\",\"loadgen-0
 /// The final-state fixture in which all three acked records are present.
 const FINAL_STATE_ALL_PRESENT: &str = r#"{"present":[{"tenant":"tenant-a","source_incarnation":"loadgen-0-1000","first_index":0,"count":3}]}"#;
 
-/// The latest-view fixture matching `CHANGELOG_ACK_LINE`'s fold.
-const LATEST_VIEW_CORRECT: &str = r#"{"views":{"dim_users":{"u1":"alice"}}}"#;
+/// The latest-view fixture matching `CHANGELOG_ACK_LINE`'s fold, keyed by
+/// tenant then key exactly as `<dataset>_latest` is (`tenant_id`-leading,
+/// `docs/design/data-model.md`).
+const LATEST_VIEW_CORRECT: &str = r#"{"views":{"dim_users":{"tenant-a":{"u1":"alice"}}}}"#;
 
 fn write_file(path: &Path, text: &str) {
     let mut file = std::fs::File::create(path).expect("create fixture file");
@@ -271,7 +279,7 @@ fn a_stale_latest_view_exits_violation() {
         None,
         Some(evidence.with_file(
             "latest_view.json",
-            r#"{"views":{"dim_users":{"u1":"STALE"}}}"#,
+            r#"{"views":{"dim_users":{"tenant-a":{"u1":"STALE"}}}}"#,
         )),
     ));
     match verdict_of(&outcome, "latest-view") {
