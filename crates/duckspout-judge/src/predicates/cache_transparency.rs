@@ -252,6 +252,28 @@ pub enum CacheTransparencyFinding {
     },
 }
 
+/// Renders a set of diverging record keys for a finding message. Capped:
+/// a `complete` answer can carry millions of rows (`crate::read_log`'s own
+/// honesty about that), and a finding is a diagnostic line, not a data dump —
+/// the count beside it is always exact.
+fn render_keys(keys: &[String]) -> String {
+    const MAX_LISTED: usize = 8;
+    if keys.is_empty() {
+        return "none".to_owned();
+    }
+    let listed = keys
+        .iter()
+        .take(MAX_LISTED)
+        .map(|key| format!("{key:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if keys.len() > MAX_LISTED {
+        format!("{listed}, … ({} more)", keys.len() - MAX_LISTED)
+    } else {
+        listed
+    }
+}
+
 impl std::fmt::Display for CacheTransparencyFinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -266,13 +288,19 @@ impl std::fmt::Display for CacheTransparencyFinding {
                 only_in_other,
             } => write!(
                 f,
+                // The diverging record keys themselves, not only how many:
+                // an operator's first question about a transparency breach is
+                // WHICH row appeared or vanished with the cache state, and a
+                // count sends them back to the raw read log to find out.
                 "tenant {tenant} partition {partition} query {query:?} at complete_through \
                  {complete_through_ms}: the answer served at cache state {reference_ops} and the \
                  one served at cache state {other_ops} are NOT the same row set ({} record(s) \
-                 only in the first, {} only in the second) — a `complete` answer must be a \
-                 function of staging ∪ lake alone (§2.4)",
+                 only in the first: {}; {} only in the second: {}) — a `complete` answer must be \
+                 a function of staging ∪ lake alone (§2.4)",
                 only_in_reference.len(),
-                only_in_other.len()
+                render_keys(only_in_reference),
+                only_in_other.len(),
+                render_keys(only_in_other)
             ),
             CacheTransparencyFinding::BlockedRead {
                 serving_node,

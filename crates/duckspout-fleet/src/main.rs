@@ -4,8 +4,9 @@
 //! `MinIO`/Postgres wiring**, and a **boot/drive-load smoke loop**; issues
 //! #203, #204 and #207 added **fault injection** on top of it ([`fault`] for the
 //! injectors, [`link`] for the real network faults' mechanism,
-//! [`faultlog`] for the `faults.ndjson` window journal). Still absent: the
-//! judge (#205–#208) and the real `duckspout-loadgen` internals (#202).
+//! [`faultlog`] for the `faults.ndjson` window journal), and #208 added the
+//! run manifest ([`runlog`], `run.json`) the judge's §8.4 run-level vacuity
+//! rules need. Still absent: the real `duckspout-loadgen` internals (#202).
 //! Those follow-ons plug into the seams this binary establishes:
 //! [`topology`] provisions real
 //! `duckspout-daemon` processes with distinct identities against a shared
@@ -18,8 +19,11 @@
 //! This binary reports its own smoke-loop status (booted / load accepted /
 //! watermarks advanced) — it is explicitly NOT the §8.4 judge: it makes no
 //! Pass/Violation/NoVerdict claim, and its exit codes are its own (module
-//! docs of [`run`]), never to be confused with `duckspout-judge`'s future
-//! ones.
+//! docs of [`run`]), never to be confused with `duckspout-judge`'s. The two
+//! files it writes FOR the judge ([`faultlog`]'s `faults.ndjson` and
+//! [`runlog`]'s `run.json`) are witness statements under exactly that
+//! separation: observations with no verdict in them, whose thresholds and
+//! exemptions all live on the judge's side ([`runlog`]'s module docs).
 //!
 //! Design home: `docs/verification.md` §8.4 (until absorption, `DUCKSPOUT.md`
 //! §8.4).
@@ -33,6 +37,7 @@ mod faultlog;
 mod link;
 mod load;
 mod process;
+mod runlog;
 mod topology;
 
 use std::path::PathBuf;
@@ -241,6 +246,13 @@ struct Cli {
     /// Grace period for each node's SIGTERM shutdown before a hard kill.
     #[arg(long, default_value_t = 10)]
     shutdown_grace_secs: u64,
+
+    /// How often, in milliseconds, to re-read each node's journal length for
+    /// the run manifest's per-node progress series (§8.4, issue #208;
+    /// `runlog`'s module docs). Finer than any judge-side silence budget by
+    /// design — this is the resolution of the observation, never a threshold.
+    #[arg(long, default_value_t = runlog::DEFAULT_SAMPLE_INTERVAL_MS)]
+    journal_sample_interval_ms: u64,
 
     // --- Fault injection (§8.4, issue #203) ---
     /// Node index (0-based) to `SIGKILL` as a real fault. Absent by
@@ -529,6 +541,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<i32> {
+    let started_at_ms = faultlog::now_unix_ms();
     let daemon_bin = resolve_daemon_bin(cli.daemon_bin.as_deref())?;
     tracing::info!(daemon_bin = %daemon_bin.display(), "resolved duckspout-daemon binary");
 
@@ -591,6 +604,9 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         spawn_loadgen_best_effort(loadgen_bin, &nodes[0]).await;
     }
 
+    let progress = std::sync::Arc::new(runlog::JournalProgress::new());
+    let sampler = spawn_journal_sampler(&progress, &nodes, &cli);
+
     // §8.4/issues #203, #204 and #207: whichever `--fault-*` faults were armed run
     // CONCURRENTLY with the drive-load/settle passes below — a fault fired
     // only after the smoke loop already finished would prove nothing about
@@ -616,6 +632,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Ok(joined) => joined,
         Err(error) => {
             tracing::error!(%error, "fault injection failed");
+            sampler.abort();
             shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
             report_work_dir(&work_dir);
             return Err(error);
@@ -625,17 +642,13 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     // shut down with the rest, not leaked past the end of the run.
     running.extend(joined);
     let all_accepted = all_batches_accepted(&cli, &load_results);
-    for (node, result) in booted_nodes.iter().zip(&load_results) {
-        tracing::info!(
-            node = %node.name,
-            attempted = result.batches_attempted,
-            accepted = result.batches_accepted,
-            records = result.records_accepted,
-            "drive-load pass complete"
-        );
-    }
+    log_load_results(booted_nodes, &load_results);
+
+    sampler.abort();
+    let manifest = capture_run_manifest(&mut running, &progress, &nodes, started_at_ms, &cli);
 
     shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
+    write_run_manifest(&work_dir, &manifest);
 
     print_summary(booted_nodes, &load_results, drain_confirmed, &work_dir);
     report_work_dir(&work_dir);
@@ -652,6 +665,86 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         return Ok(EXIT_DRAIN_UNCONFIRMED);
     }
     Ok(EXIT_OK)
+}
+
+/// Starts the run manifest's per-node journal-progress sampler (§8.4/#208,
+/// [`runlog`]), returning the task the caller aborts at teardown.
+///
+/// Samples EVERY provisioned node rather than only the booted ones: a
+/// `--fault-churn-join` member starts mid-run and must get a real
+/// first-progress stamp when it does. Whether it ends up on the manifest's
+/// roster at all is decided later, from `running`.
+fn spawn_journal_sampler(
+    progress: &std::sync::Arc<runlog::JournalProgress>,
+    nodes: &[NodeSpec],
+    cli: &Cli,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(runlog::sample_forever(
+        std::sync::Arc::clone(progress),
+        nodes.to_vec(),
+        Duration::from_millis(cli.journal_sample_interval_ms),
+    ))
+}
+
+/// Logs each node's drive-load pass. Extracted from [`run`] only because
+/// #208's manifest wiring pushed that function past the `too_many_lines`
+/// lint; the behaviour is unchanged.
+fn log_load_results(nodes: &[NodeSpec], load_results: &[load::LoadResult]) {
+    for (node, result) in nodes.iter().zip(load_results) {
+        tracing::info!(
+            node = %node.name,
+            attempted = result.batches_attempted,
+            accepted = result.batches_accepted,
+            records = result.records_accepted,
+            "drive-load pass complete"
+        );
+    }
+}
+
+/// Takes the run manifest's final observations (§8.4/#208, [`runlog`]).
+///
+/// Called at the exact moment the run's load/fault phase ends and BEFORE
+/// teardown, which is load-bearing for both of the things it measures: after
+/// our own SIGTERM every node has exited, so `exited_early` would be
+/// meaningless, and every node legitimately goes quiet while it
+/// shallow-drains, so a journal-length sample taken later would make the
+/// whole fleet look silent.
+///
+/// `nodes` is every PROVISIONED node (the sampler watched them all, including
+/// a `--fault-churn-join` member that may never have started); the roster
+/// written to the manifest is `running`, i.e. exactly the ones the runner
+/// actually started ([`runlog::RunManifest::nodes`]'s own contract).
+fn capture_run_manifest(
+    running: &mut [process::RunningNode],
+    progress: &runlog::JournalProgress,
+    nodes: &[NodeSpec],
+    started_at_ms: u64,
+    cli: &Cli,
+) -> runlog::RunManifest {
+    let ended_at_ms = faultlog::now_unix_ms();
+    progress.sample(nodes, ended_at_ms);
+    let exited_early: std::collections::BTreeSet<String> = running
+        .iter_mut()
+        .filter_map(|node| process::has_exited(node).then(|| node.spec.name.clone()))
+        .collect();
+    let roster: Vec<NodeSpec> = running.iter().map(|node| node.spec.clone()).collect();
+    runlog::RunManifest {
+        started_at_ms,
+        ended_at_ms,
+        sample_interval_ms: cli.journal_sample_interval_ms,
+        nodes: progress.roster(&roster, &exited_early),
+    }
+}
+
+/// Writes `manifest` into the work dir. A write failure is logged, never
+/// fatal: the manifest is evidence FOR the judge, and losing it degrades the
+/// judge's run-level rules to `NoVerdict` (the safe direction) rather than
+/// warranting failing a fleet run that otherwise completed.
+fn write_run_manifest(work_dir: &std::path::Path, manifest: &runlog::RunManifest) {
+    let path = work_dir.join("run.json");
+    if let Err(error) = runlog::write(&path, manifest) {
+        tracing::error!(%error, path = %path.display(), "writing the run manifest failed");
+    }
 }
 
 /// Whether every node's drive-load pass counts as fully accepted for
@@ -1433,6 +1526,10 @@ fn print_summary(
         "  fault-window journal: {} (§8.4, issues #203/#204/#207)",
         work_dir.join("faults.ndjson").display()
     );
+    println!(
+        "  run manifest: {} (§8.4 run-level vacuity teeth, issue #208)",
+        work_dir.join("run.json").display()
+    );
 }
 
 fn report_work_dir(work_dir: &std::path::Path) {
@@ -1524,6 +1621,7 @@ mod tests {
             tenant: None,
             settle_timeout_secs: 60,
             shutdown_grace_secs: 10,
+            journal_sample_interval_ms: runlog::DEFAULT_SAMPLE_INTERVAL_MS,
             fault_kill_node: None,
             fault_kill_mid_drain: false,
             fault_kill_delay_secs: 5,

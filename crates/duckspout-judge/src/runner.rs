@@ -21,16 +21,41 @@
 //! about watermark honesty, the latest view, retention, or cache
 //! transparency. Anything else would be "skipped ≠ passed" (§8.4) smuggled
 //! in through a command-line knob.
+//!
+//! # …and so does every run-level vacuity rule (#208)
+//!
+//! `crate::vacuity`'s four §8.4 run-level rules are reported the same way,
+//! in the same list, under `vacuity/…` names, and combined by the same
+//! `combined_exit_code` call. There is exactly one composition rule for the
+//! whole run (that module's docs state it), and no rule anywhere gets to
+//! short-circuit the others:
+//!
+//! **The one behaviour change #208 made here** is that the loadgen
+//! run-summary check no longer aborts the run before any predicate has
+//! spoken. It used to return a dedicated `SummaryVacuous` outcome, which
+//! meant a run with — say — an ambiguous-outcome fraction over the ceiling
+//! reported `3` even when the journals contained a *proven* lost ack. That
+//! contradicted `combined_exit_code`'s own documented ordering ("a proven
+//! violation anywhere outranks an inconclusive predicate elsewhere") for no
+//! reason: an acked record missing from the final system is a fact about the
+//! code, and an unrelated vacuity signal does not unprove it. The check now
+//! runs as `vacuity/loadgen-outcome-quality` alongside everything else, so a
+//! vacuous-and-clean run still exits `3` (unchanged) while a
+//! vacuous-and-convicted run exits `2` (the fact the judge actually holds).
+//! Ingestion failure remains the one true short-circuit: evidence that did
+//! not parse cannot be judged at all.
 
 use std::path::PathBuf;
 
+use crate::fault_ledger::{FaultLedger, parse_fault_ledger};
 use crate::final_state::{InMemoryCommittedParts, InMemoryFinalState, InMemoryLatestView};
 use crate::journal::{JournalSet, ingest_journals};
 use crate::predicates::{
     cache_transparency, latest_view, retention_honesty, watermark_honesty, zero_acked_lost,
 };
 use crate::read_log::{ReadRecord, parse_read_log};
-use crate::summary::{self, SummaryFinding};
+use crate::run_manifest::{RunManifest, parse_run_manifest};
+use crate::vacuity::{self, VacuityInputs};
 use crate::verdict::{Verdict, combined_exit_code};
 
 /// The judge run's inputs — `main.rs`'s `Cli`, stripped of `clap` so it can
@@ -56,9 +81,21 @@ pub struct RunArgs {
     /// which snapshot parts it holds. `None` leaves retention honesty with
     /// no covering set to check the journaled expiries against.
     pub committed_parts_fixture: Option<PathBuf>,
+    /// The fleet run's fault-injector ledger (`faults.ndjson`,
+    /// `crate::fault_ledger`). `None` leaves §8.4's armed-but-unfired rule
+    /// with nothing measured — reported as `NoVerdict`, never assumed from
+    /// the run's profile.
+    pub fault_log: Option<PathBuf>,
+    /// The fleet run's manifest (`run.json`, `crate::run_manifest`). `None`
+    /// leaves the cross-node-contention and node-continuity rules with no
+    /// roster and no clock — both reported as `NoVerdict`.
+    pub run_manifest: Option<PathBuf>,
     /// Ceiling on the loadgen run summary's ambiguous-outcome fraction
     /// (`crate::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION` docs).
     pub max_ambiguous_fraction: f64,
+    /// How far a roster node's journal may fall behind the fleet's own last
+    /// activity (`crate::vacuity::DEFAULT_MAX_JOURNAL_SILENCE_MS` docs).
+    pub max_journal_silence_ms: u64,
     /// Absolute latency ceiling for a read that raced a residency action
     /// (`crate::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS`
     /// docs).
@@ -77,25 +114,23 @@ pub struct PredicateReport {
 
 /// The judge's own outcome — one-to-one with `main.rs`'s `EXIT_CONTRACT`
 /// (0/2/3 via [`RunOutcome::exit_code`]).
-///
-/// Not `Eq`: [`SummaryFinding`] carries the ambiguous-fraction ceiling as an
-/// `f64`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
-    /// Journal (or read-log) ingestion itself failed (malformed input;
-    /// fails closed) — no predicate ran, because none of them can be
-    /// trusted over evidence that did not parse.
+    /// Evidence ingestion itself failed — a malformed journal, read log,
+    /// fault ledger or run manifest (fails closed). No predicate and no
+    /// vacuity rule ran, because none of them can be trusted over evidence
+    /// that did not parse. This is the pipeline's ONLY short-circuit
+    /// (module docs).
     IngestionFailed(String),
-    /// The loadgen run-summary vacuity check (ACPR finding HIGH-1) found a
-    /// reason not to trust this run's evidence.
-    SummaryVacuous(Vec<SummaryFinding>),
-    /// Every predicate ran; here is what each concluded.
+    /// Every predicate and every run-level vacuity rule ran; here is what
+    /// each concluded.
     Judged {
         /// How many journal files were ingested.
         journal_count: usize,
         /// How many total lines were ingested across every file.
         line_count: usize,
-        /// One report per predicate, in a stable order.
+        /// One report per predicate and per run-level vacuity rule, in a
+        /// stable order (predicates first, then `vacuity/…`).
         reports: Vec<PredicateReport>,
     },
 }
@@ -103,14 +138,13 @@ pub enum RunOutcome {
 impl RunOutcome {
     /// Maps this outcome to the judge's exit contract: `0` = Pass,
     /// `2` = Violation, `3` = `NoVerdict` (every other case — inconclusive
-    /// or vacuous, never a pass). A judged run combines its predicates'
-    /// verdicts through `crate::verdict::combined_exit_code`.
+    /// or vacuous, never a pass). A judged run combines every report's
+    /// verdict — predicates and `vacuity/…` rules alike — through the single
+    /// `crate::verdict::combined_exit_code`.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
-            RunOutcome::IngestionFailed(_) | RunOutcome::SummaryVacuous(_) => {
-                crate::verdict::EXIT_NO_VERDICT
-            }
+            RunOutcome::IngestionFailed(_) => crate::verdict::EXIT_NO_VERDICT,
             RunOutcome::Judged { reports, .. } => {
                 let verdicts: Vec<Verdict<String>> =
                     reports.iter().map(|r| r.verdict.clone()).collect();
@@ -120,18 +154,14 @@ impl RunOutcome {
     }
 }
 
-/// Runs the real judge pipeline: ingest → summary vacuity check → every
-/// predicate (module docs).
+/// Runs the real judge pipeline: ingest → every predicate → every run-level
+/// vacuity rule (module docs).
 #[must_use]
 pub fn run(args: &RunArgs) -> RunOutcome {
     let journals = match ingest_journals(&args.journals) {
         Ok(journals) => journals,
         Err(err) => return RunOutcome::IngestionFailed(err.to_string()),
     };
-
-    if let Err(findings) = summary::check_summaries(&journals, args.max_ambiguous_fraction) {
-        return RunOutcome::SummaryVacuous(findings);
-    }
 
     let reads = match &args.read_log {
         Some(path) => match parse_read_log(path) {
@@ -141,17 +171,70 @@ pub fn run(args: &RunArgs) -> RunOutcome {
         None => Vec::new(),
     };
 
+    // A fault ledger or manifest that was SUPPLIED and did not parse is
+    // ingestion failure, exactly like a malformed journal: the operator asked
+    // this run to be graded against that file, and silently degrading to
+    // "then we have no run-level evidence" would turn a corrupt ledger into a
+    // milder verdict than an absent one. Not supplied at all is a different
+    // thing, and `crate::vacuity` reports it as that rule's own `NoVerdict`.
+    let ledger = match &args.fault_log {
+        Some(path) => match parse_fault_ledger(path) {
+            Ok(ledger) => Some(ledger),
+            Err(err) => return RunOutcome::IngestionFailed(err.to_string()),
+        },
+        None => None,
+    };
+    let manifest = match &args.run_manifest {
+        Some(path) => match parse_run_manifest(path) {
+            Ok(manifest) => Some(manifest),
+            Err(err) => return RunOutcome::IngestionFailed(err),
+        },
+        None => None,
+    };
+
+    let mut reports = vec![
+        zero_acked_lost_report(args, &journals),
+        watermark_honesty_report(&journals, &reads),
+        latest_view_report(args, &journals),
+        retention_honesty_report(args, &journals),
+        cache_transparency_report(args, &journals, &reads),
+    ];
+    reports.extend(vacuity_reports(
+        args,
+        &journals,
+        ledger.as_ref(),
+        manifest.as_ref(),
+    ));
+
     RunOutcome::Judged {
         journal_count: args.journals.len(),
         line_count: journals.lines.len(),
-        reports: vec![
-            zero_acked_lost_report(args, &journals),
-            watermark_honesty_report(&journals, &reads),
-            latest_view_report(args, &journals),
-            retention_honesty_report(args, &journals),
-            cache_transparency_report(args, &journals, &reads),
-        ],
+        reports,
     }
+}
+
+/// §8.4's four run-level vacuity rules, as [`PredicateReport`]s so they land
+/// in the same list — and therefore under the same composition rule — as the
+/// five predicates (module docs).
+fn vacuity_reports(
+    args: &RunArgs,
+    journals: &JournalSet,
+    ledger: Option<&FaultLedger>,
+    manifest: Option<&RunManifest>,
+) -> Vec<PredicateReport> {
+    vacuity::check_all(&VacuityInputs {
+        journals,
+        ledger,
+        manifest,
+        max_ambiguous_fraction: args.max_ambiguous_fraction,
+        max_journal_silence_ms: args.max_journal_silence_ms,
+    })
+    .into_iter()
+    .map(|(rule, verdict)| PredicateReport {
+        predicate: rule,
+        verdict: verdict.erase(),
+    })
+    .collect()
 }
 
 /// Reads a fixture file into `T`, or the reason it could not be used —
@@ -281,10 +364,17 @@ mod tests {
             read_log: None,
             latest_view_fixture: None,
             committed_parts_fixture: None,
-            max_ambiguous_fraction: summary::DEFAULT_MAX_AMBIGUOUS_FRACTION,
+            fault_log: None,
+            run_manifest: None,
+            max_ambiguous_fraction: crate::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION,
+            max_journal_silence_ms: vacuity::DEFAULT_MAX_JOURNAL_SILENCE_MS,
             max_racing_read_ms: crate::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS,
         }
     }
+
+    /// How many reports a full run produces: five predicates plus §8.4's
+    /// four run-level vacuity rules.
+    const REPORT_COUNT: usize = 9;
 
     fn verdict_of<'a>(outcome: &'a RunOutcome, predicate: &str) -> &'a Verdict<String> {
         match outcome {
@@ -295,7 +385,9 @@ mod tests {
                     .expect("every predicate is reported")
                     .verdict
             }
-            other => panic!("expected a judged run, got {other:?}"),
+            other @ RunOutcome::IngestionFailed(_) => {
+                panic!("expected a judged run, got {other:?}")
+            }
         }
     }
 
@@ -333,14 +425,16 @@ mod tests {
             } => {
                 assert_eq!(*journal_count, 1);
                 assert_eq!(*line_count, 1);
-                assert_eq!(reports.len(), 5);
+                assert_eq!(reports.len(), REPORT_COUNT);
                 assert!(
                     reports
                         .iter()
                         .all(|r| matches!(r.verdict, Verdict::NoVerdict(_)))
                 );
             }
-            other => panic!("expected a judged run, got {other:?}"),
+            other @ RunOutcome::IngestionFailed(_) => {
+                panic!("expected a judged run, got {other:?}")
+            }
         }
         assert_eq!(outcome.exit_code(), 3);
     }
@@ -366,6 +460,67 @@ mod tests {
             Verdict::NoVerdict(_)
         ));
         assert_eq!(outcome.exit_code(), 2);
+    }
+
+    /// A supplied-but-corrupt fault ledger fails the whole run closed rather
+    /// than degrading to "no run-level evidence" — which would make a corrupt
+    /// ledger produce a MILDER outcome than an absent one for the predicates
+    /// that would otherwise still have been graded.
+    #[test]
+    fn a_malformed_fault_ledger_fails_the_run_closed() {
+        let journal = write_temp("{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n");
+        let bad = write_temp("not json\n");
+        let mut args = args(vec![journal.path().to_owned()]);
+        args.fault_log = Some(bad.path().to_owned());
+        let outcome = run(&args);
+        assert!(matches!(outcome, RunOutcome::IngestionFailed(_)));
+        assert_eq!(outcome.exit_code(), 3);
+    }
+
+    #[test]
+    fn a_malformed_run_manifest_fails_the_run_closed() {
+        let journal = write_temp("{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n");
+        let bad = write_temp("{\"started_at_ms\":1}\n");
+        let mut args = args(vec![journal.path().to_owned()]);
+        args.run_manifest = Some(bad.path().to_owned());
+        let outcome = run(&args);
+        assert!(matches!(outcome, RunOutcome::IngestionFailed(_)));
+        assert_eq!(outcome.exit_code(), 3);
+    }
+
+    /// The #208 composition change, stated as a test: a run that is vacuous
+    /// by a run-level rule AND holds a proven violation reports the
+    /// violation. Would catch a reintroduced pre-predicate short-circuit —
+    /// the pre-#208 behaviour, in which a missing loadgen summary made this
+    /// exact evidence set report `3` and hid the lost ack entirely.
+    #[test]
+    fn a_vacuous_run_that_also_convicts_reports_the_conviction() {
+        // A loadgen-shaped journal (identity-bearing) with NO `.summary.json`
+        // sidecar: `vacuity/loadgen-outcome-quality` is NoVerdict …
+        let journal = write_temp(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"request_id\":\"r\",\"tenant\":\"t\",\"record_count\":1,\"first_index\":0,\
+             \"source_incarnation\":\"loadgen-0-1000\"}\n",
+        );
+        // … while the final state is missing the very record that ack promised.
+        let final_state = write_temp(r#"{"present":[]}"#);
+        let mut args = args(vec![journal.path().to_owned()]);
+        args.final_state_fixture = Some(final_state.path().to_owned());
+        let outcome = run(&args);
+        assert!(matches!(
+            verdict_of(&outcome, "zero-acked-lost"),
+            Verdict::Violation(_)
+        ));
+        assert!(matches!(
+            verdict_of(&outcome, crate::vacuity::RULE_LOADGEN_OUTCOMES),
+            Verdict::NoVerdict(_)
+        ));
+        assert_eq!(
+            outcome.exit_code(),
+            2,
+            "a proven lost ack is a fact the judge holds; an unrelated vacuity signal does not \
+             unprove it"
+        );
     }
 
     #[test]

@@ -1,0 +1,21 @@
+{
+  "started_at_ms": 1000,
+  "ended_at_ms": 100000,
+  "sample_interval_ms": 500,
+  "nodes": [
+    {
+      "name": "n1",
+      "journal_path": "/w/n1/journal.ndjson",
+      "journal_lines": 7,
+      "last_progress_at_ms": 90000,
+      "exited_early": false
+    },
+    {
+      "name": "n2",
+      "journal_path": "/w/n2/journal.ndjson",
+      "journal_lines": 2,
+      "last_progress_at_ms": 20100,
+      "exited_early": true
+    }
+  ]
+}

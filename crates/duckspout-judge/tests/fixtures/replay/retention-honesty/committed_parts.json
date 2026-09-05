@@ -1,0 +1,12 @@
+{
+  "snapshots": [
+    {
+      "dataset": "dim_users",
+      "partition": "tenant-a.4",
+      "part": "dim_users/tenant-a.4/4/snapshot/12.parquet",
+      "origin_coverage": [
+        { "origin": "n1", "first_seq": 1, "last_seq": 3 }
+      ]
+    }
+  ]
+}

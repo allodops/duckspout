@@ -1,0 +1,10 @@
+{
+  "views": {
+    "dim_users": {
+      "tenant-a": {
+        "u1": "alice",
+        "u2": "bob-STALE"
+      }
+    }
+  }
+}
