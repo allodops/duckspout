@@ -1005,7 +1005,6 @@ dependencies = [
 name = "duckspout-judge"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "clap",
  "duckspout-types",
  "serde",

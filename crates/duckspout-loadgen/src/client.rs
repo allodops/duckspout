@@ -41,12 +41,45 @@ pub async fn connect(target: &str) -> anyhow::Result<LogsServiceClient<Channel>>
     Ok(LogsServiceClient::connect(target.to_owned()).await?)
 }
 
+/// The identity of one loadgen PROCESS INCARNATION (§8.4, ACPR finding
+/// HIGH-2): the `(node, start_nonce)` pair that uniquely names one loadgen
+/// process's run, distinguishing it from every OTHER fleet member sharing
+/// the same `--node-id` default (`main.rs`'s `Cli::node_id` docs: a config
+/// default, never enforced unique) and from every EARLIER OR LATER restart
+/// under the identical `--node-id` (`start_nonce` is minted fresh per
+/// process start, `main.rs`, never persisted). `client::request_id` already
+/// embeds this exact pair as its own prefix (`{node}-{start_nonce}-{seq}`);
+/// this is the same value, spelled out so `synthetic_batch` can embed it
+/// into RECORD identity too — the fix for the aliasing bug `first_index`
+/// alone has: `first_index` is `sent * batch_size` counted from 0 in EVERY
+/// process (`main.rs`), so two fleet members, or one member across a
+/// restart, produce numerically identical `[first_index, first_index +
+/// count)` ranges for the SAME tenant. A judge correlating on the bare index
+/// alone cannot tell those apart — confirmed to certify a total loss of one
+/// member's writes as `Pass` (ACPR HIGH-2). Embedding `source_incarnation`
+/// into the `loadgen.index` attribute value that actually reaches the final
+/// system makes the record's own on-the-wire identity globally unique across
+/// the whole fleet's lifetime, not just within one process.
+#[must_use]
+pub fn source_incarnation(node: &NodeId, start_nonce: u128) -> String {
+    format!("{node}-{start_nonce}")
+}
+
 /// Builds one synthetic OTLP export request of `record_count` log records —
 /// deterministic content (a counter, not randomness: no `rand` dependency is
 /// pinned, and reproducible load is easier to reason about in a fleet run's
 /// journals than random load would be).
+///
+/// `loadgen.index`'s value is `{source_incarnation}-{index}`, not a bare
+/// index (ACPR HIGH-2, `source_incarnation` docs): this is the exact string
+/// a judge's `FinalSystemState` must key its read-back on to avoid aliasing
+/// across fleet members or restarts.
 #[must_use]
-pub fn synthetic_batch(record_count: usize, first_index: u64) -> ExportLogsServiceRequest {
+pub fn synthetic_batch(
+    source_incarnation: &str,
+    record_count: usize,
+    first_index: u64,
+) -> ExportLogsServiceRequest {
     let records = (0..record_count as u64)
         .map(|i| {
             let index = first_index + i;
@@ -60,7 +93,9 @@ pub fn synthetic_batch(record_count: usize, first_index: u64) -> ExportLogsServi
                 attributes: vec![KeyValue {
                     key: "loadgen.index".to_owned(),
                     value: Some(AnyValue {
-                        value: Some(PbValue::StringValue(index.to_string())),
+                        value: Some(PbValue::StringValue(format!(
+                            "{source_incarnation}-{index}"
+                        ))),
                     }),
                     ..Default::default()
                 }],
@@ -85,27 +120,40 @@ pub fn synthetic_batch(record_count: usize, first_index: u64) -> ExportLogsServi
 /// statistics — the journal is the durable record; this is just so `main`
 /// can print a live summary.
 ///
+/// Takes a pre-built [`RequestIdentity`] rather than its fields
+/// individually (`tenant`, `request_id`, `source_incarnation`,
+/// `record_count`, `first_index` all travel together everywhere this
+/// function's caller and `crate::journal`/`crate::journal::JournalLine`
+/// touch them, so bundling them avoids both an 8-argument function
+/// signature and the risk of a caller passing them in the wrong order).
+///
 /// # Panics
 ///
-/// If `tenant` or `request_id` are not valid gRPC metadata ASCII — both are
-/// operator/loadgen-controlled inputs, never data from the wire.
+/// If `identity.tenant` or `identity.request_id` are not valid gRPC
+/// metadata ASCII — both are operator/loadgen-controlled inputs, never data
+/// from the wire.
 pub async fn send_and_journal<W: std::io::Write + Send>(
     client: &mut LogsServiceClient<Channel>,
     journal: &LoadgenJournal<W>,
-    tenant: &str,
-    request_id: String,
-    record_count: usize,
-    first_index: u64,
+    identity: RequestIdentity,
     ack_timeout: Duration,
 ) -> RequestResolution {
-    let mut request = tonic::Request::new(synthetic_batch(record_count, first_index));
+    let mut request = tonic::Request::new(synthetic_batch(
+        &identity.source_incarnation,
+        identity.record_count,
+        identity.first_index,
+    ));
     request.metadata_mut().insert(
         TENANT_METADATA_KEY,
-        tenant.parse().expect("tenant is valid metadata ASCII"),
+        identity
+            .tenant
+            .parse()
+            .expect("tenant is valid metadata ASCII"),
     );
     request.metadata_mut().insert(
         IDEMPOTENCY_METADATA_KEY,
-        request_id
+        identity
+            .request_id
             .parse()
             .expect("request id is valid metadata ASCII"),
     );
@@ -115,12 +163,6 @@ pub async fn send_and_journal<W: std::io::Write + Send>(
         Err(_elapsed) => RaceOutcome::DeadlineFirst,
     };
 
-    let identity = RequestIdentity {
-        request_id,
-        tenant: tenant.to_owned(),
-        record_count,
-        first_index,
-    };
     let resolution = resolve(&raced);
     match resolution {
         RequestResolution::Acked => journal.record_client_ack(&identity),

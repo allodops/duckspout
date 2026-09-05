@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use duckspout_accept::server::{AdmissionConfig, OtlpLogsService};
 use duckspout_loadgen::client::{connect, request_id, send_and_journal};
-use duckspout_loadgen::journal::LoadgenJournal;
+use duckspout_loadgen::journal::{LoadgenJournal, RequestIdentity};
 use duckspout_loadgen::outcome::RequestResolution;
 use duckspout_types::{
     BoxFuture, DecodedBatch, NodeId, OriginSeqRange, PartitionId, StageCommitter, StageError,
@@ -115,6 +115,24 @@ async fn serve(stager: Arc<ScriptedStager>) -> String {
     format!("http://{addr}")
 }
 
+/// Test helper bundling a call's identity fields — mirrors `main.rs`'s own
+/// construction of a `RequestIdentity` per request (ACPR HIGH-2's
+/// `send_and_journal` signature change, `client.rs` docs).
+fn identity(
+    request_id: String,
+    tenant: &str,
+    record_count: usize,
+    first_index: u64,
+) -> RequestIdentity {
+    RequestIdentity {
+        request_id,
+        tenant: tenant.to_owned(),
+        record_count,
+        first_index,
+        source_incarnation: "loadgen-smoke-0".to_owned(),
+    }
+}
+
 fn journal_lines(journal: LoadgenJournal<Vec<u8>>) -> Vec<serde_json::Value> {
     String::from_utf8(journal.into_inner())
         .unwrap()
@@ -133,10 +151,7 @@ async fn a_committed_batch_is_acked_and_journaled_with_identity() {
     let resolution = send_and_journal(
         &mut client,
         &journal,
-        "tenant-smoke",
-        id.clone(),
-        5,
-        20,
+        identity(id.clone(), "tenant-smoke", 5, 20),
         Duration::from_secs(5),
     )
     .await;
@@ -153,6 +168,10 @@ async fn a_committed_batch_is_acked_and_journaled_with_identity() {
     // future judge (#205) never has to reverse-engineer it from
     // `main.rs`'s `sent * batch_size` arithmetic.
     assert_eq!(lines[0]["first_index"], 20);
+    // ACPR finding HIGH-2: the process-incarnation identity must ride along
+    // too, so a judge can build a globally-unique correlation key instead of
+    // aliasing on the bare index.
+    assert_eq!(lines[0]["source_incarnation"], "loadgen-smoke-0");
 }
 
 /// The pre-fix flagship test, corrected (ACPR finding HIGH-1, module docs):
@@ -171,10 +190,12 @@ async fn a_hung_but_alive_acceptor_is_ambiguous_not_client_timeout() {
     let resolution = send_and_journal(
         &mut client,
         &journal,
-        "tenant-smoke",
-        request_id(&NodeId::new("loadgen-smoke"), 0, 0),
-        1,
-        0,
+        identity(
+            request_id(&NodeId::new("loadgen-smoke"), 0, 0),
+            "tenant-smoke",
+            1,
+            0,
+        ),
         Duration::from_millis(100),
     )
     .await;
@@ -202,10 +223,12 @@ async fn a_dead_acceptor_produces_a_confirmed_client_timeout() {
     let resolution = send_and_journal(
         &mut client,
         &journal,
-        "tenant-smoke",
-        request_id(&NodeId::new("loadgen-smoke"), 0, 0),
-        1,
-        0,
+        identity(
+            request_id(&NodeId::new("loadgen-smoke"), 0, 0),
+            "tenant-smoke",
+            1,
+            0,
+        ),
         Duration::from_secs(5),
     )
     .await;
@@ -230,10 +253,12 @@ async fn an_explicit_refusal_is_journaled_as_nothing() {
     let resolution = send_and_journal(
         &mut client,
         &journal,
-        "tenant-smoke",
-        request_id(&NodeId::new("loadgen-smoke"), 0, 0),
-        1,
-        0,
+        identity(
+            request_id(&NodeId::new("loadgen-smoke"), 0, 0),
+            "tenant-smoke",
+            1,
+            0,
+        ),
         Duration::from_secs(5),
     )
     .await;

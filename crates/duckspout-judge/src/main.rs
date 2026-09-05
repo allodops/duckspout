@@ -7,6 +7,11 @@
 //! Seeded-violation replays must convict, and a run whose armed injectors
 //! never fired is vacuous — `NoVerdict`, never `Pass` (§8.3).
 //!
+//! This binary is now a thin `clap` wrapper: the actual pipeline
+//! (ingest → loadgen run-summary vacuity check → predicate) lives in
+//! `duckspout_judge::runner`, split out specifically so it is directly
+//! testable (ACPR finding MEDIUM-HIGH-4) without spawning a subprocess.
+//!
 //! # #205: what's wired for real here, and what's deferred
 //!
 //! Journal ingestion (`duckspout_judge::journal`) is real: malformed input
@@ -29,11 +34,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context as _;
 use clap::Parser;
-use duckspout_judge::final_state::InMemoryFinalState;
-use duckspout_judge::journal::ingest_journals;
-use duckspout_judge::predicates::zero_acked_lost::{self, ZeroAckedLostVerdict};
+use duckspout_judge::predicates::zero_acked_lost::ZeroAckedLostVerdict;
+use duckspout_judge::runner::{RunArgs, RunOutcome, run};
+use duckspout_judge::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION;
 
 /// The judge's exit contract (§8.4), stable for every caller:
 /// `0` = Pass, `2` = Violation, `3` = `NoVerdict` (inconclusive or vacuous).
@@ -55,67 +59,76 @@ struct Cli {
     /// fabricating a verdict with nothing real to check the acks against.
     #[arg(long)]
     final_state_fixture: Option<PathBuf>,
+
+    /// Ceiling on the fraction of a loadgen's resolved requests that came
+    /// back `Ambiguous` before its run summary is treated as unreliable
+    /// evidence (ACPR finding HIGH-1; reasoning:
+    /// `duckspout_judge::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION` docs).
+    #[arg(long, default_value_t = DEFAULT_MAX_AMBIGUOUS_FRACTION)]
+    max_ambiguous_fraction: f64,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     let cli = Cli::parse();
+    let outcome = run(&RunArgs {
+        journals: cli.journal,
+        final_state_fixture: cli.final_state_fixture,
+        max_ambiguous_fraction: cli.max_ambiguous_fraction,
+    });
+    report(&outcome);
+    std::process::exit(outcome.exit_code());
+}
 
-    let journals = match ingest_journals(&cli.journal) {
-        Ok(journals) => journals,
-        Err(err) => {
+/// Prints the same operator-facing detail the judge always has, keyed off
+/// [`RunOutcome`]'s variant.
+fn report(outcome: &RunOutcome) {
+    match outcome {
+        RunOutcome::IngestionFailed(err) => {
             eprintln!(
                 "duckspout-judge: journal ingestion failed: {err} — NoVerdict \
                  (ambiguity fails closed, §8.4)"
             );
-            std::process::exit(3);
         }
-    };
-
-    let Some(fixture_path) = &cli.final_state_fixture else {
-        eprintln!(
-            "duckspout-judge: {} journal(s) parsed OK ({} record(s)); no final-system \
-             backend wired yet (§8.4's real hot/lake read-back lands with the distributed \
-             tier's fleet wiring, #205's own scope note) — NoVerdict",
-            cli.journal.len(),
-            journals.lines.len()
-        );
-        std::process::exit(3);
-    };
-
-    let fixture_text = std::fs::read_to_string(fixture_path)
-        .with_context(|| format!("reading final-state fixture {}", fixture_path.display()))?;
-    let final_state = match InMemoryFinalState::from_fixture_json(&fixture_text) {
-        Ok(state) => state,
-        Err(err) => {
+        RunOutcome::SummaryVacuous(findings) => {
             eprintln!(
-                "duckspout-judge: final-state fixture {} is malformed: {err} — NoVerdict",
-                fixture_path.display()
+                "duckspout-judge: loadgen run-summary check found {} vacuity finding(s) — \
+                 NoVerdict (§8.4 vacuity teeth, ACPR finding HIGH-1):",
+                findings.len()
             );
-            std::process::exit(3);
+            for finding in findings {
+                eprintln!("  {finding}");
+            }
         }
-    };
-
-    match zero_acked_lost::check(&journals, &final_state) {
-        ZeroAckedLostVerdict::Pass { checked } => {
+        RunOutcome::NoBackend {
+            journal_count,
+            line_count,
+        } => {
+            eprintln!(
+                "duckspout-judge: {journal_count} journal(s) parsed OK ({line_count} record(s)); \
+                 no final-system backend wired yet (§8.4's real hot/lake read-back lands with the \
+                 distributed tier's fleet wiring, #205's own scope note) — NoVerdict"
+            );
+        }
+        RunOutcome::FixtureInvalid(err) => {
+            eprintln!("duckspout-judge: final-state fixture invalid: {err} — NoVerdict");
+        }
+        RunOutcome::Predicate(ZeroAckedLostVerdict::Pass { checked }) => {
             eprintln!("duckspout-judge: zero-acked-lost PASS ({checked} acked request(s) checked)");
-            std::process::exit(0);
         }
-        ZeroAckedLostVerdict::Violation(findings) => {
+        RunOutcome::Predicate(ZeroAckedLostVerdict::Violation(findings)) => {
             eprintln!(
                 "duckspout-judge: zero-acked-lost VIOLATION ({} finding(s)):",
                 findings.len()
             );
-            for finding in &findings {
+            for finding in findings {
                 eprintln!(
                     "  request {} (tenant {}): missing indices {:?}",
                     finding.request_id, finding.tenant, finding.missing_indices
                 );
             }
-            std::process::exit(2);
         }
-        ZeroAckedLostVerdict::NoVerdict(reason) => {
+        RunOutcome::Predicate(ZeroAckedLostVerdict::NoVerdict(reason)) => {
             eprintln!("duckspout-judge: zero-acked-lost NoVerdict: {reason}");
-            std::process::exit(3);
         }
     }
 }

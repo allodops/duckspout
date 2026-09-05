@@ -8,11 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only —
-# used in `main.rs`; the library modules (`journal`, `attempt`,
-# `final_state`, `predicates`) use `thiserror` for typed, matchable errors
-# instead, same split `duckspout-loadgen` uses between its own lib and bin.
-anyhow = { workspace = true }
+# s§3.3 permits anyhow in the four bin crates (ctl, fleet, judge, loadgen)
+# only; this crate does not need it — `main.rs` is a thin wrapper around
+# `duckspout_judge::runner::run`, which returns a typed `RunOutcome` rather
+# than propagating errors, so every module (including the bin) uses
+# `thiserror` for typed, matchable errors (ACPR finding MEDIUM-HIGH-4's
+# `runner` split made this possible; `duckspout-loadgen`'s bin, by contrast,
+# still needs anyhow for its own `main.rs`'s `?`-propagating I/O setup).
 clap = { workspace = true }
 duckspout-types = { workspace = true }
 serde = { workspace = true }

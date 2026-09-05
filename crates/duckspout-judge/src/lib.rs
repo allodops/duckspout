@@ -23,10 +23,27 @@
 //!
 //! Design home: `docs/verification.md` (lands at absorption; until then see
 //! `DUCKSPOUT.md` §8.4).
+//!
+//! # `attempt`-matching module removed (ACPR finding LOW-MEDIUM-7)
+//!
+//! An earlier revision of this crate shipped an `attempt` module — a
+//! generic per-node FIFO attempt/resolution matcher, meant as shared
+//! plumbing for #206/#207/#208's future predicates (the "sharpest fault
+//! window" §8.4 names: `PutPart` → `{LakeCommitOk, LakeCommitAbort,
+//! LakeCommitIndeterminate}`). It had zero consumers in this crate — the
+//! #205 predicate this crate actually ships (`zero_acked_lost`) does not
+//! need it — which directly contradicts this same PR's own stated KISS
+//! posture elsewhere ("keep it local until a second, non-judge consumer
+//! actually needs it"). ACPR review flagged the same reasoning applies to a
+//! second, in-crate consumer just as much as an out-of-crate one, so it was
+//! removed rather than kept as speculative infrastructure; whichever of
+//! #206/#207/#208 needs attempt/resolution matching first should introduce
+//! it fresh, sized to what that predicate actually needs.
 
 #![forbid(unsafe_code)]
 
-pub mod attempt;
 pub mod final_state;
 pub mod journal;
 pub mod predicates;
+pub mod runner;
+pub mod summary;

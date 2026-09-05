@@ -46,8 +46,21 @@ pub struct RequestIdentity {
     pub record_count: usize,
     /// The 0-based index of the first record the request carried — together
     /// with `record_count`, the `[first_index, first_index + record_count)`
-    /// range this ack covers.
+    /// range this ack covers. ALIASES across loadgen fleet members and
+    /// across one member's restart (ACPR finding HIGH-2) — never use this
+    /// bare as a global correlation key; combine it with
+    /// `source_incarnation` below.
     pub first_index: u64,
+    /// The `(node, start_nonce)` pair naming the loadgen process incarnation
+    /// that sent this request (ACPR HIGH-2,
+    /// `duckspout_loadgen::client::source_incarnation`'s wire shape) —
+    /// together with `first_index` this is what makes a record's identity
+    /// globally unique across the whole fleet's lifetime, not just within
+    /// one process. The predicate keys its `FinalSystemState` lookups on
+    /// `{source_incarnation}-{index}`, matching the exact string
+    /// `duckspout_loadgen::client::synthetic_batch` embeds in the record's
+    /// own `loadgen.index` attribute.
+    pub source_incarnation: String,
 }
 
 /// One decoded journal line: the frozen envelope plus, when present, the
@@ -127,9 +140,16 @@ pub enum JournalError {
     },
     /// A node's seq did not continue the dense, zero-based sequence D-6
     /// requires — a gap (lost lines), a repeat, or an out-of-order line.
+    /// Checked BOTH within one file (`parse_journal_file`) and, since ACPR
+    /// finding MEDIUM-HIGH-3(c), across every file ingested together
+    /// (`ingest_journals`'s cross-file re-check) — so the same `(node, seq)`
+    /// reappearing in a second file (a file passed twice, or a rotated
+    /// journal re-fed by mistake) is a repeat, caught the same way a repeat
+    /// within one file would be, rather than silently double-counted.
     #[error(
         "{path}:{line_no}: node {node} seq {got}, expected {expected} \
-         (D-6: dense per-node seqs starting at 0)"
+         (D-6: dense per-node seqs starting at 0, tracked across every \
+         journal file ingested together)"
     )]
     NonDenseSeq {
         /// The journal file the bad line came from.
@@ -165,14 +185,156 @@ struct Envelope {
 /// A `rest` WITH a `request_id` field that does not fully decode as
 /// [`RequestIdentity`] IS an error: a half-formed identity is corruption,
 /// not "no identity here."
+///
+/// Also rejects, as the same kind of corruption (ACPR finding
+/// MEDIUM-HIGH-3(b)): a `first_index`/`record_count` pair whose sum
+/// overflows `u64`. Left unchecked, a predicate computing
+/// `first_index..first_index + record_count` over this identity would
+/// either panic (debug) or silently wrap to an empty, vacuously-passing
+/// range (release) — neither is the fail-closed contract this module
+/// promises, so the check happens once, here, at decode time, rather than
+/// trusting every future caller to redo it correctly.
 fn identity_from_rest(
     rest: &serde_json::Value,
 ) -> Result<Option<RequestIdentity>, serde_json::Error> {
     match rest {
         serde_json::Value::Object(map) if map.contains_key("request_id") => {
-            serde_json::from_value(rest.clone()).map(Some)
+            let identity: RequestIdentity = serde_json::from_value(rest.clone())?;
+            if identity
+                .first_index
+                .checked_add(identity.record_count as u64)
+                .is_none()
+            {
+                return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                    "first_index {} + record_count {} overflows u64 — fails closed rather \
+                     than panicking or silently wrapping to an empty range",
+                    identity.first_index, identity.record_count
+                )));
+            }
+            Ok(Some(identity))
         }
         _ => Ok(None),
+    }
+}
+
+/// A structural check for a duplicate JSON object key anywhere in one line
+/// (ACPR finding MEDIUM-HIGH-3(d)): `serde_json`'s own `Map` (the
+/// `preserve_order` feature included) silently keeps "last value wins" on a
+/// repeated key, with no built-in opt-in to reject it instead. That is
+/// dangerous here specifically: a line with `tenant` duplicated could
+/// silently reclassify a real tenant's ack as the system tenant `_self` (or
+/// vice versa) and have it wrongly excluded or included. Reasonable-effort
+/// fix, not a general JSON-validation library: walk the raw token stream
+/// with a `serde::de::Visitor` that never *builds* a map (so duplicate keys
+/// are never lost to the same collapsing a normal deserialize would do) and
+/// fail as soon as one repeats, at any nesting level a journal line could
+/// plausibly have.
+struct RejectDuplicateKeys;
+
+impl<'de> serde::de::Deserialize<'de> for RejectDuplicateKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct DupKeyVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DupKeyVisitor {
+            type Value = ();
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut seen = std::collections::HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON key {key:?} (ambiguity fails closed — \
+                             last-value-wins could silently reclassify identity fields)"
+                        )));
+                    }
+                    map.next_value::<RejectDuplicateKeys>()?;
+                }
+                Ok(())
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while seq.next_element::<RejectDuplicateKeys>()?.is_some() {}
+                Ok(())
+            }
+
+            fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_string<E>(self, _v: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::de::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(DupKeyVisitor)
+            }
+        }
+
+        deserializer.deserialize_any(DupKeyVisitor).map(|()| Self)
     }
 }
 
@@ -201,6 +363,13 @@ pub fn parse_journal_file(path: &Path) -> Result<Vec<JournalLine>, JournalError>
         // (an empty string is not a JSON object), failing this line closed
         // exactly like any other malformed one rather than needing a
         // separate branch.
+        serde_json::from_str::<RejectDuplicateKeys>(raw).map_err(|source| {
+            JournalError::Decode {
+                path: path.to_owned(),
+                line_no,
+                source,
+            }
+        })?;
         let envelope: Envelope =
             serde_json::from_str(raw).map_err(|source| JournalError::Decode {
                 path: path.to_owned(),
@@ -240,16 +409,50 @@ pub fn parse_journal_file(path: &Path) -> Result<Vec<JournalLine>, JournalError>
 /// (§8.4). The first malformed line, in any file, fails the whole
 /// ingestion — never a partial or silently-skipped result (module docs).
 ///
+/// Each file's OWN seq density is checked per-file by [`parse_journal_file`]
+/// (starting at 0 there, since one file may legitimately be one node's
+/// complete, self-contained journal). This function additionally re-checks
+/// density ACROSS every file, in ingestion order (ACPR finding
+/// MEDIUM-HIGH-3(c)): `parse_journal_file`'s own per-file check cannot catch
+/// the same file being passed twice, or a rotated/split journal fed
+/// out-of-order or duplicated, because each file looks internally dense
+/// starting from 0 on its own — the bug is only visible once seqs are
+/// tracked per node across the WHOLE run.
+///
 /// # Errors
 ///
-/// Returns the first [`JournalError`] encountered, across all files in
-/// `paths` order.
+/// Returns the first [`JournalError`] encountered: an I/O or decode failure
+/// from an individual file (in `paths` order), or a cross-file
+/// [`JournalError::NonDenseSeq`] (in ingestion order) if no single file had
+/// one.
 pub fn ingest_journals(paths: &[PathBuf]) -> Result<JournalSet, JournalError> {
     let mut lines = Vec::new();
     for path in paths {
         lines.extend(parse_journal_file(path)?);
     }
+    check_cross_file_density(&lines)?;
     Ok(JournalSet { lines })
+}
+
+/// The cross-file half of `ingest_journals`'s seq-density check (module
+/// docs): replays every line, in ingestion order, tracking each node's next
+/// expected seq across ALL files together rather than per file.
+fn check_cross_file_density(lines: &[JournalLine]) -> Result<(), JournalError> {
+    let mut next_seq: HashMap<NodeId, u64> = HashMap::new();
+    for line in lines {
+        let expected = *next_seq.get(&line.node).unwrap_or(&0);
+        if line.seq != expected {
+            return Err(JournalError::NonDenseSeq {
+                path: line.source.clone(),
+                line_no: line.line_no,
+                node: line.node.clone(),
+                expected,
+                got: line.seq,
+            });
+        }
+        next_seq.insert(line.node.clone(), expected + 1);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -286,7 +489,8 @@ mod tests {
         let file = write_journal(
             "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
              \"request_id\":\"req-1\",\"tenant\":\"tenant-a\",\
-             \"record_count\":7,\"first_index\":42}\n",
+             \"record_count\":7,\"first_index\":42,\
+             \"source_incarnation\":\"loadgen-0-1000\"}\n",
         );
         let lines = parse_journal_file(file.path()).expect("parses");
         let identity = lines[0].identity.as_ref().expect("identity present");
@@ -294,6 +498,7 @@ mod tests {
         assert_eq!(identity.tenant, "tenant-a");
         assert_eq!(identity.record_count, 7);
         assert_eq!(identity.first_index, 42);
+        assert_eq!(identity.source_incarnation, "loadgen-0-1000");
     }
 
     #[test]
@@ -366,7 +571,8 @@ mod tests {
         let f1 = write_journal("{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n");
         let f2 = write_journal(
             "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
-             \"request_id\":\"req-1\",\"tenant\":\"t\",\"record_count\":1,\"first_index\":0}\n",
+             \"request_id\":\"req-1\",\"tenant\":\"t\",\"record_count\":1,\"first_index\":0,\
+             \"source_incarnation\":\"loadgen-0-1000\"}\n",
         );
         let set = ingest_journals(&[f1.path().to_owned(), f2.path().to_owned()]).expect("ingests");
         assert_eq!(set.lines.len(), 2);
@@ -390,5 +596,73 @@ mod tests {
         let missing = PathBuf::from("/nonexistent/duckspout-judge-test-journal.ndjson");
         let err = parse_journal_file(&missing).expect_err("must fail");
         assert!(matches!(err, JournalError::Io { .. }));
+    }
+
+    #[test]
+    fn an_overflowing_index_range_is_a_decode_error_not_a_panic_or_wraparound() {
+        // ACPR finding MEDIUM-HIGH-3(b): would catch the predicate's range
+        // arithmetic panicking (debug) or silently wrapping to an empty,
+        // vacuously-passing range (release) instead of failing closed.
+        let file = write_journal(&format!(
+            "{{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"request_id\":\"req-1\",\"tenant\":\"tenant-a\",\
+             \"record_count\":10,\"first_index\":{},\
+             \"source_incarnation\":\"loadgen-0-1000\"}}\n",
+            u64::MAX - 1
+        ));
+        let err = parse_journal_file(file.path()).expect_err("must fail closed on overflow");
+        assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn a_duplicate_json_key_fails_closed() {
+        // ACPR finding MEDIUM-HIGH-3(d): a duplicated `tenant` key could
+        // silently reclassify a real tenant's ack as the system tenant
+        // (last-value-wins) — this must be rejected, not silently resolved.
+        let file = write_journal(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"request_id\":\"req-1\",\"tenant\":\"tenant-a\",\"tenant\":\"_self\",\
+             \"record_count\":1,\"first_index\":0,\
+             \"source_incarnation\":\"loadgen-0-1000\"}\n",
+        );
+        let err = parse_journal_file(file.path()).expect_err("must fail closed on duplicate key");
+        assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn a_repeated_node_seq_across_two_files_fails_closed() {
+        // ACPR finding MEDIUM-HIGH-3(c): the same file passed twice (or a
+        // rotated journal re-fed by mistake) must not be silently
+        // double-counted just because each file looks dense-from-0 on its
+        // own — density must hold across the whole ingested run.
+        let f1 = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n\
+             {\"node\":\"n1\",\"seq\":1,\"event\":\"StageCommit\"}\n",
+        );
+        let f2 = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n\
+             {\"node\":\"n1\",\"seq\":1,\"event\":\"StageCommit\"}\n",
+        );
+        let err = ingest_journals(&[f1.path().to_owned(), f2.path().to_owned()])
+            .expect_err("must fail closed on cross-file repeat");
+        assert!(matches!(
+            err,
+            JournalError::NonDenseSeq {
+                expected: 2,
+                got: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn distinct_nodes_across_files_are_unaffected_by_the_cross_file_check() {
+        // The non-regression case for the same fix: files covering
+        // DIFFERENT nodes must aggregate normally — the cross-file density
+        // check must not spuriously conflate unrelated nodes' seq counters.
+        let f1 = write_journal("{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n");
+        let f2 = write_journal("{\"node\":\"n2\",\"seq\":0,\"event\":\"Accept\"}\n");
+        let set = ingest_journals(&[f1.path().to_owned(), f2.path().to_owned()]).expect("ingests");
+        assert_eq!(set.lines.len(), 2);
     }
 }
