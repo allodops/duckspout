@@ -106,6 +106,14 @@ pub enum FaultKind {
     /// oscillation is real today and which is blocked on the registry that
     /// does not exist yet).
     DiscoveryFlap,
+    /// A node's post-drain hot residency is churned — real `DropWindow`s
+    /// (and, when the cache class ever activates, real `Demote`/`Evict`s)
+    /// firing under load while real Arrow Flight reads run through the same
+    /// engine (§8.4's "forced Evict/Demote churn and `DropWindow` racing
+    /// queries"; `crate::fault::run_cache_churn`'s module docs for the
+    /// mechanism and for exactly which third of that vocabulary is
+    /// journalable at v0.2).
+    CacheChurn,
 }
 
 /// Where in its lifecycle one fault window is, at the moment a line is

@@ -165,7 +165,13 @@ type RecordSlot = (DatasetId, PartitionId, NodeId, u64);
 
 /// What names ONE row of `<dataset>_latest`: a declared key is unique only
 /// within a tenant (module docs, ACPR finding HIGH-1).
-type RowKey = (DatasetId, TenantId, String);
+///
+/// `pub(crate)` because `crate::predicates::retention_honesty` (#207) folds
+/// the SAME acked changelog for a different question — "did retention make
+/// this row's last value unreachable?" — and a second, independently written
+/// fold would be two definitions of `LatestViewCorrect`'s left-hand side
+/// that could silently disagree. One fold, two readers.
+pub(crate) type RowKey = (DatasetId, TenantId, String);
 
 /// Runs the predicate against `journals`' acked changelog entries and
 /// `view`'s read-back of each dataset's `<dataset>_latest`.
@@ -194,16 +200,7 @@ pub fn check<V: LatestView>(journals: &JournalSet, view: &V) -> LatestViewVerdic
     // like every other row identity here — one tenant's timed-out write must
     // not silently un-judge another tenant's row that happens to share the
     // key string.
-    let unresolved_rows: BTreeSet<RowKey> = journals
-        .changelog_events(TraceEvent::ClientTimeout)
-        .map(|(_, entry)| {
-            (
-                entry.dataset.clone(),
-                entry.tenant.clone(),
-                entry.changelog_key.clone(),
-            )
-        })
-        .collect();
+    let unresolved = unresolved_rows(journals);
 
     let winners = fold_winners(&by_record);
 
@@ -228,22 +225,23 @@ pub fn check<V: LatestView>(journals: &JournalSet, view: &V) -> LatestViewVerdic
 
     let mut checked = 0usize;
     let mut findings = Vec::new();
-    for (row @ (dataset, tenant, key), (_, expected)) in &winners {
-        if unresolved_rows.contains(row) {
+    for (row @ (dataset, tenant, key), winner) in &winners {
+        if unresolved.contains(row) {
             continue;
         }
         checked += 1;
+        let expected = winning_value(winner);
         let served = served_views
             .get(dataset)
             .and_then(|view| view.get(tenant))
             .and_then(|rows| rows.get(key))
             .cloned();
-        if &served != expected {
+        if served != expected {
             findings.push(LatestViewFinding {
                 dataset: dataset.clone(),
                 tenant: tenant.clone(),
                 key: key.clone(),
-                expected: expected.clone(),
+                expected,
                 served,
             });
         }
@@ -273,7 +271,7 @@ pub fn check<V: LatestView>(journals: &JournalSet, view: &V) -> LatestViewVerdic
 /// one sequence number, which makes the fold order itself ill-defined; there
 /// is no correct answer to compare the view against, so the run fails closed
 /// rather than folding whichever copy happened to be journaled first.
-fn dedup_records<'a>(
+pub(crate) fn dedup_records<'a>(
     acked: &[&'a ChangelogEntry],
 ) -> Result<BTreeMap<RecordSlot, &'a ChangelogEntry>, String> {
     let mut by_record: BTreeMap<RecordSlot, &ChangelogEntry> = BTreeMap::new();
@@ -299,32 +297,63 @@ fn dedup_records<'a>(
 }
 
 /// The fold itself: per row, the entry with the greatest `(origin, seq)`
-/// wins; a winning tombstone means the key must be absent from the view
-/// (§7.7), which is what the `None` value means here.
-fn fold_winners(
-    by_record: &BTreeMap<RecordSlot, &ChangelogEntry>,
-) -> BTreeMap<RowKey, (FoldOrder, Option<String>)> {
-    let mut winners: BTreeMap<RowKey, (FoldOrder, Option<String>)> = BTreeMap::new();
-    for entry in by_record.values() {
+/// wins. The WINNING ENTRY is returned rather than just the value it folds
+/// to, because a second reader (`crate::predicates::retention_honesty`)
+/// needs the winner's `(partition, origin, changelog_seq)` to ask whether
+/// retention expired the part that held it — and re-deriving that from a
+/// value would be impossible.
+///
+/// [`winning_value`] turns a winner back into the value the view must serve
+/// (`None` = a tombstone, so the key must be absent — §7.7).
+pub(crate) fn fold_winners<'a>(
+    by_record: &BTreeMap<RecordSlot, &'a ChangelogEntry>,
+) -> BTreeMap<RowKey, &'a ChangelogEntry> {
+    let mut winners: BTreeMap<RowKey, &'a ChangelogEntry> = BTreeMap::new();
+    for entry in by_record.values().copied() {
         let key = (
             entry.dataset.clone(),
             entry.tenant.clone(),
             entry.changelog_key.clone(),
         );
         let order: FoldOrder = (entry.origin.clone(), entry.changelog_seq);
-        let value = if entry.tombstone {
-            None
-        } else {
-            entry.value.clone()
-        };
         match winners.get(&key) {
-            Some((seen, _)) if *seen >= order => {}
+            Some(seen) if (seen.origin.clone(), seen.changelog_seq) >= order => {}
             _ => {
-                winners.insert(key, (order, value));
+                winners.insert(key, entry);
             }
         }
     }
     winners
+}
+
+/// What `<dataset>_latest` must serve for a folded winner: `None` iff the
+/// winner is a tombstone (tombstones delete, §7.7).
+pub(crate) fn winning_value(entry: &ChangelogEntry) -> Option<String> {
+    if entry.tombstone {
+        None
+    } else {
+        entry.value.clone()
+    }
+}
+
+/// Every row whose outcome this run genuinely does not know: a
+/// `ClientTimeout`-borne changelog entry is the loadgen's own "don't know"
+/// bucket (module docs' exclusion note), so such a row cannot be judged in
+/// either direction. Shared with `crate::predicates::retention_honesty`,
+/// which folds the same acked changelog and inherits the same exclusion —
+/// two predicates disagreeing about which rows are knowable would be two
+/// different definitions of the same evidence.
+pub(crate) fn unresolved_rows(journals: &JournalSet) -> BTreeSet<RowKey> {
+    journals
+        .changelog_events(TraceEvent::ClientTimeout)
+        .map(|(_, entry)| {
+            (
+                entry.dataset.clone(),
+                entry.tenant.clone(),
+                entry.changelog_key.clone(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -388,6 +417,7 @@ mod tests {
                 tombstone: entry.value.is_none(),
                 value: entry.value.map(ToOwned::to_owned),
             }),
+            part: None,
         }
     }
 
@@ -569,6 +599,7 @@ mod tests {
             identity: None,
             watermark: None,
             changelog: None,
+            part: None,
         };
         let journals = JournalSet {
             lines: vec![

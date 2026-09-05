@@ -294,6 +294,7 @@ mod tests {
             }),
             watermark: None,
             changelog: None,
+            part: None,
         }
     }
 
@@ -318,6 +319,7 @@ mod tests {
                 identity: None,
                 watermark: None,
                 changelog: None,
+                part: None,
             }],
         };
         assert_eq!(

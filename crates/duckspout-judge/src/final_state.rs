@@ -78,9 +78,23 @@
 //! within one tenant. A key-only read-back type would fold two tenants' rows
 //! for the same key into one and let a correct fleet be convicted.
 
+//! # Committed cold parts (#207)
+//!
+//! [`CommittedParts`] is this module's third read-back surface: which parts
+//! the lake currently holds for a partition. `crate::predicates::retention_honesty`
+//! needs exactly one slice of it — the SNAPSHOT parts and their arrival
+//! coverage — because Keep Rule 10 is a statement about a covering snapshot
+//! existing at expiry time, and §8.4 judges it "against read-back state"
+//! rather than against the expiring node's own account of itself.
+//!
+//! Like [`LatestView`] it is a whole-set query per partition rather than a
+//! per-part probe: the predicate's question is "does ANY committed snapshot
+//! cover this range", which a per-part `contains` cannot answer without the
+//! judge already knowing which snapshot to ask about.
+
 use std::collections::{BTreeMap, HashSet};
 
-use duckspout_types::{DatasetId, TenantId};
+use duckspout_types::{DatasetId, OriginSeqRange, PartName, PartitionId, TenantId};
 use serde::Deserialize;
 
 /// A final-system read-back query failed (ACPR finding MEDIUM-5(b)):
@@ -311,6 +325,119 @@ impl LatestView for InMemoryLatestView {
     }
 }
 
+/// One committed snapshot part, as the lake reports it (module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CommittedSnapshot {
+    /// The changelog dataset the snapshot belongs to.
+    pub dataset: DatasetId,
+    /// The partition the snapshot covers — a snapshot is per-partition
+    /// (§6.7), and Keep Rule 10's covering snapshot must be the expired
+    /// part's OWN partition (`s.part = e.part` in the §3 guard).
+    pub partition: PartitionId,
+    /// The snapshot object's deterministic name (§6.5) — what a finding
+    /// names when it says which snapshot did (or did not) cover.
+    pub part: PartName,
+    /// The arrival range this snapshot folded: per-origin, contiguous seq
+    /// coverage (§6.8). `CoversArrival` is a containment test between this
+    /// and an expired part's own coverage.
+    pub origin_coverage: Vec<OriginSeqRange>,
+}
+
+/// A committed-parts read-back failed (the [`QueryError`] analogue for
+/// [`CommittedParts`], for the same reason both of the others exist: a
+/// failed query is not proof of absence, and treating it as one would
+/// convict a correct fleet of expiring an uncovered part).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("committed-parts query for {dataset} partition {partition} failed: {reason}")]
+pub struct PartsQueryError {
+    /// The dataset whose parts could not be read.
+    pub dataset: DatasetId,
+    /// The partition whose parts could not be read.
+    pub partition: PartitionId,
+    /// A human-readable reason (a real catalog's own error, stringified).
+    pub reason: String,
+}
+
+/// The snapshot parts the lake currently holds for a partition (§6.7).
+pub trait CommittedParts {
+    /// Every committed SNAPSHOT part for `dataset`/`partition`.
+    ///
+    /// # Errors
+    ///
+    /// A [`PartsQueryError`] iff the query itself failed — never merely
+    /// because the partition holds no snapshot (that is `Ok` of an empty
+    /// vector, and it is a violating state when a changelog part was
+    /// expired, so it must reach the predicate as data).
+    fn snapshots(
+        &self,
+        dataset: &DatasetId,
+        partition: &PartitionId,
+    ) -> Result<Vec<CommittedSnapshot>, PartsQueryError>;
+}
+
+/// A test double: the exact snapshot set the lake holds. A partition with no
+/// entry holds NO snapshots rather than failing — "this partition has never
+/// been snapshotted" is a real, and violating, state when a changelog part
+/// was expired out of it, so defaulting to an error here would let a genuine
+/// Keep Rule 10 violation escape as `NoVerdict` instead of `Violation`
+/// (the same call [`InMemoryLatestView`] makes, for the same reason).
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryCommittedParts {
+    snapshots: Vec<CommittedSnapshot>,
+}
+
+impl InMemoryCommittedParts {
+    /// An empty lake: no partition holds any snapshot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds one committed snapshot — builder-style, for compact test setup.
+    #[must_use]
+    pub fn with_snapshot(mut self, snapshot: CommittedSnapshot) -> Self {
+        self.snapshots.push(snapshot);
+        self
+    }
+
+    /// Builds a committed-parts double from a fixture file's JSON text — the
+    /// judge binary's `--committed-parts-fixture` flag, and, like the other
+    /// two fixtures, a DEV/TEST stand-in for a real catalog read-back
+    /// (module docs).
+    ///
+    /// Shape: `{"snapshots": [{"dataset": …, "partition": …, "part": …,
+    /// "origin_coverage": [{"origin": …, "first_seq": …, "last_seq": …}]}]}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`serde_json`] decode error.
+    pub fn from_fixture_json(text: &str) -> Result<Self, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct FixtureFile {
+            snapshots: Vec<CommittedSnapshot>,
+        }
+        let fixture: FixtureFile = serde_json::from_str(text)?;
+        Ok(Self {
+            snapshots: fixture.snapshots,
+        })
+    }
+}
+
+impl CommittedParts for InMemoryCommittedParts {
+    fn snapshots(
+        &self,
+        dataset: &DatasetId,
+        partition: &PartitionId,
+    ) -> Result<Vec<CommittedSnapshot>, PartsQueryError> {
+        Ok(self
+            .snapshots
+            .iter()
+            .filter(|snapshot| &snapshot.dataset == dataset && &snapshot.partition == partition)
+            .cloned()
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +562,73 @@ mod tests {
     #[test]
     fn latest_view_from_fixture_json_rejects_malformed_input() {
         assert!(InMemoryLatestView::from_fixture_json("not json").is_err());
+    }
+
+    #[test]
+    fn a_partition_with_no_snapshots_reads_as_empty_rather_than_failing() {
+        // Deliberate (this type's own docs): "never snapshotted" is a real,
+        // violating state when a changelog part was expired out of the
+        // partition, so it must arrive as data, not as a query failure that
+        // would downgrade a genuine Keep Rule 10 conviction to NoVerdict.
+        let parts = InMemoryCommittedParts::new();
+        assert_eq!(
+            parts.snapshots(&DatasetId::new("d"), &PartitionId::new("p")),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn snapshots_are_scoped_to_their_own_dataset_and_partition() {
+        // Would catch a lookup that let one partition's snapshot vouch for
+        // another's expired part — exactly the `s.part = e.part` conjunct
+        // the §3 guard spells out.
+        let parts = InMemoryCommittedParts::new().with_snapshot(CommittedSnapshot {
+            dataset: DatasetId::new("dim"),
+            partition: PartitionId::new("tenant-a.4"),
+            part: PartName::new("snap-0"),
+            origin_coverage: vec![OriginSeqRange {
+                origin: duckspout_types::NodeId::new("n1"),
+                first_seq: 1,
+                last_seq: 20,
+            }],
+        });
+        assert_eq!(
+            parts
+                .snapshots(&DatasetId::new("dim"), &PartitionId::new("tenant-a.4"))
+                .expect("query")
+                .len(),
+            1
+        );
+        assert!(
+            parts
+                .snapshots(&DatasetId::new("dim"), &PartitionId::new("tenant-a.9"))
+                .expect("query")
+                .is_empty()
+        );
+        assert!(
+            parts
+                .snapshots(&DatasetId::new("other"), &PartitionId::new("tenant-a.4"))
+                .expect("query")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn committed_parts_from_fixture_json_decodes_snapshots() {
+        let parts = InMemoryCommittedParts::from_fixture_json(
+            r#"{"snapshots":[{"dataset":"dim","partition":"t.0","part":"snap-0",
+                 "origin_coverage":[{"origin":"n1","first_seq":1,"last_seq":9}]}]}"#,
+        )
+        .expect("decodes");
+        let found = parts
+            .snapshots(&DatasetId::new("dim"), &PartitionId::new("t.0"))
+            .expect("query");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].origin_coverage[0].last_seq, 9);
+    }
+
+    #[test]
+    fn committed_parts_from_fixture_json_rejects_malformed_input() {
+        assert!(InMemoryCommittedParts::from_fixture_json("not json").is_err());
     }
 }

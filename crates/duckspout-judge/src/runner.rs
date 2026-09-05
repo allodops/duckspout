@@ -8,24 +8,27 @@
 //! [`RunOutcome`], and exits with [`RunOutcome::exit_code`] — every step a
 //! test in `tests/` can also drive directly, without a subprocess.
 //!
-//! # Every predicate runs, every time (#206)
+//! # Every predicate runs, every time (#206, #207)
 //!
-//! With three predicates in the crate, "which ones did this run judge?" is
-//! a question the exit code must not hide. There is deliberately no
-//! `--predicate` selection flag: the judge runs all of them and reports one
-//! [`PredicateReport`] each, and the run's exit code is
-//! `crate::verdict::combined_exit_code` over the lot. A predicate given no
-//! evidence reports `NoVerdict`, so a run that fed only loadgen journals
-//! and a final-state fixture exits `3` even when zero-acked-lost passes —
-//! honestly, because such a run certifies nothing about watermark honesty
-//! or the latest view. Anything else would be "skipped ≠ passed" (§8.4)
-//! smuggled in through a command-line knob.
+//! With all five of `docs/verification.md` §8.4's judges in the crate,
+//! "which ones did this run judge?" is a question the exit code must not
+//! hide. There is deliberately no `--predicate` selection flag: the judge
+//! runs all of them and reports one [`PredicateReport`] each, and the run's
+//! exit code is `crate::verdict::combined_exit_code` over the lot. A
+//! predicate given no evidence reports `NoVerdict`, so a run that fed only
+//! loadgen journals and a final-state fixture exits `3` even when
+//! zero-acked-lost passes — honestly, because such a run certifies nothing
+//! about watermark honesty, the latest view, retention, or cache
+//! transparency. Anything else would be "skipped ≠ passed" (§8.4) smuggled
+//! in through a command-line knob.
 
 use std::path::PathBuf;
 
-use crate::final_state::{InMemoryFinalState, InMemoryLatestView};
+use crate::final_state::{InMemoryCommittedParts, InMemoryFinalState, InMemoryLatestView};
 use crate::journal::{JournalSet, ingest_journals};
-use crate::predicates::{latest_view, watermark_honesty, zero_acked_lost};
+use crate::predicates::{
+    cache_transparency, latest_view, retention_honesty, watermark_honesty, zero_acked_lost,
+};
 use crate::read_log::{ReadRecord, parse_read_log};
 use crate::summary::{self, SummaryFinding};
 use crate::verdict::{Verdict, combined_exit_code};
@@ -48,9 +51,18 @@ pub struct RunArgs {
     /// DEV/TEST ONLY: a `LatestView` fixture JSON (`crate::final_state`),
     /// standing in for a `<dataset>_latest` read-back.
     pub latest_view_fixture: Option<PathBuf>,
+    /// DEV/TEST ONLY: a `CommittedParts` fixture JSON
+    /// (`crate::final_state`), standing in for the lake's own read-back of
+    /// which snapshot parts it holds. `None` leaves retention honesty with
+    /// no covering set to check the journaled expiries against.
+    pub committed_parts_fixture: Option<PathBuf>,
     /// Ceiling on the loadgen run summary's ambiguous-outcome fraction
     /// (`crate::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION` docs).
     pub max_ambiguous_fraction: f64,
+    /// Absolute latency ceiling for a read that raced a residency action
+    /// (`crate::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS`
+    /// docs).
+    pub max_racing_read_ms: u64,
 }
 
 /// One predicate's verdict, named.
@@ -136,6 +148,8 @@ pub fn run(args: &RunArgs) -> RunOutcome {
             zero_acked_lost_report(args, &journals),
             watermark_honesty_report(&journals, &reads),
             latest_view_report(args, &journals),
+            retention_honesty_report(args, &journals),
+            cache_transparency_report(args, &journals, &reads),
         ],
     }
 }
@@ -203,6 +217,51 @@ fn latest_view_report(args: &RunArgs, journals: &JournalSet) -> PredicateReport 
     }
 }
 
+/// Retention honesty needs BOTH read-backs — the lake's snapshot set for
+/// obligation (A) and the served latest view for obligation (B) — so a
+/// missing either one is that predicate's own `NoVerdict`, named precisely
+/// enough that an operator knows which fixture to supply.
+fn retention_honesty_report(args: &RunArgs, journals: &JournalSet) -> PredicateReport {
+    let parts = load_fixture(
+        args.committed_parts_fixture.as_ref(),
+        "no --committed-parts-fixture was given, and no real lake read-back is wired yet \
+         (crate::final_state's scope note) — this predicate had no committed snapshot set to \
+         check the journaled expiries against",
+        InMemoryCommittedParts::from_fixture_json,
+    );
+    let view = load_fixture(
+        args.latest_view_fixture.as_ref(),
+        "no --latest-view-fixture was given, and no real `<dataset>_latest` read-back is wired \
+         yet (crate::final_state's scope note) — this predicate could not tell whether an \
+         expiry made an acked record's last value unreachable",
+        InMemoryLatestView::from_fixture_json,
+    );
+    let verdict = match (parts, view) {
+        (Ok(parts), Ok(view)) => retention_honesty::check(journals, &parts, &view).erase(),
+        (Err(reason), _) | (Ok(_), Err(reason)) => Verdict::NoVerdict(reason),
+    };
+    PredicateReport {
+        predicate: "retention-honesty",
+        verdict,
+    }
+}
+
+/// Cache transparency reads no fixture: its evidence is the read log's cache
+/// probes and the journals' own residency actions, both of which the
+/// predicate itself downgrades to `NoVerdict` when absent — the same call
+/// `watermark_honesty_report` makes, for the same reason (one code path, one
+/// verdict, whether the evidence was never given or was given empty).
+fn cache_transparency_report(
+    args: &RunArgs,
+    journals: &JournalSet,
+    reads: &[ReadRecord],
+) -> PredicateReport {
+    PredicateReport {
+        predicate: "cache-transparency",
+        verdict: cache_transparency::check(journals, reads, args.max_racing_read_ms).erase(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -221,7 +280,9 @@ mod tests {
             final_state_fixture: None,
             read_log: None,
             latest_view_fixture: None,
+            committed_parts_fixture: None,
             max_ambiguous_fraction: summary::DEFAULT_MAX_AMBIGUOUS_FRACTION,
+            max_racing_read_ms: crate::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS,
         }
     }
 
@@ -272,7 +333,7 @@ mod tests {
             } => {
                 assert_eq!(*journal_count, 1);
                 assert_eq!(*line_count, 1);
-                assert_eq!(reports.len(), 3);
+                assert_eq!(reports.len(), 5);
                 assert!(
                     reports
                         .iter()

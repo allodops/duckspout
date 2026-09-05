@@ -142,34 +142,50 @@ pub fn node_name(seed: u64, index: u16) -> String {
     format!("fleet-{seed}-{index}")
 }
 
-/// Per-node backend-address overrides: where THIS node reaches the shared
-/// catalog and lake, when the fleet has put a [`crate::link::FaultLink`] in
-/// front of one of them (§8.4, issue #204). `None` means "dial the real
-/// backend directly," which is every node in a run with no network fault
-/// armed against it — the links are created only where a fault needs one,
-/// so an unfaulted run's byte path is exactly what it was before #204.
+/// Per-node deviations from the fleet-wide [`FleetPlan`]: which backend
+/// addresses THIS node dials, and which of its own knobs a fault has tuned.
+/// Every field `None` means "exactly the plan", which is every node in a run
+/// with no fault armed against it — so an unfaulted run's rendered config is
+/// bit-for-bit what it was before any of this existed.
+///
+/// Renamed from `BackendOverrides` by #207: with `hot_window` here it is no
+/// longer only about backends, and a struct whose name contradicts one of
+/// its fields is how a reader learns to stop trusting the names.
 #[derive(Debug, Clone, Default)]
-pub struct BackendOverrides {
+pub struct NodeOverrides {
     /// Replaces [`FleetPlan::postgres_dsn`]'s host/port for this node
-    /// (`crate::main`'s `rewrite_postgres_dsn_host_port`).
+    /// (`crate::main`'s `rewrite_postgres_dsn_host_port`) — set when a
+    /// [`crate::link::FaultLink`] sits in front of its catalog (#204).
     pub postgres_dsn: Option<String>,
     /// Replaces the `lake.s3_endpoint` this node dials — irrelevant under
     /// [`LakeStorage::Local`], which has no network at all.
     pub s3_endpoint: Option<String>,
+    /// Replaces [`FleetPlan::hot_window`] for this node alone (#207's
+    /// cache-churn fault). Shortening one node's `hot.window` is what makes
+    /// its windows seal, drain and `DropWindow` densely enough for a read to
+    /// actually race one — the same "boot exactly the target node with the
+    /// knob the fault needs" shape `--fault-kill-mid-drain` already uses for
+    /// `--fault-drain-commit-delay-ms` (`crate::fault`'s module docs).
+    ///
+    /// It is an existing, ratcheted §9.6.1 setting (`hot.window`), not a new
+    /// knob: the fault tunes the daemon's real drain cadence rather than
+    /// asking it for a back door.
+    pub hot_window: Option<String>,
 }
 
 /// Renders `node`'s complete `duckspout-daemon` TOML config against `plan`
 /// and the fleet's other members (for `cluster.seed_peers`) — module docs
 /// on why this is hand-rolled text rather than a `Serialize`d struct.
-/// `overrides` redirects this one node's catalog/lake addresses through the
-/// fleet's fault links where it has any ([`BackendOverrides`]).
+/// `overrides` applies this one node's deviations from the plan — fault-link
+/// catalog/lake addresses, and a fault-shortened `hot.window`
+/// ([`NodeOverrides`]).
 #[must_use]
 #[allow(clippy::unnecessary_debug_formatting)] // `{:?}` quotes/escapes paths for TOML string literals — `.display()` would emit them unquoted and invalid
 pub fn render_node_config(
     plan: &FleetPlan,
     node: &NodeSpec,
     all_nodes: &[NodeSpec],
-    overrides: &BackendOverrides,
+    overrides: &NodeOverrides,
 ) -> String {
     let seed_peers: Vec<String> = all_nodes
         .iter()
@@ -222,7 +238,7 @@ pub fn render_node_config(
             .unwrap_or(&plan.postgres_dsn),
         password_file = plan.postgres_password_file,
         tls = tls_placeholder,
-        hot_window = plan.hot_window,
+        hot_window = overrides.hot_window.as_deref().unwrap_or(&plan.hot_window),
         allowed_lateness = plan.allowed_lateness,
     );
 
@@ -291,7 +307,7 @@ mod tests {
         let plan = plan_with_local_lake(tmp.join("lake"), password_file);
 
         for node in &nodes {
-            let rendered = render_node_config(&plan, node, &nodes, &BackendOverrides::default());
+            let rendered = render_node_config(&plan, node, &nodes, &NodeOverrides::default());
             std::fs::write(&node.config_path, &rendered).unwrap();
             let loaded = duckspout_daemon::config::load(Some(&node.config_path))
                 .unwrap_or_else(|e| panic!("node {}: {e}\n---\n{rendered}", node.index));
@@ -341,7 +357,7 @@ mod tests {
             },
             ..plan_with_local_lake(tmp.join("unused"), password_file)
         };
-        let rendered = render_node_config(&plan, &nodes[0], &nodes, &BackendOverrides::default());
+        let rendered = render_node_config(&plan, &nodes[0], &nodes, &NodeOverrides::default());
         std::fs::write(&nodes[0].config_path, &rendered).unwrap();
         let loaded = duckspout_daemon::config::load(Some(&nodes[0].config_path))
             .unwrap_or_else(|e| panic!("{e}\n---\n{rendered}"));
@@ -351,7 +367,7 @@ mod tests {
         assert!(loaded.lake.s3_secret_access_key_file.is_some());
     }
 
-    /// The whole point of [`BackendOverrides`] (issue #204): a node whose
+    /// The whole point of [`NodeOverrides`] (issue #204): a node whose
     /// catalog and lake are reached through fault links must have THOSE
     /// addresses in its real config — proven through the real loader, so a
     /// rendering that silently kept the direct address (leaving every
@@ -376,9 +392,10 @@ mod tests {
             },
             ..plan_with_local_lake(tmp.join("unused"), password_file)
         };
-        let overrides = BackendOverrides {
+        let overrides = NodeOverrides {
             postgres_dsn: Some("postgres://duckspout@127.0.0.1:34567/duckspout_catalog".to_owned()),
             s3_endpoint: Some("127.0.0.1:34568".to_owned()),
+            hot_window: None,
         };
 
         let rendered = render_node_config(&plan, &nodes[0], &nodes, &overrides);
@@ -390,6 +407,37 @@ mod tests {
             "postgres://duckspout@127.0.0.1:34567/duckspout_catalog"
         );
         assert_eq!(loaded.lake.s3_endpoint.as_deref(), Some("127.0.0.1:34568"));
+        // The plan's own window, unoverridden — the baseline the next test
+        // varies exactly one field away from.
+        assert_eq!(loaded.hot.window, "5s");
+    }
+
+    /// The cache-churn fault's forcing mechanism, checked against the REAL
+    /// config loader (#207): a per-node `hot.window` override must actually
+    /// reach `hot.window` in the loaded struct, and must not disturb the
+    /// backend addresses beside it. Would catch an override that rendered
+    /// into the wrong section, or one silently ignored in favour of the
+    /// fleet-wide plan — either of which would leave the churn fault firing
+    /// at the plan's cadence and, quite possibly, journaling no residency
+    /// action at all.
+    #[test]
+    fn a_per_node_hot_window_override_reaches_the_real_loader() {
+        let tmp = tempfile_dir();
+        let password_file = tmp.join("pg-password-hot-window");
+        std::fs::write(&password_file, "duckspout-dev").unwrap();
+        let nodes = provision_nodes(&tmp, 12, 1, 14317, 18815, 17946, 19095).unwrap();
+        let plan = plan_with_local_lake(tmp.join("lake"), password_file);
+        let overrides = NodeOverrides {
+            hot_window: Some("250ms".to_owned()),
+            ..NodeOverrides::default()
+        };
+
+        let rendered = render_node_config(&plan, &nodes[0], &nodes, &overrides);
+        std::fs::write(&nodes[0].config_path, &rendered).unwrap();
+        let loaded = duckspout_daemon::config::load(Some(&nodes[0].config_path))
+            .unwrap_or_else(|e| panic!("{e}\n---\n{rendered}"));
+        assert_eq!(loaded.hot.window, "250ms");
+        assert_eq!(loaded.catalog.dsn, plan.postgres_dsn);
     }
 
     #[test]

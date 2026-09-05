@@ -11,6 +11,7 @@
 //! | Flight-server kill mid-stream | "a hot query's stream dies" | [`run_flight_kill_mid_stream`] | #204 |
 //! | Catalog outage | "ingest must continue undegraded; drains stall and disclose" | [`run_catalog_outage`] | #204 |
 //! | Discovery flapping | "`ClaimAdvertise`/`Heartbeat` oscillation" | [`run_discovery_flap`] | #204 |
+//! | Cache/residency churn | "forced Evict/Demote churn and `DropWindow` racing queries" | [`run_cache_churn`] | #207 |
 //!
 //! Each injector runs against a real `duckspout-daemon` process spawned by
 //! [`crate::process`] and/or a real network link owned by [`crate::link`],
@@ -90,6 +91,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use arrow_flight::Ticket;
 use arrow_flight::flight_service_client::FlightServiceClient;
+use duckspout_types::TraceEvent;
 
 use crate::faultlog::{FaultKind, FaultLog};
 use crate::link::{FaultLink, LinkConditions, LinkStats};
@@ -962,6 +964,389 @@ pub async fn run_flight_kill_mid_stream(
     Ok(())
 }
 
+/// The three §3 post-drain residency actions (§2.4, §6.9) — the set
+/// [`run_cache_churn`] counts in a target's own D-6 journal, and exactly the
+/// set `duckspout_judge::journal::JournalSet::residency_action_count` counts
+/// on the grading side. One vocabulary, two readers.
+///
+/// The events are named by their [`TraceEvent`] VARIANTS, not by string
+/// literals, so this list cannot drift from the frozen §3.3 vocabulary: the
+/// journal token each one is written as is `format!("{variant:?}")`, which
+/// `duckspout_types::trace`'s own
+/// `every_event_serializes_as_its_verbatim_action_name` test pins for all 28
+/// variants. The second element is the key the count is journaled under in
+/// this crate's `faults.ndjson` detail object — an ordinary `snake_case` JSON
+/// key, deliberately not the action name, because the fault log is this
+/// crate's informal channel and not a D-6 journal (`crate::faultlog`'s own
+/// framing).
+const RESIDENCY_EVENTS: [(TraceEvent, &str); 3] = [
+    (TraceEvent::Demote, "demote"),
+    (TraceEvent::Evict, "evict"),
+    (TraceEvent::DropWindow, "drop_window"),
+];
+
+/// One cache-churn window's observed residency activity — the real counts,
+/// per event, from the target's own journal, positionally aligned with
+/// [`RESIDENCY_EVENTS`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ResidencyCounts([u64; RESIDENCY_EVENTS.len()]);
+
+impl ResidencyCounts {
+    /// Reads `journal_path` and counts each residency event in it, skipping
+    /// the first `skip_lines` lines so a window measures only what happened
+    /// inside it (the same anchoring [`wait_for_journal_event`] needs, for
+    /// the same reason).
+    ///
+    /// Never errors: a journal that does not exist yet, or a torn last line
+    /// mid-write, both read as "nothing counted" — a fault log must never
+    /// fail the fleet run over a best-effort observation.
+    fn since(journal_path: &std::path::Path, skip_lines: u64) -> Self {
+        let Ok(contents) = std::fs::read_to_string(journal_path) else {
+            return Self::default();
+        };
+        let mut counts = Self::default();
+        for line in contents
+            .lines()
+            .skip(usize::try_from(skip_lines).unwrap_or(usize::MAX))
+        {
+            let Some(event) = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("event")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+            else {
+                continue;
+            };
+            if let Some(index) = RESIDENCY_EVENTS
+                .iter()
+                .position(|(variant, _)| event_token(*variant) == event)
+            {
+                counts.0[index] += 1;
+            }
+        }
+        counts
+    }
+
+    /// How many times `event` was journaled — `0` for an event that is not a
+    /// residency action at all.
+    ///
+    /// Test-only: production code reads the whole set through
+    /// [`ResidencyCounts::to_json`] and [`ResidencyCounts::total`], and a
+    /// per-event accessor with no production caller would be dead weight
+    /// in the shipped binary.
+    #[cfg(test)]
+    fn of(self, event: TraceEvent) -> u64 {
+        RESIDENCY_EVENTS
+            .iter()
+            .position(|(variant, _)| *variant == event)
+            .map_or(0, |index| self.0[index])
+    }
+
+    /// How many residency actions of any kind — the judge-side cache-state
+    /// label's own definition.
+    fn total(self) -> u64 {
+        self.0.iter().sum()
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        for ((_, key), count) in RESIDENCY_EVENTS.iter().zip(self.0) {
+            out.insert((*key).to_owned(), serde_json::json!(count));
+        }
+        out.insert("total".to_owned(), serde_json::json!(self.total()));
+        serde_json::Value::Object(out)
+    }
+}
+
+/// The exact token `event` is written as in a node's own D-6 journal
+/// ([`RESIDENCY_EVENTS`]' own note on why `Debug` is the authority here).
+fn event_token(event: TraceEvent) -> String {
+    format!("{event:?}")
+}
+
+/// What the racing reads observed across one cache-churn window.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReadTally {
+    issued: u64,
+    served: u64,
+    failed: u64,
+    max_latency_ms: u64,
+    /// Reads whose own residency-op count moved between issue and
+    /// completion — the ones that genuinely overlapped a residency action,
+    /// which is what obligation (c) is about.
+    raced: u64,
+}
+
+impl ReadTally {
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "issued": self.issued,
+            "served": self.served,
+            "failed": self.failed,
+            "raced_residency_action": self.raced,
+            "max_latency_ms": self.max_latency_ms,
+        })
+    }
+}
+
+/// Runs one real cache/residency-churn fault (§8.4, issue #207): the target
+/// node's post-drain residency is churned under load while real Arrow Flight
+/// reads run through the same engine.
+///
+/// # The forcing mechanism, and why it is not a back door
+///
+/// §8.4 asks for "forced Evict/Demote churn and `DropWindow` racing
+/// queries". The forcing here is the daemon's OWN drain cadence, tuned
+/// through its own ratcheted setting: the target is booted with a shortened
+/// `hot.window` (`--fault-cache-churn-hot-window`, applied to that one node
+/// via [`crate::topology::NodeOverrides`]), so under sustained drive load its
+/// windows seal, drain, commit and `DropWindow` every window period instead
+/// of every minute. Nothing is simulated and no debug hook is added: the
+/// residency actions this window counts are the real ones
+/// `duckspout_drain::coordinator` journals after a real durable
+/// `LakeCommit`.
+///
+/// A daemon-side hook (a `--fault-*` decorator like
+/// `duckspout_daemon::fault::StallingLakeCommitter`) was considered and
+/// rejected: there is nothing for it to decorate. `DropWindow` already fires
+/// on every drain, so the honest lever is the cadence, and shortening a
+/// window is a configuration the daemon already supports and a real
+/// deployment can legitimately choose.
+///
+/// # What this can and cannot force at v0.2 (disclosed, not papered over)
+///
+/// Of the three residency actions, **only `DropWindow` can fire today**, and
+/// the reason is a settled design decision rather than a gap this injector
+/// declined to close:
+///
+/// - `docs/design/data-model.md` §2.4: "v1's cache class is **empty by
+///   construction** (`DropWindow` at drain commit)". A drained window is
+///   dropped, never demoted, so no cache-class table ever exists.
+/// - `docs/deferred.md`'s warm-retention row parks the whole residency
+///   mechanism — SLRU, the `residency` attribute, rung-0 eviction — behind a
+///   v0.4 experiment with a named trigger.
+/// - Consequently `duckspout_types::TraceEvent::{Demote, Evict}` have no
+///   emitter anywhere in this workspace.
+///
+/// Making them fire would mean implementing warm retention, which is exactly
+/// the settled deferral `AGENTS.md` forbids re-litigating in a PR. So this
+/// injector counts all three events and journals all three counts —
+/// `demote: 0, evict: 0` is the honest, machine-readable record of that
+/// state, and the day the cache class activates the same injector starts
+/// reporting non-zero without a line changing. This is the same shape #203
+/// disclosed for `FencedZombie` and #204 for discovery flapping: the fault
+/// is real now, and the part of the predicate that needs unbuilt composition
+/// says so rather than pretending.
+///
+/// What IS being exercised for real, and is not a lesser thing: `DropWindow`
+/// is the transition where a window stops being served from staging and
+/// starts being served from the lake — §2.4 obligation (b)'s "exactly one
+/// side serves any window — staging XOR lake/cache" boundary, crossed under
+/// a live read. That is precisely the read-path interleaving
+/// `specs/formal-core.md`'s `CacheTransparency` note hands to §8.4 ("eviction
+/// interleavings stress the read-path equivalence, which is §8.4's job, not
+/// this formula's").
+///
+/// # Why the reads are what they are
+///
+/// The default query (`--fault-cache-churn-query`) reads the staging
+/// engine's own window registry, which `DropWindow`'s transaction deletes
+/// from in the same transaction as its `DROP TABLE`
+/// (`duckspout_staging::engine`). A read of a table the churn is actively
+/// writing is the one that would show a held lock; a query over `range()`
+/// would touch nothing the churn touches and would prove nothing about
+/// obligation (c).
+///
+/// The reads go through a real Flight `DoGet` on a real dedicated read
+/// connection (§7.8, #114) — the same client construction
+/// [`run_flight_kill_mid_stream`] uses. Each read is bracketed by a
+/// residency-op count read out of the target's own journal, so a read that
+/// really overlapped an action is distinguishable from one that did not.
+///
+/// This injector deliberately does NOT write `duckspout-judge`'s read log:
+/// the daemon's read surface is hot-only, with no read concern and no
+/// coverage pinning (`duckspout_daemon::serving`'s #113 gap), so there is no
+/// `complete` read here to log, and inventing a `complete_through_ms` for
+/// one would be manufacturing the exact evidence the judge is supposed to
+/// weigh. The observations go into this window's own `Ended` line instead,
+/// where they are what they are: a fleet runner's record, not a verdict
+/// (§8.4 — this binary never makes one).
+///
+/// # Errors
+///
+/// If no residency action is observed inside the window at all. A churn
+/// fault that churned nothing fired vacuously (§8.4's vacuity teeth), and
+/// journaling an `Ended` line for it would record a storm that never
+/// happened — the same fail-closed posture [`run_sigstop_pause`] takes when
+/// it cannot confirm its own pause. Flight-side failures are NOT errors:
+/// a refused or errored read is an OBSERVATION about the system under churn,
+/// journaled and left to the judge.
+pub async fn run_cache_churn(
+    fault_id: &str,
+    target: &NodeSpec,
+    query: &str,
+    delay: Duration,
+    duration: Duration,
+    read_interval: Duration,
+    log: &FaultLog,
+) -> anyhow::Result<()> {
+    let target_node = rendered_node_id(target);
+    let endpoint = format!("http://127.0.0.1:{}", target.flight_port);
+    let anchor = node_journal_line_count(&target.journal_path);
+    log.armed(
+        fault_id,
+        FaultKind::CacheChurn,
+        &target_node,
+        Some(serde_json::json!({
+            "flight_endpoint": endpoint,
+            "query": query,
+            "planned_duration_ms": duration.as_millis(),
+            "residency_events_watched": RESIDENCY_EVENTS
+                .iter()
+                .map(|(event, _)| event_token(*event))
+                .collect::<Vec<_>>(),
+            "node_journal_lines": anchor,
+        })),
+    );
+
+    tokio::time::sleep(delay).await;
+
+    // The window opens where the reads start, not where the injector armed:
+    // everything the drive-load pass drained during `delay` belongs to
+    // neither the baseline nor the storm.
+    let window_start = node_journal_line_count(&target.journal_path);
+    log.started(
+        fault_id,
+        FaultKind::CacheChurn,
+        &target_node,
+        Some(serde_json::json!({
+            "node_journal_lines": window_start,
+            // What the node churned between arming and the window opening —
+            // NOT part of the window's own counts below, and journaled so a
+            // reader can tell a node that was already churning from one this
+            // fault had to get going.
+            "residency_actions_before_window": ResidencyCounts::since(
+                &target.journal_path,
+                anchor,
+            )
+            .to_json(),
+        })),
+    );
+
+    let tally = drive_racing_reads(&endpoint, target, query, duration, read_interval).await;
+    let observed = ResidencyCounts::since(&target.journal_path, window_start);
+
+    log.ended(
+        fault_id,
+        FaultKind::CacheChurn,
+        &target_node,
+        Some(serde_json::json!({
+            "residency_actions_during_window": observed.to_json(),
+            "reads_during_window": tally.to_json(),
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    anyhow::ensure!(
+        observed.total() > 0,
+        "fault {fault_id}: node {target_node} journaled no Demote/Evict/DropWindow line during \
+         the whole {duration:?} churn window — the storm never happened, so this fault fired \
+         vacuously (§8.4). Check that the drive load is still running and that \
+         --fault-cache-churn-hot-window is short enough for a window to seal and drain inside \
+         the window's duration."
+    );
+    Ok(())
+}
+
+/// Issues real Flight reads against `endpoint` for `duration`, bracketing
+/// each one by the target's own residency-op count (module docs of
+/// [`run_cache_churn`]).
+///
+/// Best-effort by construction: a connection that cannot be established, a
+/// refused ticket and a stream that errors mid-read are all counted as
+/// FAILED reads rather than propagated, because each of them is exactly the
+/// kind of thing §2.4's obligation (c) is about and the runner does not get
+/// to decide whether it was a violation.
+async fn drive_racing_reads(
+    endpoint: &str,
+    target: &NodeSpec,
+    query: &str,
+    duration: Duration,
+    read_interval: Duration,
+) -> ReadTally {
+    let mut tally = ReadTally::default();
+    let deadline = tokio::time::Instant::now() + duration;
+    let client = match tonic::transport::Endpoint::from_shared(endpoint.to_owned()) {
+        Ok(channel) => match channel.connect().await {
+            Ok(channel) => Some(FlightServiceClient::new(channel)),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let Some(mut client) = client else {
+        // Not reachable at all: every read this window would have issued is
+        // a failed one, and the `Ended` line will show `issued == failed`.
+        //
+        // The window still runs its FULL duration rather than collapsing to
+        // zero: the residency storm is the daemon's own drain loop, which is
+        // churning whether or not this injector can reach the Flight port,
+        // and cutting the window short would report a real storm as a
+        // vacuous one purely because the read half could not connect. The
+        // two halves are journaled separately for exactly this reason.
+        tally.issued = 1;
+        tally.failed = 1;
+        tokio::time::sleep_until(deadline).await;
+        return tally;
+    };
+
+    while tokio::time::Instant::now() < deadline {
+        let before = ResidencyCounts::since(&target.journal_path, 0).total();
+        let started = tokio::time::Instant::now();
+        let outcome = read_once(&mut client, query).await;
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let after = ResidencyCounts::since(&target.journal_path, 0).total();
+
+        tally.issued += 1;
+        if outcome {
+            tally.served += 1;
+        } else {
+            tally.failed += 1;
+        }
+        if after > before {
+            tally.raced += 1;
+        }
+        tally.max_latency_ms = tally.max_latency_ms.max(latency_ms);
+
+        tokio::time::sleep(read_interval).await;
+    }
+    tally
+}
+
+/// One real Flight read, drained to completion. `true` iff the whole stream
+/// arrived without a typed error.
+async fn read_once(
+    client: &mut FlightServiceClient<tonic::transport::Channel>,
+    query: &str,
+) -> bool {
+    let Ok(response) = client
+        .do_get(Ticket::new(query.to_owned().into_bytes()))
+        .await
+    else {
+        return false;
+    };
+    let mut stream = response.into_inner();
+    loop {
+        match stream.message().await {
+            Ok(Some(_)) => {}
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
 /// `(label, upstream)` for every link a fault window covers — the journal's
 /// own record of exactly which real network edges it cut.
 fn link_descriptions(links: &[&FaultLink]) -> Vec<serde_json::Value> {
@@ -1148,6 +1533,197 @@ mod tests {
             .iter()
             .map(|line| line["phase"].as_str().unwrap())
             .collect()
+    }
+
+    /// Writes `text` as a node's own D-6 journal and returns its path.
+    fn write_node_journal(label: &str, text: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "duckspout-fleet-fault-test-{}-{label}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.ndjson");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        path
+    }
+
+    /// The residency counter reads exactly the three §3 post-drain actions
+    /// out of a real NDJSON journal, and nothing else. Would catch a counter
+    /// that swept in every line (making an idle node look like a storm) or
+    /// that missed `Demote`/`Evict` — the two that cannot fire yet, and
+    /// whose day-one arrival must not need a code change here
+    /// (`run_cache_churn`'s own disclosure).
+    #[test]
+    fn the_residency_counter_counts_exactly_the_three_post_drain_actions() {
+        let path = write_node_journal(
+            "residency-counts",
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n\
+             {\"node\":\"n1\",\"seq\":1,\"event\":\"DropWindow\"}\n\
+             {\"node\":\"n1\",\"seq\":2,\"event\":\"Demote\"}\n\
+             {\"node\":\"n1\",\"seq\":3,\"event\":\"Evict\"}\n\
+             {\"node\":\"n1\",\"seq\":4,\"event\":\"DropWindow\"}\n\
+             {\"node\":\"n1\",\"seq\":5,\"event\":\"LakeCommitOk\"}\n",
+        );
+        let counts = ResidencyCounts::since(&path, 0);
+        assert_eq!(counts.of(TraceEvent::DropWindow), 2);
+        assert_eq!(counts.of(TraceEvent::Demote), 1);
+        assert_eq!(counts.of(TraceEvent::Evict), 1);
+        assert_eq!(counts.total(), 4);
+        // A non-residency action is not a residency action — would catch a
+        // counter that swept in every journaled line.
+        assert_eq!(counts.of(TraceEvent::Accept), 0);
+    }
+
+    /// The watched set is derived from the frozen [`TraceEvent`] vocabulary,
+    /// not from hand-written strings ([`RESIDENCY_EVENTS`]' own note). Would
+    /// catch a token that drifted from what a node actually journals — a
+    /// churn window would then silently count nothing and report every real
+    /// storm as vacuous.
+    #[test]
+    fn the_watched_event_tokens_are_the_frozen_action_names() {
+        let tokens: Vec<String> = RESIDENCY_EVENTS
+            .iter()
+            .map(|(event, _)| event_token(*event))
+            .collect();
+        assert_eq!(tokens, vec!["Demote", "Evict", "DropWindow"]);
+    }
+
+    /// The window anchor is load-bearing: a churn window must count only
+    /// what happened INSIDE it, never the drains the drive-load pass already
+    /// did while the injector was waiting out its delay. Would catch an
+    /// injector that inherited a pre-window storm and reported a vacuous
+    /// window as a real one.
+    #[test]
+    fn the_residency_counter_ignores_everything_before_the_windows_anchor() {
+        let path = write_node_journal(
+            "residency-anchor",
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"DropWindow\"}\n\
+             {\"node\":\"n1\",\"seq\":1,\"event\":\"DropWindow\"}\n\
+             {\"node\":\"n1\",\"seq\":2,\"event\":\"DropWindow\"}\n",
+        );
+        assert_eq!(ResidencyCounts::since(&path, 0).total(), 3);
+        assert_eq!(ResidencyCounts::since(&path, 2).total(), 1);
+        assert_eq!(ResidencyCounts::since(&path, 3).total(), 0);
+    }
+
+    /// A journal that does not exist yet — or a torn last line mid-write —
+    /// counts as nothing rather than erroring: a best-effort observation
+    /// must never fail the fleet run (its own docs).
+    #[test]
+    fn a_missing_or_torn_journal_counts_as_nothing_rather_than_failing() {
+        assert_eq!(
+            ResidencyCounts::since(
+                std::path::Path::new("/nonexistent/duckspout-fleet-churn-journal.ndjson"),
+                0
+            )
+            .total(),
+            0
+        );
+        let torn = write_node_journal(
+            "residency-torn",
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"DropWindow\"}\n{\"node\":\"n1\",\"se",
+        );
+        assert_eq!(ResidencyCounts::since(&torn, 0).total(), 1);
+    }
+
+    /// A churn window that observed no residency action at all must FAIL,
+    /// not journal a clean `Ended` line: a storm that never happened is
+    /// exactly §8.4's vacuous fault, and recording it as a completed window
+    /// would tell a judge the run exercised something it did not. The
+    /// `Ended` line is still written first, so the run's own journal shows
+    /// the zero counts that justify the failure.
+    #[tokio::test]
+    async fn a_churn_window_that_churned_nothing_fails_closed() {
+        let (log_path, log) = scratch_faultlog("cache-churn-vacuous");
+        let mut spec = test_support::dummy_spec();
+        spec.journal_path = write_node_journal(
+            "residency-idle",
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n",
+        );
+        // Port 1 is not bound by anything here, so every read fails — which
+        // is an observation, not an error (the injector's own docs); the
+        // failure below must come from the ABSENT residency actions.
+        spec.flight_port = 1;
+
+        let error = run_cache_churn(
+            "cache-churn-0",
+            &spec,
+            "SELECT 1",
+            Duration::ZERO,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            &log,
+        )
+        .await
+        .expect_err("a churn window that churned nothing must fail closed");
+        assert!(error.to_string().contains("vacuously"), "error: {error:#}");
+
+        let lines = window_lines(&log_path, "cache-churn-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        let ended = lines.last().unwrap();
+        assert_eq!(
+            ended["detail"]["residency_actions_during_window"]["total"],
+            0
+        );
+        assert_eq!(ended["detail"]["reads_during_window"]["served"], 0);
+    }
+
+    /// The `Ended` line reports the real counts it observed, per event —
+    /// including the `demote`/`evict` zeros that are the honest record of
+    /// v1's empty-by-construction cache class (`run_cache_churn`'s
+    /// disclosure). Would catch an injector that reported only a total, or
+    /// that omitted the two events it cannot yet see, either of which would
+    /// leave a judge unable to tell "no cache class" from "cache class that
+    /// never churned".
+    #[tokio::test]
+    async fn a_churn_window_journals_every_residency_event_it_watched() {
+        let (log_path, log) = scratch_faultlog("cache-churn-counts");
+        let mut spec = test_support::dummy_spec();
+        spec.flight_port = 1;
+        // The journal already holds one pre-window action, and gains two
+        // more that the window itself must be the one to count.
+        spec.journal_path = write_node_journal(
+            "residency-during",
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"DropWindow\"}\n",
+        );
+        let journal_path = spec.journal_path.clone();
+        let appender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal_path)
+                .unwrap();
+            file.write_all(
+                b"{\"node\":\"n1\",\"seq\":1,\"event\":\"DropWindow\"}\n\
+                  {\"node\":\"n1\",\"seq\":2,\"event\":\"DropWindow\"}\n",
+            )
+            .unwrap();
+        });
+
+        run_cache_churn(
+            "cache-churn-0",
+            &spec,
+            "SELECT 1",
+            Duration::ZERO,
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+            &log,
+        )
+        .await
+        .expect("a window that observed real residency actions must succeed");
+        appender.await.unwrap();
+
+        let lines = window_lines(&log_path, "cache-churn-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        let observed = &lines.last().unwrap()["detail"]["residency_actions_during_window"];
+        assert_eq!(observed["drop_window"], 2);
+        assert_eq!(
+            observed["demote"], 0,
+            "v1's cache class is empty by construction — the zero must be journaled, not omitted"
+        );
+        assert_eq!(observed["evict"], 0);
+        assert_eq!(observed["total"], 2);
     }
 
     /// A [`NodeSpec`] with a chosen `/status` port — the network-fault

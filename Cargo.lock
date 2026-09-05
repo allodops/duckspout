@@ -1003,6 +1003,7 @@ dependencies = [
  "clap",
  "duckspout-accept",
  "duckspout-daemon",
+ "duckspout-types",
  "futures",
  "opentelemetry-proto",
  "serde",

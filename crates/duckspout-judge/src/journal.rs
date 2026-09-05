@@ -40,23 +40,42 @@
 //! | `request_id` | [`RequestIdentity`] | `duckspout-loadgen` (`ClientAck`/`ClientTimeout`) | `zero_acked_lost`, `watermark_honesty` |
 //! | `complete_through_ms` | [`WatermarkClaim`] | the node advancing (`LakeCommitOk`, §6.4) or advertising (`ClaimAdvertise`, §7.3) a watermark | `watermark_honesty` |
 //! | `changelog_key` | [`ChangelogEntry`] | the changelog write client, on the line resolving its request | `latest_view` |
+//! | `part` | [`PartRetention`] | the node retiring (`Expire`, §6.7) or sealing (`SnapshotSeal`, §6.7) a cold part | `retention_honesty` |
 //!
 //! **Producer status, stated plainly** (the same honesty
 //! `crate::final_state`'s scope note keeps for the read-back side): the
 //! `RequestIdentity` shape is written for real today by
 //! `duckspout_loadgen::journal`; its two #206 additions
-//! (`partition`/`max_event_time_ms`) and both new payload shapes are
+//! (`partition`/`max_event_time_ms`) and the three other payload shapes are
 //! formats this judge DEFINES and decodes, and no producer in this
 //! workspace emits them yet — the fleet's node-side watermark disclosure
 //! and its changelog write client land with the distributed tier's own
 //! wiring (#204, #208). A run whose journals carry none of them is not
 //! quietly passed: each predicate's vacuity rule turns absent evidence into
 //! `NoVerdict` (§8.4), never `Pass`.
+//!
+//! [`PartRetention`] (#207) is the sharpest case of that honesty, and it is
+//! worth naming precisely rather than leaving to the general disclaimer:
+//! `Expire`, `SnapshotSeal`, `Demote` and `Evict` are journaled by NOTHING
+//! in this workspace today — `docs/trace-mapping.md` attributes all four to
+//! `duckspout-drain`, which implements only `DropWindow` of the five
+//! post-drain/retention actions, because retention scheduling and the
+//! cache class are respectively unbuilt and empty by construction at v1
+//! (`docs/design/data-model.md` §2.4, `docs/deferred.md`'s warm-retention
+//! row). So `crate::predicates::retention_honesty` is a real predicate over
+//! a real, spec-shaped evidence format with no emitter yet, and it reports
+//! `NoVerdict` on every run until one exists. That is the same posture #206
+//! took for the watermark payloads, for the same reason: the judge for a
+//! Keep Rule lands with the milestone that arms the rule's tier
+//! (`ctk-release-gate`, v0.3), not after it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use duckspout_types::{DatasetId, NodeId, PartitionId, TenantId, TraceEvent};
+use duckspout_types::{
+    DatasetId, DatasetKind, NodeId, OriginSeqRange, PartKind, PartName, PartitionId, TenantId,
+    TraceEvent,
+};
 use serde::Deserialize;
 
 /// The loadgen's payload identity, decoded structurally off a journal
@@ -209,6 +228,64 @@ pub struct ChangelogEntry {
     pub value: Option<String>,
 }
 
+/// One cold part named by a retention-relevant action, decoded structurally
+/// off a journal line carrying `part` (module docs).
+///
+/// The shape is deliberately the frozen [`WindowManifest`]'s own field
+/// vocabulary rather than a parallel one this judge invents: `part_kind` is
+/// [`PartKind`], the arrival range is `Vec<OriginSeqRange>`, and both types
+/// come from `duckspout-types` verbatim. A part's arrival range IS its
+/// per-origin seq coverage (`docs/design/drain.md` §3: "arrival-window
+/// placement"; §8: the manifest carries "per-origin seq coverage"), so
+/// `SnapshotCovered`'s `CoversArrival(s, e)` is decidable from two of these
+/// and nothing else.
+///
+/// # Which lines carry it
+///
+/// - **`Expire`** (§6.7): the part being retired. This is the evidence
+///   `crate::predicates::retention_honesty` replays.
+/// - **`SnapshotSeal`** / **`LakeCommitOk`** (§6.7, §6.4): a sealed snapshot
+///   part and the commit that made it real. Read-back is the primary source
+///   for "which snapshots are committed" (§8.4 judges "against read-back
+///   state"), so a snapshot descriptor on a journal line is corroboration,
+///   not the authority — with one exception the spec itself names: a
+///   snapshot that was ITSELF later expired is gone from read-back but was
+///   in the lake when it covered, which is why `SnapshotCovered`'s
+///   surrounding invariants read `lake ∪ expired`
+///   (`specs/formal-core.md`'s `Expire` note). The predicate therefore
+///   unions read-back with journaled snapshot EXPIRIES, not with journaled
+///   snapshot seals — a seal that never committed proves nothing.
+///
+/// [`WindowManifest`]: duckspout_types::WindowManifest
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PartRetention {
+    /// The dataset the part belongs to.
+    pub dataset: DatasetId,
+    /// The partition the part belongs to — the scope `SnapshotCovered`
+    /// quantifies a covering snapshot within (`s.part = e.part` in the §3
+    /// formula, where the spec's `part` is the partition).
+    pub partition: PartitionId,
+    /// The part's deterministic object name (§6.5) — identity, and what a
+    /// finding names so an operator can go look at the object.
+    pub part: PartName,
+    /// `primary` / `supplement` / `snapshot` (§6.2). Keep Rule 10 guards
+    /// only the non-snapshot changelog parts: a snapshot expires under a
+    /// NEWER covering snapshot, which is the same rule one level up, and the
+    /// §3 guard spells the exclusion out as `e.kind # "snapshot"`.
+    pub part_kind: PartKind,
+    /// `event` or `changelog` (§2). Keep Rule 10 is a changelog obligation
+    /// (`IsChangelogData(e)` in the §3 guard); an `event` part's expiry is
+    /// plain age-based retention with nothing to cover
+    /// (`docs/design/drain.md` §7).
+    pub dataset_kind: DatasetKind,
+    /// The part's arrival range: per-origin, contiguous seq coverage (§6.8).
+    /// Never empty — `part_from_rest` rejects an empty coverage list,
+    /// because a part naming no arrival range makes `CoversArrival` a
+    /// vacuous truth and would let every expiry of such a part pass
+    /// unexamined.
+    pub origin_coverage: Vec<OriginSeqRange>,
+}
+
 /// One decoded journal line: the frozen envelope plus, when present, the
 /// loadgen's payload identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +311,9 @@ pub struct JournalLine {
     /// Present exactly on lines carrying a `changelog_key` field (module
     /// docs' payload table).
     pub changelog: Option<ChangelogEntry>,
+    /// Present exactly on lines carrying a `part` field (module docs'
+    /// payload table).
+    pub part: Option<PartRetention>,
 }
 
 /// A parsed, queryable set of journal lines from every ingested file
@@ -274,6 +354,42 @@ impl JournalSet {
         self.lines
             .iter()
             .filter_map(|line| line.watermark.as_ref().map(|claim| (line, claim)))
+    }
+
+    /// Every part-descriptor-bearing line for `event`, in ingestion order —
+    /// the accessor `retention_honesty` uses with [`TraceEvent::Expire`] to
+    /// get exactly the parts retention actually retired.
+    pub fn part_events(
+        &self,
+        event: TraceEvent,
+    ) -> impl Iterator<Item = (&JournalLine, &PartRetention)> {
+        self.lines.iter().filter_map(move |line| {
+            if line.event == event {
+                line.part.as_ref().map(|part| (line, part))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// How many lines journaled a post-drain residency action —
+    /// `Demote`/`Evict`/`DropWindow`, the three §3 actions that move a
+    /// window between the staging class, the cache class, and nowhere (§2.4,
+    /// §6.9). `crate::predicates::cache_transparency` cross-checks the
+    /// eviction-storm evidence against this: a run whose read probes claim
+    /// residency churn that NO node journaled is contradictory evidence, not
+    /// a certifiable run.
+    #[must_use]
+    pub fn residency_action_count(&self) -> usize {
+        self.lines
+            .iter()
+            .filter(|line| {
+                matches!(
+                    line.event,
+                    TraceEvent::Demote | TraceEvent::Evict | TraceEvent::DropWindow
+                )
+            })
+            .count()
     }
 
     /// Every changelog-entry-bearing line for `event`, in ingestion order —
@@ -452,6 +568,50 @@ fn changelog_from_rest(
     }
 }
 
+/// Decodes `rest` into a [`PartRetention`] when it carries a `part` field
+/// ([`identity_from_rest`]'s rules again), and additionally rejects the two
+/// coverage shapes that would make `SnapshotCovered` undecidable rather than
+/// false — both at decode time, so no predicate has to re-derive what a
+/// well-formed part descriptor is:
+///
+/// - **an empty `origin_coverage`**: a part naming no arrival range is
+///   covered by every snapshot vacuously, including by none at all, so
+///   accepting it would let a real uncovered expiry through as a silent
+///   pass. This is exactly the vacuity §8.4 forbids, at the evidence layer
+///   rather than the verdict layer.
+/// - **an inverted range** (`first_seq > last_seq`): `first_seq..=last_seq`
+///   is empty for such a pair, so containment tests answer "covered" for
+///   every snapshot and "contains" for no record — the same vacuous pass in
+///   a different disguise.
+fn part_from_rest(rest: &serde_json::Value) -> Result<Option<PartRetention>, serde_json::Error> {
+    match rest {
+        serde_json::Value::Object(map) if map.contains_key("part") => {
+            let part: PartRetention = serde_json::from_value(rest.clone())?;
+            if part.origin_coverage.is_empty() {
+                return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                    "part {} names no origin coverage — a part with no arrival range is \
+                     vacuously covered by every snapshot (and by none), so this fails closed \
+                     rather than passing SnapshotCovered unexamined",
+                    part.part
+                )));
+            }
+            if let Some(bad) = part
+                .origin_coverage
+                .iter()
+                .find(|range| range.first_seq > range.last_seq)
+            {
+                return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                    "part {} carries an inverted arrival range for origin {} ({} > {}) — an \
+                     empty range is vacuously covered, so ambiguity fails closed",
+                    part.part, bad.origin, bad.first_seq, bad.last_seq
+                )));
+            }
+            Ok(Some(part))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// A structural check for a duplicate JSON object key at the TOP LEVEL of
 /// one line (ACPR finding MEDIUM-HIGH-3(d)): `serde_json`'s own `Map` (the
 /// `preserve_order` feature included) silently keeps "last value wins" on a
@@ -578,6 +738,7 @@ pub fn parse_journal_file(path: &Path) -> Result<Vec<JournalLine>, JournalError>
         let identity = identity_from_rest(&envelope.rest).map_err(decode_error)?;
         let watermark = watermark_from_rest(&envelope.rest).map_err(decode_error)?;
         let changelog = changelog_from_rest(&envelope.rest).map_err(decode_error)?;
+        let part = part_from_rest(&envelope.rest).map_err(decode_error)?;
         lines.push(JournalLine {
             source: path.to_owned(),
             line_no,
@@ -587,6 +748,7 @@ pub fn parse_journal_file(path: &Path) -> Result<Vec<JournalLine>, JournalError>
             identity,
             watermark,
             changelog,
+            part,
         });
     }
     Ok(lines)
@@ -1026,6 +1188,99 @@ mod tests {
         assert_eq!(set.changelog_events(TraceEvent::ClientAck).count(), 1);
         assert_eq!(set.changelog_events(TraceEvent::ClientTimeout).count(), 1);
         assert_eq!(set.identity_events(TraceEvent::ClientAck).count(), 0);
+    }
+
+    /// One `Expire` line's part descriptor, with every field the §3 guard
+    /// reads: the partition it fences within, the kind that decides whether
+    /// Keep Rule 10 applies at all, the dataset kind that decides the same,
+    /// and the arrival range a snapshot must cover.
+    #[test]
+    fn extracts_a_part_descriptor_from_an_expire_line() {
+        let file = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Expire\",\
+             \"dataset\":\"dim_users\",\"partition\":\"tenant-a.4\",\
+             \"part\":\"dim_users/tenant-a.4/7/primary/0.parquet\",\
+             \"part_kind\":\"primary\",\"dataset_kind\":\"changelog\",\
+             \"origin_coverage\":[{\"origin\":\"n1\",\"first_seq\":1,\"last_seq\":9}]}\n",
+        );
+        let lines = parse_journal_file(file.path()).expect("parses");
+        let part = lines[0].part.as_ref().expect("part present");
+        assert_eq!(part.dataset, DatasetId::new("dim_users"));
+        assert_eq!(part.partition, PartitionId::new("tenant-a.4"));
+        assert_eq!(part.part_kind, PartKind::Primary);
+        assert_eq!(part.dataset_kind, DatasetKind::Changelog);
+        assert_eq!(part.origin_coverage.len(), 1);
+        assert_eq!(part.origin_coverage[0].last_seq, 9);
+        assert!(lines[0].changelog.is_none());
+        assert!(lines[0].watermark.is_none());
+    }
+
+    #[test]
+    fn a_half_formed_part_descriptor_is_a_decode_error_not_a_silent_downgrade() {
+        // Would catch a line that NAMES a part (`part` present) but omits
+        // the kind that decides whether Keep Rule 10 applies to it being
+        // read as "no part here" — silently dropping the one expiry the
+        // retention judge exists to replay.
+        let file = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Expire\",\
+             \"dataset\":\"d\",\"partition\":\"p\",\"part\":\"obj\"}\n",
+        );
+        let err = parse_journal_file(file.path()).expect_err("must fail closed");
+        assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn a_part_with_no_arrival_range_fails_closed() {
+        // The vacuity tooth at the evidence layer (`part_from_rest`'s own
+        // docs): an empty coverage list is covered by every snapshot AND by
+        // none, so accepting it would turn a genuinely uncovered expiry into
+        // a silent pass — precisely the shape §8.4 forbids.
+        let file = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Expire\",\
+             \"dataset\":\"d\",\"partition\":\"p\",\"part\":\"obj\",\
+             \"part_kind\":\"primary\",\"dataset_kind\":\"changelog\",\
+             \"origin_coverage\":[]}\n",
+        );
+        let err = parse_journal_file(file.path()).expect_err("must fail closed");
+        assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn a_part_with_an_inverted_arrival_range_fails_closed() {
+        let file = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Expire\",\
+             \"dataset\":\"d\",\"partition\":\"p\",\"part\":\"obj\",\
+             \"part_kind\":\"primary\",\"dataset_kind\":\"changelog\",\
+             \"origin_coverage\":[{\"origin\":\"n1\",\"first_seq\":9,\"last_seq\":1}]}\n",
+        );
+        let err = parse_journal_file(file.path()).expect_err("must fail closed");
+        assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn part_events_and_residency_actions_select_only_their_own_evidence() {
+        let file = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"Expire\",\
+             \"dataset\":\"d\",\"partition\":\"p\",\"part\":\"obj-1\",\
+             \"part_kind\":\"primary\",\"dataset_kind\":\"changelog\",\
+             \"origin_coverage\":[{\"origin\":\"n1\",\"first_seq\":1,\"last_seq\":2}]}\n\
+             {\"node\":\"n1\",\"seq\":1,\"event\":\"SnapshotSeal\",\
+             \"dataset\":\"d\",\"partition\":\"p\",\"part\":\"snap-1\",\
+             \"part_kind\":\"snapshot\",\"dataset_kind\":\"changelog\",\
+             \"origin_coverage\":[{\"origin\":\"n1\",\"first_seq\":1,\"last_seq\":5}]}\n\
+             {\"node\":\"n1\",\"seq\":2,\"event\":\"DropWindow\"}\n\
+             {\"node\":\"n1\",\"seq\":3,\"event\":\"Evict\"}\n\
+             {\"node\":\"n1\",\"seq\":4,\"event\":\"Accept\"}\n",
+        );
+        let set = JournalSet {
+            lines: parse_journal_file(file.path()).expect("parses"),
+        };
+        assert_eq!(set.part_events(TraceEvent::Expire).count(), 1);
+        assert_eq!(set.part_events(TraceEvent::SnapshotSeal).count(), 1);
+        // `Accept` never carries a part; `DropWindow`/`Evict` are counted by
+        // the residency accessor, not by the part one.
+        assert_eq!(set.part_events(TraceEvent::Accept).count(), 0);
+        assert_eq!(set.residency_action_count(), 2);
     }
 
     #[test]

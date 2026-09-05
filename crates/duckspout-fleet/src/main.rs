@@ -415,12 +415,67 @@ struct Cli {
     /// How long each cycle leaves it up again before the next cycle.
     #[arg(long, default_value_t = 1_000)]
     fault_discovery_flap_up_ms: u64,
+
+    // --- Cache/residency churn (§8.4, issue #207) ---
+    /// Node index (0-based) whose post-drain hot residency is CHURNED while
+    /// real Arrow Flight reads run through it (§8.4's "forced Evict/Demote
+    /// churn and `DropWindow` racing queries"). Boots that one node with
+    /// `--fault-cache-churn-hot-window` as its `hot.window`, so under the
+    /// drive load its windows seal, drain and `DropWindow` densely instead
+    /// of once a minute. Absent by default.
+    ///
+    /// `fault::run_cache_churn`'s own docs carry the mechanism, and the
+    /// disclosure of which third of the Evict/Demote/`DropWindow` vocabulary
+    /// can actually fire at v0.2 (only `DropWindow`: v1's cache class is
+    /// empty by construction, `docs/design/data-model.md` §2.4).
+    #[arg(long)]
+    fault_cache_churn_node: Option<u16>,
+
+    /// Delay before the churn window opens.
+    #[arg(long, default_value_t = 5)]
+    fault_cache_churn_delay_secs: u64,
+
+    /// How long the churn window holds — how long reads keep racing the
+    /// residency actions. Long enough by default for several windows to
+    /// seal and drain at the shortened `hot.window` below.
+    #[arg(long, default_value_t = 20)]
+    fault_cache_churn_duration_secs: u64,
+
+    /// The `hot.window` the churn target is booted with, replacing
+    /// `--hot-window` for that one node. An existing §9.6.1 setting tuned
+    /// down, never a new knob — the fault uses the daemon's own drain
+    /// cadence rather than a back door.
+    #[arg(long, default_value = "1s")]
+    fault_cache_churn_hot_window: String,
+
+    /// The SQL each racing read issues. The default reads the staging
+    /// engine's own window registry, which `DropWindow` DELETEs from inside
+    /// the same transaction as its `DROP TABLE`
+    /// (`duckspout_staging::engine`) — a read of exactly the table the churn
+    /// is mutating, which is what makes a held lock observable at all. A
+    /// query over synthetic rows would touch nothing the churn touches and
+    /// would prove nothing about §2.4's obligation (c).
+    #[arg(long, default_value = CACHE_CHURN_DEFAULT_QUERY)]
+    fault_cache_churn_query: String,
+
+    /// Pause between racing reads. Small enough that reads and residency
+    /// actions actually interleave; a value at or above the churn duration
+    /// would issue one read and prove nothing.
+    #[arg(long, default_value_t = 50)]
+    fault_cache_churn_read_interval_ms: u64,
 }
 
 /// `--fault-flight-kill-query`'s default (its own doc comment for the
 /// sizing rationale): ~2M `BIGINT`s ≈ 16 MiB of encoded Arrow, orders of
 /// magnitude past HTTP/2's 64 KiB default flow-control window.
 const FLIGHT_KILL_DEFAULT_QUERY: &str = "SELECT i FROM range(0, 2000000) t(i)";
+
+/// `--fault-cache-churn-query`'s default (its own doc comment for why this
+/// table and not a synthetic one): the staging engine's window registry,
+/// which `DropWindow`'s own transaction deletes rows from
+/// (`duckspout_staging::engine`'s `DropWindow` transaction body).
+const CACHE_CHURN_DEFAULT_QUERY: &str =
+    "SELECT count(*) FROM duckspout_windows WHERE staged_bytes >= 0";
 
 /// This runner's own smoke-loop status codes — **not** `duckspout-judge`'s
 /// future Pass(0)/Violation(2)/NoVerdict(3) vocabulary (§8.4's vacuity-teeth
@@ -489,7 +544,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     )?;
     let links = build_fault_links(&cli, &nodes).await?;
     for node in &nodes {
-        let overrides = backend_overrides(&cli, links.get(&node.index))?;
+        let overrides = node_overrides(&cli, node.index, links.get(&node.index))?;
         let rendered = topology::render_node_config(&plan, node, &nodes, &overrides);
         std::fs::write(&node.config_path, rendered)
             .with_context(|| format!("writing {}", node.config_path.display()))?;
@@ -772,10 +827,37 @@ async fn run_armed_faults(
     ctx: &FaultRun<'_>,
     running: &mut [process::RunningNode],
 ) -> anyhow::Result<Vec<process::RunningNode>> {
-    let (network, process_faults) =
-        tokio::join!(run_network_faults(ctx), run_process_faults(ctx, running));
+    let (network, churn, process_faults) = tokio::join!(
+        run_network_faults(ctx),
+        run_cache_churn_fault(ctx),
+        run_process_faults(ctx, running)
+    );
     network?;
+    churn?;
     process_faults
+}
+
+/// The cache/residency-churn fault (§8.4, issue #207). Its own group rather
+/// than a member of either existing one: it touches no process handle (so it
+/// need not serialize with the process faults) and no [`link::FaultLink`]
+/// (so it is not a network fault), and it must run CONCURRENTLY with the
+/// drive-load pass — a residency storm on an idle node churns nothing.
+async fn run_cache_churn_fault(ctx: &FaultRun<'_>) -> anyhow::Result<()> {
+    let cli = ctx.cli;
+    let Some(index) = cli.fault_cache_churn_node else {
+        return Ok(());
+    };
+    let target = node_spec(ctx.nodes, index, "--fault-cache-churn-node")?;
+    fault::run_cache_churn(
+        "cache-churn-0",
+        target,
+        &cli.fault_cache_churn_query,
+        Duration::from_secs(cli.fault_cache_churn_delay_secs),
+        Duration::from_secs(cli.fault_cache_churn_duration_secs),
+        Duration::from_millis(cli.fault_cache_churn_read_interval_ms),
+        ctx.log,
+    )
+    .await
 }
 
 /// The link-level faults (§8.4, issue #204): partition, asymmetric
@@ -1146,18 +1228,30 @@ async fn build_fault_links(cli: &Cli, nodes: &[NodeSpec]) -> anyhow::Result<Flee
     Ok(links)
 }
 
-/// The catalog/lake addresses node `index` must be configured with, given
-/// its links (`topology::BackendOverrides`).
+/// How node `index`'s rendered config must deviate from the fleet plan: the
+/// catalog/lake addresses its fault links impose, and the shortened
+/// `hot.window` the cache-churn fault needs on its own target
+/// (`topology::NodeOverrides`).
 ///
 /// # Errors
 ///
 /// If the catalog DSN cannot be rewritten to point at the link.
-fn backend_overrides(
+fn node_overrides(
     cli: &Cli,
+    index: u16,
     links: Option<&NodeLinks>,
-) -> anyhow::Result<topology::BackendOverrides> {
+) -> anyhow::Result<topology::NodeOverrides> {
+    // Applied to the churn target ONLY: a fleet-wide short window would
+    // change every node's drain cadence, which is a different experiment
+    // from "one node's residency churns while queries race it" — and would
+    // silently move the baseline every other fault is measured against.
+    let hot_window = (cli.fault_cache_churn_node == Some(index))
+        .then(|| cli.fault_cache_churn_hot_window.clone());
     let Some(links) = links else {
-        return Ok(topology::BackendOverrides::default());
+        return Ok(topology::NodeOverrides {
+            hot_window,
+            ..topology::NodeOverrides::default()
+        });
     };
     let postgres_dsn = links
         .catalog
@@ -1174,9 +1268,10 @@ fn backend_overrides(
         .lake
         .as_ref()
         .map(|link| format!("127.0.0.1:{}", link.listen_addr().port()));
-    Ok(topology::BackendOverrides {
+    Ok(topology::NodeOverrides {
         postgres_dsn,
         s3_endpoint,
+        hot_window,
     })
 }
 
@@ -1406,6 +1501,12 @@ mod tests {
             fault_discovery_flap_cycles: 5,
             fault_discovery_flap_down_ms: 1_000,
             fault_discovery_flap_up_ms: 1_000,
+            fault_cache_churn_node: None,
+            fault_cache_churn_delay_secs: 5,
+            fault_cache_churn_duration_secs: 20,
+            fault_cache_churn_hot_window: "1s".to_owned(),
+            fault_cache_churn_query: CACHE_CHURN_DEFAULT_QUERY.to_owned(),
+            fault_cache_churn_read_interval_ms: 50,
         }
     }
 
@@ -1857,16 +1958,16 @@ mod tests {
         assert_eq!(load_target_addr(&node, &links), expected);
     }
 
-    /// `backend_overrides` must point the node's own config at whatever
+    /// `node_overrides` must point the node's own config at whatever
     /// links it has — and at nothing when it has none.
     #[tokio::test]
-    async fn backend_overrides_follow_the_links_a_node_actually_has() {
+    async fn node_overrides_follow_the_links_a_node_actually_has() {
         let mut cli = base_cli("overrides");
         cli.local_lake = false;
         cli.postgres_dsn = "postgres://duckspout@10.0.0.9:5432/duckspout_catalog".to_owned();
 
         assert!(
-            backend_overrides(&cli, None)
+            node_overrides(&cli, 0, None)
                 .unwrap()
                 .postgres_dsn
                 .is_none(),
@@ -1887,7 +1988,7 @@ mod tests {
             lake: Some(lake),
         };
 
-        let overrides = backend_overrides(&cli, Some(&links)).unwrap();
+        let overrides = node_overrides(&cli, 0, Some(&links)).unwrap();
         assert_eq!(
             overrides.postgres_dsn.as_deref(),
             Some(
