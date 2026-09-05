@@ -218,6 +218,12 @@ fn phases(lines: &[serde_json::Value]) -> Vec<&str> {
 }
 
 /// Node 0's own real D-6 NDJSON journal, as parsed lines.
+///
+/// Unparseable lines are dropped (`read_ndjson_lines`), so this is for
+/// CONTENT assertions only. An assertion that indexes by physical line
+/// number — one against a fault window's `node_journal_lines` anchors, say —
+/// must read the raw lines itself, or a single dropped line shifts every
+/// index after it.
 fn node0_journal(work_dir: &Path) -> Vec<serde_json::Value> {
     read_ndjson_lines(&work_dir.join("node-0").join("journal.ndjson"))
 }
@@ -1091,7 +1097,12 @@ fn cache_churn_produces_real_residency_actions_while_real_reads_run_through_the_
     // count against the whole file instead can never fail for any defect:
     // the file is a superset of every window's slice by construction, so
     // `whole_file >= window` holds even for a count that is pure invention.
-    let journal = node0_journal(&work_dir);
+    // RAW lines, not `node0_journal`'s parsed ones: the anchors are counts
+    // of physical lines, and that helper silently drops any line that fails
+    // to parse, which would shift every index after it.
+    let journal_text =
+        std::fs::read_to_string(work_dir.join("node-0").join("journal.ndjson")).unwrap();
+    let journal: Vec<&str> = journal_text.lines().collect();
     let window_start = lines[1]["detail"]["node_journal_lines"].as_u64().unwrap();
     let window_end = lines[2]["detail"]["node_journal_lines"].as_u64().unwrap();
     assert!(
@@ -1104,6 +1115,7 @@ fn cache_churn_produces_real_residency_actions_while_real_reads_run_through_the_
         .iter()
         .skip(usize::try_from(window_start).unwrap())
         .take(usize::try_from(window_end - window_start).unwrap())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|line| {
             matches!(
                 line["event"].as_str(),

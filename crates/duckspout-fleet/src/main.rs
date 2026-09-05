@@ -551,6 +551,12 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     if cli.nodes == 0 {
         bail!("--nodes 0: nothing to boot");
     }
+    // Before any node is rendered or booted: the churn target's config is
+    // written a few lines below, and a no-op override would produce a fleet
+    // that looks right and forces nothing.
+    if cli.fault_cache_churn_node.is_some() {
+        churn_hot_window_forces_something(&cli)?;
+    }
     // `--fault-churn-join` provisions ONE extra member (§8.4's membership
     // join): it gets a config, an identity and a slot in every other node's
     // `cluster.seed_peers` up front, but `boot_fleet` below never starts it
@@ -873,7 +879,6 @@ async fn run_cache_churn_fault(ctx: &FaultRun<'_>) -> anyhow::Result<()> {
     let Some(index) = cli.fault_cache_churn_node else {
         return Ok(());
     };
-    churn_hot_window_forces_something(cli)?;
     let target = node_spec(ctx.nodes, index, "--fault-cache-churn-node")?;
     fault::run_cache_churn(
         "cache-churn-0",
