@@ -269,7 +269,7 @@ async fn otlp_to_lake_end_to_end_through_the_public_daemon_api() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // --- Boot through the public API (never the binary, per the task) ---
-    let daemon = Daemon::boot(&config, 0).await.expect("daemon boots");
+    let daemon = Daemon::boot(&config, 0, None).await.expect("daemon boots");
     let handle = daemon.handle();
     let otlp_addr = daemon.otlp_addr();
     let status_addr = daemon.status_addr();

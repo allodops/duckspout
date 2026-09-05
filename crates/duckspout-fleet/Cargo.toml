@@ -8,7 +8,42 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Bin-crate error ergonomics (s§3.3: anyhow in the four bin crates only —
+# ctl, fleet, judge, loadgen).
+anyhow = { workspace = true }
 clap = { workspace = true }
+# Reused, not reimplemented (issue #201's own scoping note): the real node
+# binary's config surface (`config::defaults`, the golden-manifest-pinned
+# `LakeConfig`/`ClusterConfig`/… shapes) and its `detect_node_id` hostname
+# override (`system::DUCKSPOUT_NODE_HOSTNAME_OVERRIDE`) — a fleet member's
+# identity must match character-for-character what the real daemon binary
+# will itself compute (`wiring.rs`'s `seed_peer_node_id` doc comment), so
+# this crate depends on the daemon library to stay in lockstep with it
+# rather than hand-duplicating the config surface and risking drift (DRY).
+duckspout-daemon = { workspace = true }
+# Concurrent per-node boot/load/shutdown fan-out (`join_all`) — the
+# ecosystem-standard combinator, no in-house candidate (R-third-party-first).
+futures = { workspace = true }
+# The internal placeholder OTLP drive-load client (module docs of
+# `load.rs`): the same real gRPC client shape
+# `duckspout-daemon/tests/otlp_e2e.rs` and
+# `duckspout-daemon/tests/common/capture.rs` already use, reused here rather
+# than reimplemented — full load-generation semantics (retries,
+# ClientAck/ClientTimeout journaling) are `duckspout-loadgen`'s own scope
+# (issue #202), not duplicated here.
+opentelemetry-proto = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = [
+  "process",
+  "net",
+  "time",
+  "sync",
+  "io-util",
+  "fs",
+] }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

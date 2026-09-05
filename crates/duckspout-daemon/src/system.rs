@@ -281,7 +281,8 @@ fn memory_budget_bytes() -> std::io::Result<u64> {
 }
 
 /// This node's identity (§5's origin rendering, `<node_id>/<incarnation>`):
-/// the OS hostname (`/proc/sys/kernel/hostname`, falling back to the
+/// an explicit [`DUCKSPOUT_NODE_HOSTNAME_OVERRIDE`] override when set,
+/// else the OS hostname (`/proc/sys/kernel/hostname`, falling back to the
 /// `HOSTNAME` environment variable, falling back to a fixed literal when
 /// neither is readable — a dev sandbox with no hostname source is still a
 /// bootable single node) paired with `incarnation`.
@@ -291,15 +292,33 @@ fn memory_budget_bytes() -> std::io::Result<u64> {
 /// silently assumed.
 #[must_use]
 pub fn detect_node_id(incarnation: &str) -> NodeId {
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+    let host = std::env::var(DUCKSPOUT_NODE_HOSTNAME_OVERRIDE)
         .ok()
-        .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| std::env::var("HOSTNAME").ok())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "duckspout-node".to_owned());
     NodeId::new(format!("{host}/{incarnation}"))
 }
+
+/// An explicit override for [`detect_node_id`]'s hostname component,
+/// checked before `/proc/sys/kernel/hostname` (issue #201): co-located
+/// `duckspout-daemon` processes on ONE physical/container host all share the
+/// same kernel hostname, so `duckspout-fleet` sets this per child process to
+/// give each real node a distinct [`NodeId`] without a distinct kernel
+/// hostname (which would need a network namespace / `CAP_SYS_ADMIN`, not
+/// available to a plain fleet-runner process). Deliberately a dedicated
+/// name, not a reordering of the existing `HOSTNAME` fallback: many
+/// unrelated tools and shells already set `HOSTNAME`, and reordering that
+/// check ahead of the kernel hostname would silently change v0.1's existing
+/// behavior wherever `HOSTNAME` happens to be set to something else.
+pub const DUCKSPOUT_NODE_HOSTNAME_OVERRIDE: &str = "DUCKSPOUT_NODE_HOSTNAME";
 
 #[cfg(test)]
 mod tests {
