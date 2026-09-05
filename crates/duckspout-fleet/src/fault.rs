@@ -1001,9 +1001,23 @@ impl ResidencyCounts {
     /// mid-write, both read as "nothing counted" — a fault log must never
     /// fail the fleet run over a best-effort observation.
     fn since(journal_path: &std::path::Path, skip_lines: u64) -> Self {
+        Self::since_with_line_count(journal_path, skip_lines).0
+    }
+
+    /// [`ResidencyCounts::since`], plus the journal's TOTAL line count, from
+    /// ONE read of the file.
+    ///
+    /// One read, not two, because a window's `Ended` line journals both and
+    /// the drain loop keeps appending between them: taking the line count in
+    /// a second read would let the `Ended` line claim a slice that does not
+    /// contain the actions counted beside it, and
+    /// `tests/fault_injection.rs` recounts exactly that slice and requires
+    /// exact equality.
+    fn since_with_line_count(journal_path: &std::path::Path, skip_lines: u64) -> (Self, u64) {
         let Ok(contents) = std::fs::read_to_string(journal_path) else {
-            return Self::default();
+            return (Self::default(), 0);
         };
+        let total_lines = u64::try_from(contents.lines().count()).unwrap_or(u64::MAX);
         let mut counts = Self::default();
         for line in contents
             .lines()
@@ -1027,7 +1041,7 @@ impl ResidencyCounts {
                 counts.0[index] += 1;
             }
         }
-        counts
+        (counts, total_lines)
     }
 
     /// How many times `event` was journaled — `0` for an event that is not a
@@ -1061,36 +1075,188 @@ impl ResidencyCounts {
     }
 }
 
-/// The exact token `event` is written as in a node's own D-6 journal
-/// ([`RESIDENCY_EVENTS`]' own note on why `Debug` is the authority here).
+/// The exact token `event` is written as in a node's own D-6 journal.
+///
+/// A node journals its trace lines through `serde`, so `serde` is the
+/// authority on the token, and this function asks it rather than asking
+/// `Debug` ([`RESIDENCY_EVENTS`]' own note). The two agree today — that is
+/// what `duckspout_types::trace`'s
+/// `every_event_serializes_as_its_verbatim_action_name` pins — but only the
+/// `Serialize` impl can drift under a `#[serde(rename)]`, so only the
+/// `Serialize` impl is worth reading. Falls back to `Debug` if the variant
+/// somehow does not serialize as a bare JSON string, which no unit-only enum
+/// can do: a watch list that silently emptied itself would report every real
+/// storm as vacuous.
 fn event_token(event: TraceEvent) -> String {
-    format!("{event:?}")
+    match serde_json::to_value(event) {
+        Ok(serde_json::Value::String(token)) => token,
+        _ => format!("{event:?}"),
+    }
 }
 
-/// What the racing reads observed across one cache-churn window.
-#[derive(Debug, Clone, Copy, Default)]
-struct ReadTally {
-    issued: u64,
-    served: u64,
-    failed: u64,
-    max_latency_ms: u64,
-    /// Reads whose own residency-op count moved between issue and
-    /// completion — the ones that genuinely overlapped a residency action,
-    /// which is what obligation (c) is about.
-    raced: u64,
+/// How one racing read ended (module docs of [`run_cache_churn`] on why the
+/// last variant is fatal and the others are observations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOutcome {
+    /// The whole `DoGet` stream arrived without a typed error.
+    Served,
+    /// The stream errored partway through — an observation about the system
+    /// under churn, which is what §2.4's obligation (c) is about.
+    StreamError,
+    /// The read did not finish within [`READ_TIMEOUT`]. Also an observation,
+    /// and the sharpest one obligation (c) can produce: a read the residency
+    /// storm outlived.
+    TimedOut,
+    /// The `DoGet` itself was refused. NOT an observation — see
+    /// [`ReadPathFailure`].
+    TicketRefused,
 }
 
-impl ReadTally {
+impl ReadOutcome {
+    /// The token this outcome is journaled as, in the per-read evidence
+    /// array a judge reads.
+    fn as_str(self) -> &'static str {
+        match self {
+            ReadOutcome::Served => "served",
+            ReadOutcome::StreamError => "stream_error",
+            ReadOutcome::TimedOut => "timed_out",
+            ReadOutcome::TicketRefused => "ticket_refused",
+        }
+    }
+}
+
+/// One racing read, with the evidence a judge needs to place it.
+///
+/// Per-read rather than aggregated, because the aggregate cannot carry
+/// §2.4's obligation (c) (ACPR finding MEDIUM-7): a run with one genuinely
+/// blocked racing read among many fast unraced ones, and a run where that
+/// same slow read was unraced (an unrelated GC pause), produce the identical
+/// `max_latency_ms`. Only the per-read pairing of a latency with its OWN
+/// before/after residency counts distinguishes them — which is exactly the
+/// shape `duckspout_judge::read_log::CacheProbe` is defined over, so the day
+/// the real query client lands (#208) the judge reads the same fields off
+/// its own log.
+#[derive(Debug, Clone, Copy)]
+struct ReadObservation {
+    residency_ops_before: u64,
+    residency_ops_after: u64,
+    latency_ms: u64,
+    outcome: ReadOutcome,
+}
+
+impl ReadObservation {
+    /// Whether this read overlapped at least one residency action — the same
+    /// definition `duckspout_judge::read_log::CacheProbe::raced_residency_action`
+    /// uses, so the two sides cannot drift.
+    fn raced(self) -> bool {
+        self.residency_ops_after > self.residency_ops_before
+    }
+
     fn to_json(self) -> serde_json::Value {
         serde_json::json!({
-            "issued": self.issued,
-            "served": self.served,
-            "failed": self.failed,
-            "raced_residency_action": self.raced,
-            "max_latency_ms": self.max_latency_ms,
+            "residency_ops_before": self.residency_ops_before,
+            "residency_ops_after": self.residency_ops_after,
+            "latency_ms": self.latency_ms,
+            "outcome": self.outcome.as_str(),
         })
     }
 }
+
+/// What the racing reads observed across one cache-churn window.
+#[derive(Debug, Clone, Default)]
+struct ReadTally {
+    reads: Vec<ReadObservation>,
+}
+
+impl ReadTally {
+    fn count(&self, outcome: ReadOutcome) -> usize {
+        self.reads
+            .iter()
+            .filter(|read| read.outcome == outcome)
+            .count()
+    }
+
+    /// Reads that genuinely overlapped a residency action, counted over
+    /// SERVED reads only.
+    ///
+    /// A refused or timed-out read never reached the read path, so counting
+    /// it as "raced" would claim an overlap that did not happen —
+    /// `duckspout_judge::predicates::cache_transparency` already excludes
+    /// non-`Served` outcomes from its own baselines for the same reason, and
+    /// the two sides have to agree on what "raced" means (ACPR finding
+    /// MEDIUM-7).
+    fn raced(&self) -> usize {
+        self.reads
+            .iter()
+            .filter(|read| read.outcome == ReadOutcome::Served && read.raced())
+            .count()
+    }
+
+    fn max_latency_ms(&self) -> u64 {
+        self.reads
+            .iter()
+            .map(|read| read.latency_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "issued": self.reads.len(),
+            "served": self.count(ReadOutcome::Served),
+            "failed": self.reads.len() - self.count(ReadOutcome::Served),
+            "stream_errors": self.count(ReadOutcome::StreamError),
+            "timed_out": self.count(ReadOutcome::TimedOut),
+            "raced_residency_action": self.raced(),
+            "max_latency_ms": self.max_latency_ms(),
+            // The per-read evidence, in issue order. Not sampled and not
+            // capped: a subset would silently stop being able to convict the
+            // read it dropped (`duckspout_judge::read_log`'s own note on why
+            // its answers are not sampled either).
+            "reads": self.reads.iter().map(|read| read.to_json()).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// A read-path failure that means the churn window proved nothing about
+/// §2.4's obligation (c), so [`run_cache_churn`] fails closed on it.
+///
+/// The line between this and a [`ReadObservation`] is the one
+/// [`run_flight_kill_mid_stream`]'s docs already draw and follow: "a rejected
+/// ticket is a misconfigured query, not a fault window." An unreachable
+/// endpoint and a refused ticket are both the runner's own setup being
+/// wrong; a slow, errored or timed-out read is the system under churn
+/// answering, which is the thing being measured (ACPR finding MEDIUM-5).
+struct ReadPathFailure(String);
+
+/// How long one racing read may take before it is recorded as
+/// [`ReadOutcome::TimedOut`] and the loop moves on.
+///
+/// Unbounded awaits here are a real hang, not a theoretical one:
+/// `--fault-cache-churn-node 0 --fault-sigstop-node 0` leaves the target's
+/// listen socket alive (the kernel accepts; the stopped process never
+/// answers), so `connect` succeeds and `do_get` never returns — hanging the
+/// whole fleet run, which has no outer timeout (ACPR finding MEDIUM-4).
+/// [`run_flight_kill_mid_stream`] bounds its own first-message read for the
+/// same reason.
+///
+/// Hardcoded rather than a CLI flag, unlike that sibling's
+/// `--fault-flight-kill-first-message-timeout-secs`, and the difference is
+/// not an oversight: that timeout is a fault PARAMETER — it decides whether
+/// the kill lands mid-stream, so an operator tuning the fault has to be able
+/// to move it. This one is a liveness backstop on a read whose interesting
+/// range is milliseconds (`duckspout_judge::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS`
+/// is 1s, and everything past it is already a finding). Ten seconds is an
+/// order of magnitude past the point where the judge has made up its mind,
+/// so no scenario needs a different value; a flag would be a knob with no
+/// question behind it.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the churn injector waits to establish its Flight connection.
+/// Bounded for exactly [`READ_TIMEOUT`]'s reason — a `SIGSTOP`ped node's
+/// socket is still listening — and shorter, because a TCP connect to
+/// localhost either completes in milliseconds or is not going to.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs one real cache/residency-churn fault (§8.4, issue #207): the target
 /// node's post-drain residency is churned under load while real Arrow Flight
@@ -1166,6 +1332,15 @@ impl ReadTally {
 /// residency-op count read out of the target's own journal, so a read that
 /// really overlapped an action is distinguishable from one that did not.
 ///
+/// The evidence is journaled **per read**, not as aggregates: one object per
+/// read carrying its own latency, its own before/after residency counts and
+/// its own outcome ([`ReadObservation`]). Aggregates cannot carry §2.4's
+/// obligation (c) — a run with one genuinely blocked racing read among many
+/// fast unraced ones, and a run where that same slow read was unraced,
+/// produce the identical `max_latency_ms` — and the per-read shape is
+/// deliberately the shape `duckspout_judge::read_log::CacheProbe` is defined
+/// over, so the same fields carry across when the real query client lands.
+///
 /// This injector deliberately does NOT write `duckspout-judge`'s read log:
 /// the daemon's read surface is hot-only, with no read concern and no
 /// coverage pinning (`duckspout_daemon::serving`'s #113 gap), so there is no
@@ -1177,13 +1352,24 @@ impl ReadTally {
 ///
 /// # Errors
 ///
-/// If no residency action is observed inside the window at all. A churn
-/// fault that churned nothing fired vacuously (§8.4's vacuity teeth), and
-/// journaling an `Ended` line for it would record a storm that never
-/// happened — the same fail-closed posture [`run_sigstop_pause`] takes when
-/// it cannot confirm its own pause. Flight-side failures are NOT errors:
-/// a refused or errored read is an OBSERVATION about the system under churn,
-/// journaled and left to the judge.
+/// Two ways, and the `Ended` line is journaled first in both, so the run's
+/// own record carries the counts that justify the failure:
+///
+/// - **The read path never ran** — the Flight endpoint was unreachable or
+///   the `DoGet` ticket was refused ([`ReadPathFailure`]). A window whose
+///   reads never reached the read path proves nothing about obligation (c),
+///   and a refused ticket is a misconfigured query rather than a fault
+///   window — exactly the policy [`run_flight_kill_mid_stream`] states and
+///   follows.
+/// - **No residency action was observed inside the window at all.** A churn
+///   fault that churned nothing fired vacuously (§8.4's vacuity teeth), and
+///   recording a clean completed window for it would tell a judge the run
+///   exercised something it did not — the same fail-closed posture
+///   [`run_sigstop_pause`] takes when it cannot confirm its own pause.
+///
+/// A read that was SERVED slowly, errored mid-stream, or timed out is not
+/// an error: each is an OBSERVATION about the system under churn, journaled
+/// per read and left to the judge.
 pub async fn run_cache_churn(
     fault_id: &str,
     target: &NodeSpec,
@@ -1217,7 +1403,11 @@ pub async fn run_cache_churn(
     // The window opens where the reads start, not where the injector armed:
     // everything the drive-load pass drained during `delay` belongs to
     // neither the baseline nor the storm.
-    let window_start = node_journal_line_count(&target.journal_path);
+    // One read for both, so the baseline below and the anchor the window's
+    // own counts start from cannot straddle a line appended between two
+    // reads of the file.
+    let (before_window, window_start) =
+        ResidencyCounts::since_with_line_count(&target.journal_path, anchor);
     log.started(
         fault_id,
         FaultKind::CacheChurn,
@@ -1228,16 +1418,16 @@ pub async fn run_cache_churn(
             // NOT part of the window's own counts below, and journaled so a
             // reader can tell a node that was already churning from one this
             // fault had to get going.
-            "residency_actions_before_window": ResidencyCounts::since(
-                &target.journal_path,
-                anchor,
-            )
-            .to_json(),
+            "residency_actions_before_window": before_window.to_json(),
         })),
     );
 
-    let tally = drive_racing_reads(&endpoint, target, query, duration, read_interval).await;
-    let observed = ResidencyCounts::since(&target.journal_path, window_start);
+    let (tally, read_path_failure) =
+        drive_racing_reads(&endpoint, target, query, duration, read_interval).await;
+    // Both from ONE read of the journal, so `node_journal_lines` really is
+    // the end of the slice `residency_actions_during_window` counted.
+    let (observed, window_end) =
+        ResidencyCounts::since_with_line_count(&target.journal_path, window_start);
 
     log.ended(
         fault_id,
@@ -1246,10 +1436,25 @@ pub async fn run_cache_churn(
         Some(serde_json::json!({
             "residency_actions_during_window": observed.to_json(),
             "reads_during_window": tally.to_json(),
-            "node_journal_lines": node_journal_line_count(&target.journal_path),
+            "read_path_failure": read_path_failure
+                .as_ref()
+                .map(|failure| failure.0.clone()),
+            "node_journal_lines": window_end,
         })),
     );
 
+    // The read-path failure first: it names the runner's own misconfiguration
+    // ("nothing is listening", "that query is refused"), which is the
+    // actionable cause and usually also the reason the vacuity check below
+    // would fire.
+    if let Some(ReadPathFailure(reason)) = read_path_failure {
+        anyhow::bail!(
+            "fault {fault_id}: the racing-read half of the churn window never reached node \
+             {target_node}'s read path ({reason}) — a window whose reads never ran proves nothing \
+             about §2.4's obligation (c), and a refused ticket is a misconfigured query rather \
+             than a fault window (run_flight_kill_mid_stream's own policy)"
+        );
+    }
     anyhow::ensure!(
         observed.total() > 0,
         "fault {fault_id}: node {target_node} journaled no Demote/Evict/DropWindow line during \
@@ -1265,84 +1470,114 @@ pub async fn run_cache_churn(
 /// each one by the target's own residency-op count (module docs of
 /// [`run_cache_churn`]).
 ///
-/// Best-effort by construction: a connection that cannot be established, a
-/// refused ticket and a stream that errors mid-read are all counted as
-/// FAILED reads rather than propagated, because each of them is exactly the
-/// kind of thing §2.4's obligation (c) is about and the runner does not get
-/// to decide whether it was a violation.
+/// Returns what the reads observed, plus the [`ReadPathFailure`] that ended
+/// the loop early if there was one. A slow, errored or timed-out read is an
+/// observation and stays in the tally; an unreachable endpoint or a refused
+/// ticket is the runner's own misconfiguration and is reported as a failure
+/// for [`run_cache_churn`] to bail on.
+///
+/// The window runs its FULL duration either way, including after a fatal
+/// read-path failure: the residency storm is the daemon's own drain loop,
+/// which is churning whether or not this injector can reach the Flight port,
+/// and cutting the window short would report a real storm as a vacuous one
+/// purely because the read half could not connect. The two halves are
+/// journaled separately for exactly this reason.
 async fn drive_racing_reads(
     endpoint: &str,
     target: &NodeSpec,
     query: &str,
     duration: Duration,
     read_interval: Duration,
-) -> ReadTally {
+) -> (ReadTally, Option<ReadPathFailure>) {
     let mut tally = ReadTally::default();
     let deadline = tokio::time::Instant::now() + duration;
-    let client = match tonic::transport::Endpoint::from_shared(endpoint.to_owned()) {
-        Ok(channel) => match channel.connect().await {
-            Ok(channel) => Some(FlightServiceClient::new(channel)),
-            Err(_) => None,
-        },
-        Err(_) => None,
-    };
-    let Some(mut client) = client else {
-        // Not reachable at all: every read this window would have issued is
-        // a failed one, and the `Ended` line will show `issued == failed`.
-        //
-        // The window still runs its FULL duration rather than collapsing to
-        // zero: the residency storm is the daemon's own drain loop, which is
-        // churning whether or not this injector can reach the Flight port,
-        // and cutting the window short would report a real storm as a
-        // vacuous one purely because the read half could not connect. The
-        // two halves are journaled separately for exactly this reason.
-        tally.issued = 1;
-        tally.failed = 1;
+    let bail = |tally: ReadTally, reason: String| async move {
         tokio::time::sleep_until(deadline).await;
-        return tally;
+        (tally, Some(ReadPathFailure(reason)))
+    };
+
+    let connected = match tonic::transport::Endpoint::from_shared(endpoint.to_owned()) {
+        Ok(channel) => match tokio::time::timeout(CONNECT_TIMEOUT, channel.connect()).await {
+            Ok(Ok(channel)) => Ok(FlightServiceClient::new(channel)),
+            Ok(Err(error)) => Err(format!("connecting to Flight at {endpoint}: {error}")),
+            Err(_) => Err(format!(
+                "connecting to Flight at {endpoint} did not complete within {CONNECT_TIMEOUT:?} — \
+                 the port is listening but nothing is answering it"
+            )),
+        },
+        Err(error) => Err(format!(
+            "{endpoint} is not a valid Flight endpoint: {error}"
+        )),
+    };
+    let mut client = match connected {
+        Ok(client) => client,
+        Err(reason) => return bail(tally, reason).await,
     };
 
     while tokio::time::Instant::now() < deadline {
-        let before = ResidencyCounts::since(&target.journal_path, 0).total();
+        let residency_ops_before = ResidencyCounts::since(&target.journal_path, 0).total();
         let started = tokio::time::Instant::now();
-        let outcome = read_once(&mut client, query).await;
+        let outcome = read_once(&mut client, query, READ_TIMEOUT).await;
         let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let after = ResidencyCounts::since(&target.journal_path, 0).total();
+        let residency_ops_after = ResidencyCounts::since(&target.journal_path, 0).total();
 
-        tally.issued += 1;
-        if outcome {
-            tally.served += 1;
-        } else {
-            tally.failed += 1;
+        let (outcome, refusal) = match outcome {
+            Ok(outcome) => (outcome, None),
+            Err(status) => (ReadOutcome::TicketRefused, Some(status)),
+        };
+        tally.reads.push(ReadObservation {
+            residency_ops_before,
+            residency_ops_after,
+            latency_ms,
+            outcome,
+        });
+        if let Some(status) = refusal {
+            return bail(
+                tally,
+                format!(
+                    "DoGet {query:?} was refused: {} {}",
+                    status.code(),
+                    status.message()
+                ),
+            )
+            .await;
         }
-        if after > before {
-            tally.raced += 1;
-        }
-        tally.max_latency_ms = tally.max_latency_ms.max(latency_ms);
 
         tokio::time::sleep(read_interval).await;
     }
-    tally
+    (tally, None)
 }
 
-/// One real Flight read, drained to completion. `true` iff the whole stream
-/// arrived without a typed error.
+/// One real Flight read, drained to completion under [`READ_TIMEOUT`].
+///
+/// `Err` is a REFUSED ticket only — the one outcome that is the runner's own
+/// misconfiguration rather than an observation about the system under churn.
+/// Everything else the read can do (arrive, error mid-stream, outlive the
+/// timeout) is an `Ok` outcome the caller journals.
+/// `timeout` is a parameter rather than a direct read of [`READ_TIMEOUT`]
+/// only so the unit tests can exercise the bound in milliseconds instead of
+/// in ten seconds; [`drive_racing_reads`] is the one production caller and
+/// always passes the constant.
 async fn read_once(
     client: &mut FlightServiceClient<tonic::transport::Channel>,
     query: &str,
-) -> bool {
-    let Ok(response) = client
-        .do_get(Ticket::new(query.to_owned().into_bytes()))
-        .await
-    else {
-        return false;
+    timeout: Duration,
+) -> Result<ReadOutcome, tonic::Status> {
+    let ticket = Ticket::new(query.to_owned().into_bytes());
+    let Ok(response) = tokio::time::timeout(timeout, client.do_get(ticket)).await else {
+        return Ok(ReadOutcome::TimedOut);
     };
-    let mut stream = response.into_inner();
+    let mut stream = response?.into_inner();
     loop {
-        match stream.message().await {
-            Ok(Some(_)) => {}
-            Ok(None) => return true,
-            Err(_) => return false,
+        // The timeout covers each message rather than the whole stream: a
+        // stream that keeps delivering is being served, however long it
+        // takes in total, and its real latency is what obligation (c) grades.
+        // A stream that STOPS delivering is the hang this bound exists for.
+        match tokio::time::timeout(timeout, stream.message()).await {
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => return Ok(ReadOutcome::Served),
+            Ok(Err(_)) => return Ok(ReadOutcome::StreamError),
+            Err(_) => return Ok(ReadOutcome::TimedOut),
         }
     }
 }
@@ -1580,8 +1815,24 @@ mod tests {
     /// catch a token that drifted from what a node actually journals — a
     /// churn window would then silently count nothing and report every real
     /// storm as vacuous.
+    ///
+    /// Asserted against the `Serialize` output, which is what a node's D-6
+    /// journal line actually holds, rather than against `Debug`. Asserting
+    /// `Debug` output beside the same literals could not catch the drift it
+    /// claimed to (a `#[serde(rename)]` leaves `Debug` untouched) — it was
+    /// only testing that the enum variants are spelled the way they are
+    /// spelled.
     #[test]
     fn the_watched_event_tokens_are_the_frozen_action_names() {
+        for (event, _) in RESIDENCY_EVENTS {
+            assert_eq!(
+                serde_json::to_value(event).unwrap(),
+                serde_json::json!(event_token(event)),
+                "the token {event:?} is watched under must be what a node journals"
+            );
+        }
+        // And the tokens are the §3.3 action names verbatim, pinned here so
+        // a rename anywhere is visible in this crate's own diff too.
         let tokens: Vec<String> = RESIDENCY_EVENTS
             .iter()
             .map(|(event, _)| event_token(*event))
@@ -1627,12 +1878,184 @@ mod tests {
         assert_eq!(ResidencyCounts::since(&torn, 0).total(), 1);
     }
 
+    /// A REAL Arrow Flight server, for the churn tests whose subject is the
+    /// injector's own read loop (ACPR finding MEDIUM-8).
+    ///
+    /// # Why this fixture exists
+    ///
+    /// Both churn tests used to point the injector at `flight_port: 1`, so
+    /// neither ever entered [`drive_racing_reads`]' loop at all: a `panic!()`
+    /// at the top of [`read_once`] left the whole unit suite green, and the
+    /// only test that would have caught it was the Postgres-gated e2e, which
+    /// skips itself in every CI run. This is the same `serve_with_incoming`
+    /// construction `duckspout-daemon`'s own Flight tests use, against the
+    /// same generated service trait the real daemon implements — so the
+    /// injector's client half is exercised against a real gRPC/Flight wire,
+    /// in-process and with no backend.
+    ///
+    /// # What it still cannot cover, stated rather than implied
+    ///
+    /// The FORCING half — a shortened `hot.window` making a real daemon's
+    /// real drain loop journal real `DropWindow` lines — needs a real
+    /// daemon, a real Postgres catalog and a real object store, and stays
+    /// with `tests/fault_injection.rs`'s Postgres-gated e2e. What IS
+    /// CI-runnable here is every link between that and the judge: the read
+    /// loop really running, its per-read evidence really being journaled,
+    /// the residency bracket around each read really being read out of the
+    /// target's journal, the timeout really bounding a hung read, a refused
+    /// ticket really failing the window closed — plus, in `crate::main`'s
+    /// own tests, the override wiring that selects the target node and the
+    /// default schedule that puts the window inside the load pass.
+    mod flight_stub {
+        use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+        use arrow_flight::{
+            Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+            HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+        };
+        use futures::stream::BoxStream;
+        use tonic::{Request, Response, Status, Streaming};
+
+        /// What the stub's `do_get` does — one variant per read outcome the
+        /// injector has to tell apart.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(super) enum Behaviour {
+            /// Answers with a short stream of real `FlightData` messages.
+            Serve,
+            /// Refuses the ticket with a typed error — a misconfigured
+            /// query, which the injector must treat as fatal.
+            RefuseTicket,
+            /// Accepts the connection and never answers — a `SIGSTOP`ped
+            /// node's shape, which the injector must time out on.
+            Hang,
+        }
+
+        pub(super) struct Stub(Behaviour);
+
+        #[tonic::async_trait]
+        impl FlightService for Stub {
+            type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
+            type ListFlightsStream = BoxStream<'static, Result<FlightInfo, Status>>;
+            type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
+            type DoPutStream = BoxStream<'static, Result<PutResult, Status>>;
+            type DoExchangeStream = BoxStream<'static, Result<FlightData, Status>>;
+            type DoActionStream = BoxStream<'static, Result<arrow_flight::Result, Status>>;
+            type ListActionsStream = BoxStream<'static, Result<ActionType, Status>>;
+
+            async fn do_get(
+                &self,
+                _request: Request<Ticket>,
+            ) -> Result<Response<Self::DoGetStream>, Status> {
+                match self.0 {
+                    Behaviour::Serve => {
+                        let messages = vec![Ok(FlightData::default()), Ok(FlightData::default())];
+                        Ok(Response::new(Box::pin(futures::stream::iter(messages))))
+                    }
+                    Behaviour::RefuseTicket => Err(Status::invalid_argument("no such table")),
+                    Behaviour::Hang => {
+                        std::future::pending::<()>().await;
+                        unreachable!("pending never resolves")
+                    }
+                }
+            }
+
+            async fn handshake(
+                &self,
+                _request: Request<Streaming<HandshakeRequest>>,
+            ) -> Result<Response<Self::HandshakeStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn list_flights(
+                &self,
+                _request: Request<Criteria>,
+            ) -> Result<Response<Self::ListFlightsStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn get_flight_info(
+                &self,
+                _request: Request<FlightDescriptor>,
+            ) -> Result<Response<FlightInfo>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn poll_flight_info(
+                &self,
+                _request: Request<FlightDescriptor>,
+            ) -> Result<Response<PollInfo>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn get_schema(
+                &self,
+                _request: Request<FlightDescriptor>,
+            ) -> Result<Response<SchemaResult>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn do_put(
+                &self,
+                _request: Request<Streaming<FlightData>>,
+            ) -> Result<Response<Self::DoPutStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn do_exchange(
+                &self,
+                _request: Request<Streaming<FlightData>>,
+            ) -> Result<Response<Self::DoExchangeStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn do_action(
+                &self,
+                _request: Request<Action>,
+            ) -> Result<Response<Self::DoActionStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn list_actions(
+                &self,
+                _request: Request<Empty>,
+            ) -> Result<Response<Self::ListActionsStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+        }
+
+        /// Spawns the stub on an ephemeral loopback port and returns it.
+        pub(super) async fn spawn(behaviour: Behaviour) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let _ = tonic::transport::Server::builder()
+                    .add_service(FlightServiceServer::new(Stub(behaviour)))
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                    .await;
+            });
+            port
+        }
+    }
+
+    /// Appends `lines` to `path` after `delay` — a stand-in for the real
+    /// daemon's drain loop journaling residency actions while the injector's
+    /// reads are in flight.
+    fn append_journal_after(
+        path: std::path::PathBuf,
+        delay: Duration,
+        lines: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(lines.as_bytes()).unwrap();
+        })
+    }
+
     /// A churn window that observed no residency action at all must FAIL,
     /// not journal a clean `Ended` line: a storm that never happened is
     /// exactly §8.4's vacuous fault, and recording it as a completed window
     /// would tell a judge the run exercised something it did not. The
     /// `Ended` line is still written first, so the run's own journal shows
     /// the zero counts that justify the failure.
+    ///
+    /// The reads all SUCCEED here, against a real Flight server, so the
+    /// failure can only come from the absent residency actions — the read
+    /// half cannot mask it.
     #[tokio::test]
     async fn a_churn_window_that_churned_nothing_fails_closed() {
         let (log_path, log) = scratch_faultlog("cache-churn-vacuous");
@@ -1641,17 +2064,14 @@ mod tests {
             "residency-idle",
             "{\"node\":\"n1\",\"seq\":0,\"event\":\"Accept\"}\n",
         );
-        // Port 1 is not bound by anything here, so every read fails — which
-        // is an observation, not an error (the injector's own docs); the
-        // failure below must come from the ABSENT residency actions.
-        spec.flight_port = 1;
+        spec.flight_port = flight_stub::spawn(flight_stub::Behaviour::Serve).await;
 
         let error = run_cache_churn(
             "cache-churn-0",
             &spec,
             "SELECT 1",
             Duration::ZERO,
-            Duration::from_millis(50),
+            Duration::from_millis(100),
             Duration::from_millis(10),
             &log,
         )
@@ -1666,7 +2086,13 @@ mod tests {
             ended["detail"]["residency_actions_during_window"]["total"],
             0
         );
-        assert_eq!(ended["detail"]["reads_during_window"]["served"], 0);
+        assert!(
+            ended["detail"]["reads_during_window"]["served"]
+                .as_u64()
+                .unwrap()
+                > 0,
+            "the reads themselves succeeded, so the failure is the storm's absence: {lines:#?}"
+        );
     }
 
     /// The `Ended` line reports the real counts it observed, per event —
@@ -1676,46 +2102,50 @@ mod tests {
     /// that omitted the two events it cannot yet see, either of which would
     /// leave a judge unable to tell "no cache class" from "cache class that
     /// never churned".
+    ///
+    /// Also pins the window ANCHOR against the `residency_actions_before_window`
+    /// baseline the `Started` line carries: one action lands during the
+    /// injector's delay and belongs to the baseline, two land inside the
+    /// window and belong to it.
     #[tokio::test]
     async fn a_churn_window_journals_every_residency_event_it_watched() {
         let (log_path, log) = scratch_faultlog("cache-churn-counts");
         let mut spec = test_support::dummy_spec();
-        spec.flight_port = 1;
-        // The journal already holds one pre-window action, and gains two
-        // more that the window itself must be the one to count.
-        spec.journal_path = write_node_journal(
-            "residency-during",
+        spec.flight_port = flight_stub::spawn(flight_stub::Behaviour::Serve).await;
+        spec.journal_path = write_node_journal("residency-during", "");
+        let during_delay = append_journal_after(
+            spec.journal_path.clone(),
+            Duration::from_millis(20),
             "{\"node\":\"n1\",\"seq\":0,\"event\":\"DropWindow\"}\n",
         );
-        let journal_path = spec.journal_path.clone();
-        let appender = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&journal_path)
-                .unwrap();
-            file.write_all(
-                b"{\"node\":\"n1\",\"seq\":1,\"event\":\"DropWindow\"}\n\
-                  {\"node\":\"n1\",\"seq\":2,\"event\":\"DropWindow\"}\n",
-            )
-            .unwrap();
-        });
+        let during_window = append_journal_after(
+            spec.journal_path.clone(),
+            Duration::from_millis(150),
+            "{\"node\":\"n1\",\"seq\":1,\"event\":\"DropWindow\"}\n\
+             {\"node\":\"n1\",\"seq\":2,\"event\":\"DropWindow\"}\n",
+        );
 
         run_cache_churn(
             "cache-churn-0",
             &spec,
             "SELECT 1",
-            Duration::ZERO,
-            Duration::from_millis(200),
+            Duration::from_millis(100),
+            Duration::from_millis(400),
             Duration::from_millis(10),
             &log,
         )
         .await
         .expect("a window that observed real residency actions must succeed");
-        appender.await.unwrap();
+        during_delay.await.unwrap();
+        during_window.await.unwrap();
 
         let lines = window_lines(&log_path, "cache-churn-0");
         assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        assert_eq!(
+            lines[1]["detail"]["residency_actions_before_window"]["total"], 1,
+            "the action journaled during the delay belongs to the baseline, not the window: \
+             {lines:#?}"
+        );
         let observed = &lines.last().unwrap()["detail"]["residency_actions_during_window"];
         assert_eq!(observed["drop_window"], 2);
         assert_eq!(
@@ -1724,6 +2154,203 @@ mod tests {
         );
         assert_eq!(observed["evict"], 0);
         assert_eq!(observed["total"], 2);
+    }
+
+    /// The read loop really traverses a real Flight server, and journals
+    /// PER-READ evidence a judge can consume (ACPR findings MEDIUM-7 and
+    /// MEDIUM-8). Would catch an injector whose reads never left the
+    /// process (a `panic!()` at the top of `read_once` used to leave the
+    /// whole unit suite green), and an `Ended` line that aggregated the
+    /// per-read latencies and residency brackets into scalars — in which a
+    /// blocked racing read and an unrelated slow unraced read are
+    /// indistinguishable.
+    #[tokio::test]
+    async fn the_churn_windows_reads_are_journaled_one_by_one_with_their_own_residency_bracket() {
+        let (log_path, log) = scratch_faultlog("cache-churn-per-read");
+        let mut spec = test_support::dummy_spec();
+        spec.flight_port = flight_stub::spawn(flight_stub::Behaviour::Serve).await;
+        spec.journal_path = write_node_journal("residency-per-read", "");
+        // Journaled while reads are in flight, so at least one read's own
+        // bracket has to move.
+        let appender = append_journal_after(
+            spec.journal_path.clone(),
+            Duration::from_millis(120),
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"DropWindow\"}\n",
+        );
+
+        run_cache_churn(
+            "cache-churn-0",
+            &spec,
+            "SELECT 1",
+            Duration::ZERO,
+            Duration::from_millis(400),
+            Duration::from_millis(5),
+            &log,
+        )
+        .await
+        .expect("a window that observed a real residency action must succeed");
+        appender.await.unwrap();
+
+        let lines = window_lines(&log_path, "cache-churn-0");
+        let reads = &lines.last().unwrap()["detail"]["reads_during_window"];
+        let issued = reads["issued"].as_u64().unwrap();
+        assert!(
+            issued > 1,
+            "the loop must have issued many real Flight reads: {lines:#?}"
+        );
+        assert_eq!(
+            reads["served"], reads["issued"],
+            "every read against a serving stub must be served: {lines:#?}"
+        );
+        assert_eq!(reads["failed"], 0);
+
+        let per_read = reads["reads"].as_array().unwrap();
+        assert_eq!(
+            u64::try_from(per_read.len()).unwrap(),
+            issued,
+            "every issued read must appear in the per-read evidence, not only in the aggregates: \
+             {lines:#?}"
+        );
+        for read in per_read {
+            assert_eq!(read["outcome"], "served");
+            assert!(
+                read["residency_ops_after"].as_u64().unwrap()
+                    >= read["residency_ops_before"].as_u64().unwrap()
+            );
+            assert!(read["latency_ms"].is_number());
+        }
+        // The residency action landed mid-window, so exactly the read that
+        // straddled it has a bracket that moved — and that is the read
+        // obligation (c) is about.
+        let raced: Vec<&serde_json::Value> = per_read
+            .iter()
+            .filter(|read| {
+                read["residency_ops_after"].as_u64() > read["residency_ops_before"].as_u64()
+            })
+            .collect();
+        assert_eq!(
+            u64::try_from(raced.len()).unwrap(),
+            reads["raced_residency_action"].as_u64().unwrap(),
+            "the aggregate raced count must be exactly the per-read evidence's own: {lines:#?}"
+        );
+    }
+
+    /// A refused ticket is a misconfigured query, not a fault window — the
+    /// policy `run_flight_kill_mid_stream`'s docs state and follow, now
+    /// followed here too (ACPR finding MEDIUM-5). Would catch an injector
+    /// that collapsed a refusal into "a failed read" and reported a healthy
+    /// completed window for a query the node never ran.
+    #[tokio::test]
+    async fn a_refused_ticket_fails_the_window_closed_rather_than_counting_as_an_observation() {
+        let (log_path, log) = scratch_faultlog("cache-churn-refused");
+        let mut spec = test_support::dummy_spec();
+        spec.flight_port = flight_stub::spawn(flight_stub::Behaviour::RefuseTicket).await;
+        // Real residency churn, so the vacuity guard cannot be what fails.
+        spec.journal_path = write_node_journal("residency-refused", "");
+        let appender = append_journal_after(
+            spec.journal_path.clone(),
+            Duration::from_millis(20),
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"DropWindow\"}\n",
+        );
+
+        let error = run_cache_churn(
+            "cache-churn-0",
+            &spec,
+            "SELECT * FROM no_such_table",
+            Duration::ZERO,
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+            &log,
+        )
+        .await
+        .expect_err("a refused ticket must fail the window closed");
+        appender.await.unwrap();
+        assert!(
+            error.to_string().contains("refused"),
+            "the error must name the refusal, not the storm: {error:#}"
+        );
+
+        let lines = window_lines(&log_path, "cache-churn-0");
+        assert_eq!(
+            phases(&lines),
+            vec!["armed", "started", "ended"],
+            "the Ended line is journaled BEFORE the bail, so the run's own record carries the \
+             evidence: {lines:#?}"
+        );
+        let ended = &lines.last().unwrap()["detail"];
+        assert!(
+            ended["read_path_failure"]
+                .as_str()
+                .unwrap()
+                .contains("refused"),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            ended["reads_during_window"]["reads"][0]["outcome"],
+            "ticket_refused"
+        );
+        assert!(
+            ended["residency_actions_during_window"]["total"]
+                .as_u64()
+                .unwrap()
+                > 0,
+            "the storm half really happened and is journaled anyway: {lines:#?}"
+        );
+    }
+
+    /// A node whose listen socket is alive but which never answers (a
+    /// `SIGSTOP`ped one — `--fault-cache-churn-node 0 --fault-sigstop-node 0`)
+    /// must time the read out, not hang the fleet run (ACPR finding
+    /// MEDIUM-4). Would catch the unbounded `do_get` await this injector
+    /// shipped with; the sibling `run_flight_kill_mid_stream` has bounded
+    /// its own first-message read all along.
+    ///
+    /// Exercises [`read_once`] directly so the bound can be measured in
+    /// milliseconds rather than in [`READ_TIMEOUT`]'s ten seconds.
+    #[tokio::test]
+    async fn a_read_against_a_listening_but_unanswering_node_times_out() {
+        let port = flight_stub::spawn(flight_stub::Behaviour::Hang).await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .connect()
+            .await
+            .expect("the socket accepts — that is the whole hazard");
+        let mut client = FlightServiceClient::new(channel);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_once(&mut client, "SELECT 1", Duration::from_millis(150)),
+        )
+        .await
+        .expect("read_once must return on its own, not be rescued by this outer timeout");
+        assert_eq!(outcome.unwrap(), ReadOutcome::TimedOut);
+    }
+
+    /// A read that never touched the read path is not a read that RACED one.
+    /// `duckspout_judge::predicates::cache_transparency` already excludes
+    /// non-`Served` outcomes from its baselines; the two sides have to agree
+    /// (ACPR finding MEDIUM-7). Would catch a `raced` count taken over every
+    /// observation regardless of outcome.
+    #[test]
+    fn a_refused_or_timed_out_read_is_never_counted_as_having_raced() {
+        let straddling = |outcome| ReadObservation {
+            residency_ops_before: 4,
+            residency_ops_after: 5,
+            latency_ms: 1,
+            outcome,
+        };
+        let tally = ReadTally {
+            reads: vec![
+                straddling(ReadOutcome::Served),
+                straddling(ReadOutcome::TimedOut),
+                straddling(ReadOutcome::TicketRefused),
+                straddling(ReadOutcome::StreamError),
+            ],
+        };
+        assert_eq!(tally.raced(), 1);
+        assert_eq!(tally.to_json()["raced_residency_action"], 1);
+        assert_eq!(tally.to_json()["issued"], 4);
+        assert_eq!(tally.to_json()["served"], 1);
+        assert_eq!(tally.to_json()["failed"], 3);
     }
 
     /// A [`NodeSpec`] with a chosen `/status` port — the network-fault

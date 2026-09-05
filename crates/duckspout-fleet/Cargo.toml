@@ -69,5 +69,13 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[dev-dependencies]
+# The REAL Arrow Flight server fixture the cache-churn injector's read-loop
+# tests run against (`fault::run_cache_churn`, #207): `TcpListenerStream` is
+# the same `serve_with_incoming` construction `duckspout-daemon`'s own Flight
+# tests use, so the injector's client half is exercised against a real
+# gRPC/Flight wire in-process, with no backend.
+tokio-stream = { workspace = true }
+
 [lints]
 workspace = true

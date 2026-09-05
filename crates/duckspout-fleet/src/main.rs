@@ -2,7 +2,7 @@
 //!
 //! Issue #201's foundational slice: **node provisioning**, **real
 //! `MinIO`/Postgres wiring**, and a **boot/drive-load smoke loop**; issues
-//! #203 and #204 added **fault injection** on top of it ([`fault`] for the
+//! #203, #204 and #207 added **fault injection** on top of it ([`fault`] for the
 //! injectors, [`link`] for the real network faults' mechanism,
 //! [`faultlog`] for the `faults.ndjson` window journal). Still absent: the
 //! judge (#205–#208) and the real `duckspout-loadgen` internals (#202).
@@ -190,7 +190,17 @@ struct Cli {
     boot_timeout_secs: u64,
 
     /// OTLP export batches sent to each node during the drive-load pass.
-    #[arg(long, default_value_t = 20)]
+    ///
+    /// Sized so the default load pass OUTLASTS every armed fault window's
+    /// default schedule: `(load_batches - 1) * load_interval_ms` ≈ 11.8s,
+    /// against fault delays of 3–5s and durations of up to 8s. A fault
+    /// window that opens after the load has already stopped is a window on
+    /// an idle fleet, which is worst for the churn fault — "a residency
+    /// storm on an idle node churns nothing"
+    /// ([`fault::run_cache_churn`]) — but weakens every other one too.
+    /// [`the_default_churn_window_overlaps_the_default_load_pass`] pins the
+    /// arithmetic (ACPR finding MEDIUM-6).
+    #[arg(long, default_value_t = 60)]
     load_batches: u32,
 
     /// Log records per OTLP export batch.
@@ -431,20 +441,32 @@ struct Cli {
     #[arg(long)]
     fault_cache_churn_node: Option<u16>,
 
-    /// Delay before the churn window opens.
-    #[arg(long, default_value_t = 5)]
+    /// Delay before the churn window opens. Long enough for the first
+    /// shortened `hot.window` to have sealed and drained, short enough that
+    /// the window below still closes inside the default load pass.
+    #[arg(long, default_value_t = 3)]
     fault_cache_churn_delay_secs: u64,
 
     /// How long the churn window holds — how long reads keep racing the
-    /// residency actions. Long enough by default for several windows to
-    /// seal and drain at the shortened `hot.window` below.
-    #[arg(long, default_value_t = 20)]
+    /// residency actions. Long enough for several windows to seal and drain
+    /// at the shortened `hot.window` below (at `1s` + the `1s` default
+    /// `--allowed-lateness`, a window becomes drainable ~2s after it opens,
+    /// so 8s covers several), and short enough that `delay + duration` still
+    /// lands inside the default load pass — see `--load-batches`.
+    #[arg(long, default_value_t = 8)]
     fault_cache_churn_duration_secs: u64,
 
     /// The `hot.window` the churn target is booted with, replacing
     /// `--hot-window` for that one node. An existing §9.6.1 setting tuned
     /// down, never a new knob — the fault uses the daemon's own drain
     /// cadence rather than a back door.
+    ///
+    /// Must differ from `--hot-window`: passing the fleet-wide value here
+    /// renders a byte-identical node config, which is a no-op fault that
+    /// would still satisfy the injector's own residency guard (that guard
+    /// only proves the node drained at all, which an unfaulted node does
+    /// too). [`run`] rejects it rather than running a fault that forces
+    /// nothing (R-3/vacuity-avoidance).
     #[arg(long, default_value = "1s")]
     fault_cache_churn_hot_window: String,
 
@@ -563,7 +585,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         spawn_loadgen_best_effort(loadgen_bin, &nodes[0]).await;
     }
 
-    // §8.4/issues #203 and #204: whichever `--fault-*` faults were armed run
+    // §8.4/issues #203, #204 and #207: whichever `--fault-*` faults were armed run
     // CONCURRENTLY with the drive-load/settle passes below — a fault fired
     // only after the smoke loop already finished would prove nothing about
     // the system under load. `fault_log` and `running` are separate
@@ -791,9 +813,9 @@ struct FaultRun<'a> {
     log: &'a faultlog::FaultLog,
 }
 
-/// Runs whichever faults `cli` armed (§8.4, issues #203 and #204).
+/// Runs whichever faults `cli` armed (§8.4, issues #203, #204 and #207).
 ///
-/// Two groups, run CONCURRENTLY with each other (and, via [`run`]'s own
+/// Three groups, run CONCURRENTLY with each other (and, via [`run`]'s own
 /// `tokio::join!`, with the drive-load and settle passes — a fault that
 /// fired only after the smoke loop finished would prove nothing about the
 /// system under load):
@@ -811,8 +833,12 @@ struct FaultRun<'a> {
 ///   running child, so they run sequentially, in the fixed order below.
 ///   Each one's own `--fault-*-delay-secs` is measured from when its turn
 ///   starts, not from the beginning of the run.
+/// - **The cache/residency-churn fault** ([`run_cache_churn_fault`]) is its
+///   own group, for the reasons that function's own docs give: it holds
+///   neither a process handle nor a [`link::FaultLink`], so it need not
+///   serialize with either of the other two.
 ///
-/// The two groups are joined with `tokio::join!`, not `try_join!`, on
+/// The three groups are joined with `tokio::join!`, not `try_join!`, on
 /// purpose: a process fault that fails must not cancel a network fault
 /// mid-window, which would leave that link dropped with no `Ended` line
 /// ever journaled for it — an unresolved window is exactly the shape
@@ -847,6 +873,7 @@ async fn run_cache_churn_fault(ctx: &FaultRun<'_>) -> anyhow::Result<()> {
     let Some(index) = cli.fault_cache_churn_node else {
         return Ok(());
     };
+    churn_hot_window_forces_something(cli)?;
     let target = node_spec(ctx.nodes, index, "--fault-cache-churn-node")?;
     fault::run_cache_churn(
         "cache-churn-0",
@@ -858,6 +885,29 @@ async fn run_cache_churn_fault(ctx: &FaultRun<'_>) -> anyhow::Result<()> {
         ctx.log,
     )
     .await
+}
+
+/// Rejects a churn fault whose `hot.window` override equals the fleet-wide
+/// `--hot-window` (that flag's own doc comment).
+///
+/// The override is the fault's ENTIRE forcing mechanism, and setting it to
+/// the value every other node already has renders a byte-identical config:
+/// nothing is forced, yet [`fault::run_cache_churn`]'s residency guard still
+/// passes, because that guard only proves the node drained at all — which an
+/// unfaulted node under load does too. A fault that cannot fail is not a
+/// fault (R-3), so this is an error rather than a warning. Compared as
+/// strings deliberately: the daemon parses this value itself, and this
+/// runner second-guessing its duration grammar would be a second parser to
+/// keep in sync.
+fn churn_hot_window_forces_something(cli: &Cli) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cli.fault_cache_churn_hot_window != cli.hot_window,
+        "--fault-cache-churn-hot-window {:?} is the same as --hot-window, so the churn target \
+         would boot with a byte-identical config and the fault would force no residency churn at \
+         all. Pass a shorter window (the default is 1s against a 5s fleet-wide window).",
+        cli.fault_cache_churn_hot_window
+    );
+    Ok(())
 }
 
 /// The link-level faults (§8.4, issue #204): partition, asymmetric
@@ -1375,7 +1425,7 @@ fn print_summary(
     );
     println!("  work dir: {}", work_dir.display());
     println!(
-        "  fault-window journal: {} (§8.4, issues #203/#204)",
+        "  fault-window journal: {} (§8.4, issues #203/#204/#207)",
         work_dir.join("faults.ndjson").display()
     );
 }
@@ -1463,7 +1513,7 @@ mod tests {
             hot_window: "5s".to_owned(),
             allowed_lateness: "1s".to_owned(),
             boot_timeout_secs: 30,
-            load_batches: 20,
+            load_batches: 60,
             load_batch_size: 25,
             load_interval_ms: 200,
             tenant: None,
@@ -1502,8 +1552,8 @@ mod tests {
             fault_discovery_flap_down_ms: 1_000,
             fault_discovery_flap_up_ms: 1_000,
             fault_cache_churn_node: None,
-            fault_cache_churn_delay_secs: 5,
-            fault_cache_churn_duration_secs: 20,
+            fault_cache_churn_delay_secs: 3,
+            fault_cache_churn_duration_secs: 8,
             fault_cache_churn_hot_window: "1s".to_owned(),
             fault_cache_churn_query: CACHE_CHURN_DEFAULT_QUERY.to_owned(),
             fault_cache_churn_read_interval_ms: 50,
@@ -1998,6 +2048,81 @@ mod tests {
         assert_eq!(
             overrides.s3_endpoint.as_deref(),
             Some(format!("127.0.0.1:{lake_port}").as_str())
+        );
+    }
+
+    /// The churn fault's ENTIRE forcing mechanism is the per-node
+    /// `hot.window` override, and it must reach exactly the target node
+    /// (ACPR finding MEDIUM-8: disconnecting this wiring altogether used to
+    /// leave every unit test green, because the only test that exercised it
+    /// was the Postgres-gated e2e that skips itself in CI).
+    /// `topology::a_per_node_hot_window_override_reaches_the_real_loader` is
+    /// the other half — that the override reaches the real config loader.
+    #[test]
+    fn the_churn_hot_window_override_reaches_the_target_node_and_no_other() {
+        let mut cli = base_cli("churn-override");
+        assert!(
+            node_overrides(&cli, 0, None).unwrap().hot_window.is_none(),
+            "with no churn fault armed, no node's window is overridden"
+        );
+
+        cli.fault_cache_churn_node = Some(1);
+        cli.fault_cache_churn_hot_window = "250ms".to_owned();
+        assert_eq!(
+            node_overrides(&cli, 1, None).unwrap().hot_window.as_deref(),
+            Some("250ms"),
+            "the churn target boots with the shortened window — without this the fault forces \
+             nothing at all"
+        );
+        assert!(
+            node_overrides(&cli, 0, None).unwrap().hot_window.is_none(),
+            "a fleet-wide short window would be a different experiment, and would move the \
+             baseline every other fault is measured against"
+        );
+    }
+
+    /// Passing the fleet-wide `--hot-window` as the churn override renders a
+    /// byte-identical node config: nothing is forced, yet the injector's own
+    /// residency guard still passes, because that guard only proves the node
+    /// drained at all — which an unfaulted node under load does too. A fault
+    /// that cannot fail is not a fault (R-3, and §8.4's vacuity teeth).
+    #[test]
+    fn a_churn_hot_window_equal_to_the_fleet_wide_one_is_rejected() {
+        let mut cli = base_cli("churn-noop");
+        assert!(churn_hot_window_forces_something(&cli).is_ok());
+        cli.fault_cache_churn_hot_window = cli.hot_window.clone();
+        let error = churn_hot_window_forces_something(&cli).expect_err("a no-op fault must fail");
+        assert!(error.to_string().contains("byte-identical"), "{error:#}");
+    }
+
+    /// The churn window's default schedule must land INSIDE the default
+    /// drive-load pass: the fault's own docs say it "must run CONCURRENTLY
+    /// with the drive-load pass — a residency storm on an idle node churns
+    /// nothing", and `tests/fault_injection.rs`'s e2e overrides the load
+    /// parameters with commented arithmetic to make that true. The stock
+    /// defaults have to satisfy the same arithmetic (ACPR finding MEDIUM-6),
+    /// and a test is the only thing that keeps two default values that live
+    /// 200 lines apart in agreement.
+    #[test]
+    fn the_default_churn_window_overlaps_the_default_load_pass() {
+        // Parsed from clap, NOT built from `base_cli`: the subject is the
+        // real `#[arg(default_value_t = …)]` values an operator gets, and a
+        // hand-written fixture would only test itself.
+        let cli = Cli::try_parse_from(["duckspout-fleet"]).expect("the bare defaults parse");
+        // `load` sleeps `load_interval_ms` BETWEEN batches, so a pass of `n`
+        // batches spans `(n - 1) * interval` at minimum — the per-batch RPCs
+        // only make it longer, so this is the conservative bound.
+        let load_ms = u64::from(cli.load_batches - 1) * cli.load_interval_ms;
+        let window_end_ms =
+            (cli.fault_cache_churn_delay_secs + cli.fault_cache_churn_duration_secs) * 1_000;
+        assert!(
+            window_end_ms <= load_ms,
+            "the default churn window closes at {window_end_ms}ms but the default load pass ends \
+             by {load_ms}ms — the window would hold against a fleet receiving nothing"
+        );
+        assert!(
+            cli.fault_cache_churn_delay_secs * 1_000 < load_ms,
+            "the default churn window must also OPEN while load is still running"
         );
     }
 

@@ -1085,10 +1085,25 @@ fn cache_churn_produces_real_residency_actions_while_real_reads_run_through_the_
 
     // The node's OWN journal is the ground truth the window's counts are
     // read from: a count that did not correspond to a real journaled line
-    // would be this runner grading itself.
+    // would be this runner grading itself. Recount the window's OWN slice of
+    // that journal — the lines between the `Started` line's anchor and the
+    // `Ended` line's — and require exact equality. Comparing the window's
+    // count against the whole file instead can never fail for any defect:
+    // the file is a superset of every window's slice by construction, so
+    // `whole_file >= window` holds even for a count that is pure invention.
     let journal = node0_journal(&work_dir);
-    let journaled_residency = journal
+    let window_start = lines[1]["detail"]["node_journal_lines"].as_u64().unwrap();
+    let window_end = lines[2]["detail"]["node_journal_lines"].as_u64().unwrap();
+    assert!(
+        window_end >= window_start && window_end <= u64::try_from(journal.len()).unwrap(),
+        "the window's own anchors must bracket a real slice of node 0's journal ({window_start} \
+         → {window_end}, {} lines): {lines:#?}",
+        journal.len()
+    );
+    let residency_in_window = journal
         .iter()
+        .skip(usize::try_from(window_start).unwrap())
+        .take(usize::try_from(window_end - window_start).unwrap())
         .filter(|line| {
             matches!(
                 line["event"].as_str(),
@@ -1096,9 +1111,10 @@ fn cache_churn_produces_real_residency_actions_while_real_reads_run_through_the_
             )
         })
         .count();
-    assert!(
-        u64::try_from(journaled_residency).unwrap() >= total,
-        "the window counted {total} residency action(s) but node 0's own journal holds only \
-         {journaled_residency}"
+    assert_eq!(
+        u64::try_from(residency_in_window).unwrap(),
+        total,
+        "the window counted {total} residency action(s), but its own slice of node 0's journal \
+         (lines {window_start}..{window_end}) holds {residency_in_window}"
     );
 }
