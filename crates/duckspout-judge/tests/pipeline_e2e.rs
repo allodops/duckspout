@@ -115,10 +115,11 @@ impl Evidence {
         Self { dir, journal }
     }
 
-    /// The three probed `complete` reads a healthy eviction storm produces:
-    /// the same question at two different cache states, plus one read that
-    /// really overlapped a residency action and has an unraced sibling to be
-    /// judged against.
+    /// The probed `complete` reads a healthy eviction storm produces: the
+    /// same question at three different cache states, plus one read that
+    /// really overlapped a residency action and has a full unraced baseline
+    /// to be judged against (`cache_transparency::MIN_UNRACED_BASELINE_SAMPLES`
+    /// served siblings on the same node under the same concern).
     fn probed_reads(&self, name: &str) -> PathBuf {
         let read = |ops_before: u64, ops_after: u64, latency_ms: u64| {
             format!(
@@ -132,7 +133,13 @@ impl Evidence {
         };
         self.with_file(
             name,
-            &format!("{}{}{}", read(0, 0, 5), read(2, 2, 5), read(2, 3, 6)),
+            &format!(
+                "{}{}{}{}",
+                read(0, 0, 5),
+                read(1, 1, 5),
+                read(2, 2, 5),
+                read(2, 3, 6)
+            ),
         )
     }
 

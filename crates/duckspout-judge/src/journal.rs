@@ -245,16 +245,15 @@ pub struct ChangelogEntry {
 /// - **`Expire`** (§6.7): the part being retired. This is the evidence
 ///   `crate::predicates::retention_honesty` replays.
 /// - **`SnapshotSeal`** / **`LakeCommitOk`** (§6.7, §6.4): a sealed snapshot
-///   part and the commit that made it real. Read-back is the primary source
-///   for "which snapshots are committed" (§8.4 judges "against read-back
-///   state"), so a snapshot descriptor on a journal line is corroboration,
-///   not the authority — with one exception the spec itself names: a
-///   snapshot that was ITSELF later expired is gone from read-back but was
-///   in the lake when it covered, which is why `SnapshotCovered`'s
-///   surrounding invariants read `lake ∪ expired`
-///   (`specs/formal-core.md`'s `Expire` note). The predicate therefore
-///   unions read-back with journaled snapshot EXPIRIES, not with journaled
-///   snapshot seals — a seal that never committed proves nothing.
+///   part and the commit that made it real. Read-back is the ONLY source for
+///   "which snapshots are committed" (§8.4 judges "against read-back state",
+///   and `SnapshotCovered` quantifies over bare `lake`), so a snapshot
+///   descriptor on a journal line is diagnostic context and never enters
+///   `crate::predicates::retention_honesty`'s covering set — not a seal,
+///   which may never have committed, and not a snapshot's own `Expire`
+///   either, which would let the node whose `Expire` line is on trial write
+///   its own acquittal (that module's covering-set section for why snapshot
+///   rollover means read-back alone is also sufficient).
 ///
 /// [`WindowManifest`]: duckspout_types::WindowManifest
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

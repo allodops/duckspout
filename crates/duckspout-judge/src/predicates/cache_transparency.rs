@@ -78,34 +78,83 @@
 //!   this crate already keeps (`crate::predicates::latest_view`'s HIGH-1
 //!   note; watermarks are per-partition, §7.3).
 //!
+//! # Obligation (c)'s evidence is scoped per serving node AND per concern
+//!
+//! [`LockQuestion`] — what obligation (c) groups its evidence by — is
+//! `(serving_node, tenant, partition, query, concern)`. The last two
+//! coordinates were ACPR findings (HIGH-2 and HIGH-1), and each of them was
+//! a real false positive rather than a tidiness point:
+//!
+//! - **`serving_node`.** The residency counter is a count of lines in ONE
+//!   node's own D-6 journal ([`CacheProbe::serving_node`]'s doc comment:
+//!   "a probe naming a different node's counter would be comparing two
+//!   unrelated clocks"). A busy drainer's counter reaching 900 says nothing
+//!   about a quiet node whose counter is at 5, so a bracket closed — or a
+//!   latency baseline drawn — across two nodes compares two clocks that
+//!   never ticked together. Every comparison below therefore happens inside
+//!   one node's journal.
+//! - **`concern`.** An `available` read narrows silently (§7.6): it keeps
+//!   being SERVED at ever-higher residency counts precisely where a
+//!   `complete` read of the same question correctly refuses. Letting a
+//!   served `available` read close the upper half of a `complete` refusal's
+//!   bracket convicts the one thing the bracket exists to acquit — a
+//!   legitimate `DeclareLoss` coverage regression (§5.8). A lock still does
+//!   not care what concern a read ran under, which is why (c) is GRADED over
+//!   reads of any concern; what it cannot do is let one concern's outcome
+//!   stand in as the other's evidence.
+//!
 //! # Obligation (c) is self-calibrating, deliberately
 //!
 //! A racing read is convicted as BLOCKED only when it is both slower than
-//! [`DEFAULT_MAX_RACING_READ_MS`] *and* slower than the worst NON-racing
-//! read of the same query in the same run. Both halves are needed:
+//! [`DEFAULT_MAX_RACING_READ_MS`] *and* slower than the NON-racing baseline
+//! of the same lock question in the same run. Both halves are needed:
 //!
 //! - the absolute ceiling alone would convict an inherently slow query for
 //!   being slow, which says nothing about locks;
 //! - the relative baseline alone would convict on ordinary scheduling
 //!   jitter between two millisecond-scale reads.
 //!
-//! A racing read with no non-racing read of the same query to compare
-//! against is NOT judged for (c) — there is no baseline, so there is no
-//! statement to make — and it is not counted as checked either.
+//! The baseline is the **median** of the unraced served reads' latencies,
+//! over at least [`MIN_UNRACED_BASELINE_SAMPLES`] of them — not their
+//! maximum, which was ACPR finding MEDIUM-1. A maximum makes the check
+//! structurally unable to fail: one cold first read or one GC pause among
+//! the unraced samples raises the bar above anything a real lock could
+//! produce, and the run then reports a healthy `Pass` with a nonzero check
+//! count while a genuinely blocked racing read sits in the evidence. Three
+//! is the sample floor because three is exactly where a median stops
+//! following a single outlier: with one sample the "median" IS the outlier,
+//! with two it is the mean of the pair (an outlier moves it by half), and
+//! with three the middle value is unmoved by either end.
+//!
+//! A racing read whose lock question has no such baseline is NOT judged for
+//! (c) — there is no bar, so there is no statement to make — and it is not
+//! counted as checked either.
 //!
 //! The refusal rule is bracketed for the same reason: a racing read that was
-//! REFUSED is convicted only when a non-racing read of the same question was
-//! served both at a LOWER and at a HIGHER residency count. Coverage can
-//! legitimately regress exactly once, through the `DeclareLoss` ceremony
-//! (§5.8) — after which every later read of that question refuses too, so no
-//! higher-count served read exists and the bracket does not close. What the
-//! bracket does catch is the shape §2.4's corollary forbids: a question the
-//! system answers before and after the storm but fails closed on *during*
-//! it. "A cache miss can never fail-close a `complete` read."
+//! REFUSED is convicted only when a non-racing read **of the same lock
+//! question** was served both at a LOWER and at a HIGHER residency count.
+//! Coverage can legitimately regress exactly once, through the `DeclareLoss`
+//! ceremony (§5.8) — after which every later read of that question refuses
+//! too, so no higher-count served read exists and the bracket does not close.
+//! What the bracket does catch is the shape §2.4's corollary forbids: a
+//! question the system answers before and after the storm but fails closed
+//! on *during* it. "A cache miss can never fail-close a `complete` read."
+//!
+//! # Contradictory evidence gates the findings that rest on it
+//!
+//! A run whose probes claim residency churn no node journaled is
+//! contradictory evidence, and this predicate refuses to certify it. That
+//! gate runs BEFORE obligation (c) is allowed to convict, because both of
+//! (c)'s findings rest entirely on [`CacheProbe::raced_residency_action`] —
+//! the very claim the zero-residency-actions evidence contradicts (ACPR
+//! finding MEDIUM-2). The row-set half is deliberately NOT gated by it: two
+//! different answers to one question at one pinned coverage are a violation
+//! of §2.4 whatever the residency evidence says, and that finding never
+//! consults the race flag at all.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use duckspout_types::PartitionId;
+use duckspout_types::{NodeId, PartitionId};
 
 use crate::journal::JournalSet;
 use crate::read_log::{CacheProbe, ReadConcern, ReadOutcome, ReadRecord};
@@ -128,6 +177,12 @@ use crate::verdict::Verdict;
 /// exactly so an operator on slower hardware can raise it with a reason,
 /// the same posture `crate::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION` takes.
 pub const DEFAULT_MAX_RACING_READ_MS: u64 = 1_000;
+
+/// How many unraced SERVED reads of one [`LockQuestion`] are needed before
+/// their median is used as obligation (c)'s relative bar (module docs'
+/// self-calibration note for why a median rather than a maximum, and why
+/// three rather than one).
+pub const MIN_UNRACED_BASELINE_SAMPLES: usize = 3;
 
 /// One way a run violated §2.4's read-answer equivalence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,16 +209,24 @@ pub enum CacheTransparencyFinding {
     /// Obligation (c): a read that raced a residency action was held up far
     /// longer than the same query runs when nothing is racing it.
     BlockedRead {
+        /// The node that served it — every comparison behind this finding
+        /// happened inside that node's own journal (module docs).
+        serving_node: NodeId,
         /// The tenant the read was issued as.
         tenant: String,
         /// The partition it covered.
         partition: PartitionId,
         /// The question it asked.
         query: String,
+        /// The concern it ran under — evidence is never pooled across
+        /// concerns (module docs).
+        concern: ReadConcern,
         /// How long it actually took.
         latency_ms: u64,
-        /// The worst this same query ran at when NOT racing anything.
+        /// The median of this same lock question's unraced served reads.
         baseline_ms: u64,
+        /// How many unraced served reads that median was taken over.
+        baseline_samples: usize,
         /// The absolute ceiling that was also exceeded.
         ceiling_ms: u64,
     },
@@ -171,12 +234,19 @@ pub enum CacheTransparencyFinding {
     /// action was refused, on a question the system answered both before and
     /// after the storm.
     RefusedWhileRacing {
+        /// The node that refused it — the bracket that convicts it was
+        /// closed inside that node's own journal (module docs).
+        serving_node: NodeId,
         /// The tenant the read was issued as.
         tenant: String,
         /// The partition it covered.
         partition: PartitionId,
         /// The question it asked.
         query: String,
+        /// The concern it ran under. The bracket is closed only by served
+        /// reads of this SAME concern — an `available` read narrows silently
+        /// (§7.6) and so can never vouch for a `complete` read's coverage.
+        concern: ReadConcern,
         /// The refusal reason, verbatim from the client.
         reason: String,
     },
@@ -205,29 +275,36 @@ impl std::fmt::Display for CacheTransparencyFinding {
                 only_in_other.len()
             ),
             CacheTransparencyFinding::BlockedRead {
+                serving_node,
                 tenant,
                 partition,
                 query,
+                concern,
                 latency_ms,
                 baseline_ms,
+                baseline_samples,
                 ceiling_ms,
             } => write!(
                 f,
-                "tenant {tenant} partition {partition} query {query:?}: a read that raced a \
-                 residency action took {latency_ms}ms — past the {ceiling_ms}ms ceiling AND past \
-                 the {baseline_ms}ms this same query's worst unraced read took — so a residency \
-                 action held something this read path depends on (§2.4 obligation (c))"
+                "node {serving_node} tenant {tenant} partition {partition} query {query:?} \
+                 ({concern:?}): a read that raced a residency action took {latency_ms}ms — past \
+                 the {ceiling_ms}ms ceiling AND past the {baseline_ms}ms median of this same \
+                 question's {baseline_samples} unraced served read(s) on that node — so a \
+                 residency action held something this read path depends on (§2.4 obligation (c))"
             ),
             CacheTransparencyFinding::RefusedWhileRacing {
+                serving_node,
                 tenant,
                 partition,
                 query,
+                concern,
                 reason,
             } => write!(
                 f,
-                "tenant {tenant} partition {partition} query {query:?}: a read that raced a \
-                 residency action was REFUSED ({reason:?}) on a question this run answered both \
-                 before and after the storm — a cache miss can never fail-close a read (§2.4)"
+                "node {serving_node} tenant {tenant} partition {partition} query {query:?} \
+                 ({concern:?}): a read that raced a residency action was REFUSED ({reason:?}) on a \
+                 question this node answered under this same concern both before and after the \
+                 storm — a cache miss can never fail-close a read (§2.4)"
             ),
         }
     }
@@ -239,9 +316,40 @@ pub type CacheTransparencyVerdict = Verdict<CacheTransparencyFinding>;
 /// What names one QUESTION for the equivalence half (module docs).
 type Question = (String, PartitionId, String, i64);
 
-/// What names one question for obligation (c) — no pinned coverage, because
-/// a refusal has none to report and a lock does not care about coverage.
-type LockQuestion = (String, PartitionId, String);
+/// What names one question for obligation (c):
+/// `(serving_node, tenant, partition, query, concern)`.
+///
+/// No pinned coverage, because a refusal has none to report and a lock does
+/// not care about coverage. But the serving node and the concern are both
+/// load-bearing, and the module docs' "scoped per serving node AND per
+/// concern" section says exactly which false positive each one removes.
+type LockQuestion = (NodeId, String, PartitionId, String, ReadConcern);
+
+/// The lock question one probed read belongs to.
+fn lock_question(read: &ReadRecord, probe: &CacheProbe) -> LockQuestion {
+    (
+        probe.serving_node.clone(),
+        read.tenant.clone(),
+        read.partition.clone(),
+        probe.query.clone(),
+        read.concern,
+    )
+}
+
+/// Obligation (c)'s relative bar for one lock question: the median of its
+/// unraced served reads' latencies, or `None` when there are fewer than
+/// [`MIN_UNRACED_BASELINE_SAMPLES`] of them (module docs).
+///
+/// Sorts `latencies` in place. For an even sample count the upper median is
+/// taken — the conservative side of the pair, since a higher bar is the one
+/// that acquits.
+fn unraced_baseline(latencies: &mut [u64]) -> Option<u64> {
+    if latencies.len() < MIN_UNRACED_BASELINE_SAMPLES {
+        return None;
+    }
+    latencies.sort_unstable();
+    latencies.get(latencies.len() / 2).copied()
+}
 
 /// Runs the predicate against the run's read log and journals.
 ///
@@ -260,10 +368,23 @@ pub fn check(
         .filter_map(|read| read.cache.as_ref().map(|probe| (read, probe)))
         .collect();
 
+    // Contradictory evidence, decided BEFORE obligation (c) is allowed to
+    // speak: both of its findings rest on `raced_residency_action()`, and a
+    // run in which no node journaled a residency line at all contradicts
+    // exactly that claim (module docs' own section; ACPR finding MEDIUM-2).
+    // The row-set half below is deliberately not gated — it never consults
+    // the race flag, and two different answers to one question at one pinned
+    // coverage are a §2.4 violation regardless of what the journals hold.
+    let residency_evidence = journals.residency_action_count() > 0;
+
     let mut findings = Vec::new();
     let (equivalence_checked, mut equivalence_findings) = check_equivalence(&probed);
     findings.append(&mut equivalence_findings);
-    let (lock_checked, mut lock_findings) = check_no_blocking(&probed, max_racing_read_ms);
+    let (lock_checked, mut lock_findings) = if residency_evidence {
+        check_no_blocking(&probed, max_racing_read_ms)
+    } else {
+        (0, Vec::new())
+    };
     findings.append(&mut lock_findings);
 
     // A proven violation outranks every vacuity rule below: the honest
@@ -283,7 +404,7 @@ pub fn check(
                 .to_owned(),
         );
     }
-    if journals.residency_action_count() == 0 {
+    if !residency_evidence {
         return Verdict::NoVerdict(
             "the read probes label cache states, but no node journaled a single \
              Demote/Evict/DropWindow line — the probes claim residency churn the run has no \
@@ -302,10 +423,11 @@ pub fn check(
     }
     if lock_checked == 0 {
         return Verdict::NoVerdict(
-            "no read that raced a residency action had an unraced read of the same query to be \
-             judged against, so obligation (c) — no Evict-held lock ever blocks a read — went \
-             unexercised. A run that never made a read and an eviction overlap cannot certify \
-             that they do not interfere (§8.4 vacuity teeth)"
+            "no read that raced a residency action had enough unraced reads of the same lock \
+             question — same serving node, same concern — to be judged against, so obligation \
+             (c) — no Evict-held lock ever blocks a read — went unexercised. A run that never \
+             made a read and an eviction overlap on one node cannot certify that they do not \
+             interfere (§8.4 vacuity teeth)"
                 .to_owned(),
         );
     }
@@ -391,30 +513,36 @@ fn check_no_blocking(
     probed: &[(&ReadRecord, &CacheProbe)],
     ceiling_ms: u64,
 ) -> (usize, Vec<CacheTransparencyFinding>) {
-    // Baselines, from the reads that raced nothing. Only SERVED unraced
-    // reads are baselines: a refusal's latency is the cost of failing
-    // closed, not the cost of answering, so using one as the bar a served
-    // read must beat would compare two different operations — and, since a
-    // refusal is typically the faster of the two, would bias toward
-    // convicting.
-    let mut worst_unraced: BTreeMap<LockQuestion, u64> = BTreeMap::new();
+    // Baselines, from the reads that raced nothing, grouped by
+    // `LockQuestion` — so every comparison below stays inside one node's
+    // journal and one read concern (module docs). Only SERVED unraced reads
+    // are baselines: a refusal's latency is the cost of failing closed, not
+    // the cost of answering, so using one as the bar a served read must beat
+    // would compare two different operations — and, since a refusal is
+    // typically the faster of the two, would bias toward convicting.
+    let mut unraced_latencies: BTreeMap<LockQuestion, Vec<u64>> = BTreeMap::new();
     let mut served_unraced_ops: BTreeMap<LockQuestion, Vec<u64>> = BTreeMap::new();
     for (read, probe) in probed.iter().copied() {
         if probe.raced_residency_action() || !matches!(read.outcome, ReadOutcome::Served { .. }) {
             continue;
         }
-        let question = (
-            read.tenant.clone(),
-            read.partition.clone(),
-            probe.query.clone(),
-        );
-        let slot = worst_unraced.entry(question.clone()).or_default();
-        *slot = (*slot).max(probe.latency_ms);
+        let question = lock_question(read, probe);
+        unraced_latencies
+            .entry(question.clone())
+            .or_default()
+            .push(probe.latency_ms);
         served_unraced_ops
             .entry(question)
             .or_default()
             .push(probe.residency_ops_before);
     }
+    let baselines: BTreeMap<LockQuestion, (u64, usize)> = unraced_latencies
+        .into_iter()
+        .filter_map(|(question, mut latencies)| {
+            let samples = latencies.len();
+            unraced_baseline(&mut latencies).map(|median| (question, (median, samples)))
+        })
+        .collect();
 
     let mut checked = 0usize;
     let mut findings = Vec::new();
@@ -422,35 +550,37 @@ fn check_no_blocking(
         if !probe.raced_residency_action() {
             continue;
         }
-        let question = (
-            read.tenant.clone(),
-            read.partition.clone(),
-            probe.query.clone(),
-        );
+        let question = lock_question(read, probe);
         match &read.outcome {
             ReadOutcome::Served { .. } => {
-                // No unraced sibling, no baseline, no statement (module
-                // docs) — and no check counted for it either.
-                let Some(baseline_ms) = worst_unraced.get(&question).copied() else {
+                // Too few unraced siblings on this node under this concern,
+                // no baseline, no statement (module docs) — and no check
+                // counted for it either.
+                let Some((baseline_ms, baseline_samples)) = baselines.get(&question).copied()
+                else {
                     continue;
                 };
                 checked += 1;
                 if probe.latency_ms > ceiling_ms && probe.latency_ms > baseline_ms {
                     findings.push(CacheTransparencyFinding::BlockedRead {
+                        serving_node: probe.serving_node.clone(),
                         tenant: read.tenant.clone(),
                         partition: read.partition.clone(),
                         query: probe.query.clone(),
+                        concern: read.concern,
                         latency_ms: probe.latency_ms,
                         baseline_ms,
+                        baseline_samples,
                         ceiling_ms,
                     });
                 }
             }
             ReadOutcome::Refused { reason } => {
-                // The bracket (module docs): served unraced both below and
-                // above this read's cache state. Without both sides, a
-                // legitimate one-way coverage regression is indistinguishable
-                // from a cache-caused fail-close.
+                // The bracket (module docs): served unraced reads of this
+                // SAME lock question, both below and above this read's cache
+                // state. Without both sides, a legitimate one-way coverage
+                // regression is indistinguishable from a cache-caused
+                // fail-close.
                 let Some(ops) = served_unraced_ops.get(&question) else {
                     continue;
                 };
@@ -461,9 +591,11 @@ fn check_no_blocking(
                 }
                 checked += 1;
                 findings.push(CacheTransparencyFinding::RefusedWhileRacing {
+                    serving_node: probe.serving_node.clone(),
                     tenant: read.tenant.clone(),
                     partition: read.partition.clone(),
                     query: probe.query.clone(),
+                    concern: read.concern,
                     reason: reason.clone(),
                 });
             }
@@ -482,6 +614,11 @@ mod tests {
     use crate::journal::JournalLine;
 
     const QUERY: &str = "SELECT count(*) FROM duckspout_windows";
+    /// The single node every fixture serves from unless it says otherwise.
+    const NODE_A: &str = "fleet-0-1/1";
+    /// A SECOND node, for the fixtures that exist because a residency counter
+    /// is a per-node clock (module docs; ACPR finding HIGH-2).
+    const NODE_B: &str = "fleet-0-2/1";
 
     /// A run whose journals record real residency churn — the cross-check
     /// every probed run has to survive.
@@ -510,10 +647,12 @@ mod tests {
         ops_after: u64,
         latency_ms: u64,
         query: &'static str,
+        node: &'static str,
     }
 
     impl Probe {
-        /// A `complete` read that raced nothing, at cache state `ops`.
+        /// A `complete` read on [`NODE_A`] that raced nothing, at cache
+        /// state `ops`.
         fn at(ops: u64) -> Self {
             Self {
                 concern: ReadConcern::Complete,
@@ -521,18 +660,45 @@ mod tests {
                 ops_after: ops,
                 latency_ms: 5,
                 query: QUERY,
+                node: NODE_A,
             }
         }
 
         /// A read that overlapped one residency action.
         fn racing(ops: u64, latency_ms: u64) -> Self {
             Self {
-                concern: ReadConcern::Complete,
-                ops_before: ops,
                 ops_after: ops + 1,
                 latency_ms,
-                query: QUERY,
+                ..Self::at(ops)
             }
+        }
+
+        /// The same probe, served by a different node.
+        fn on(self, node: &'static str) -> Self {
+            Self { node, ..self }
+        }
+
+        /// The same probe, issued under `available` (§7.6).
+        fn available(self) -> Self {
+            Self {
+                concern: ReadConcern::Available,
+                ..self
+            }
+        }
+
+        /// The same probe, at a different latency.
+        fn taking(self, latency_ms: u64) -> Self {
+            Self { latency_ms, ..self }
+        }
+    }
+
+    fn probe_of(probe: Probe) -> CacheProbe {
+        CacheProbe {
+            query: probe.query.to_owned(),
+            serving_node: NodeId::new(probe.node),
+            residency_ops_before: probe.ops_before,
+            residency_ops_after: probe.ops_after,
+            latency_ms: probe.latency_ms,
         }
     }
 
@@ -545,13 +711,7 @@ mod tests {
                 complete_through_ms,
                 record_keys: keys.iter().map(|k| (*k).to_owned()).collect(),
             },
-            cache: Some(CacheProbe {
-                query: probe.query.to_owned(),
-                serving_node: NodeId::new("fleet-0-1/1"),
-                residency_ops_before: probe.ops_before,
-                residency_ops_after: probe.ops_after,
-                latency_ms: probe.latency_ms,
-            }),
+            cache: Some(probe_of(probe)),
         }
     }
 
@@ -563,22 +723,18 @@ mod tests {
             outcome: ReadOutcome::Refused {
                 reason: reason.to_owned(),
             },
-            cache: Some(CacheProbe {
-                query: probe.query.to_owned(),
-                serving_node: NodeId::new("fleet-0-1/1"),
-                residency_ops_before: probe.ops_before,
-                residency_ops_after: probe.ops_after,
-                latency_ms: probe.latency_ms,
-            }),
+            cache: Some(probe_of(probe)),
         }
     }
 
-    /// The shape a healthy storm produces: one question, two cache states,
-    /// one row set, plus a racing read with an unraced baseline so
-    /// obligation (c) is exercised too.
+    /// The shape a healthy storm produces: one question, three cache states,
+    /// one row set, plus a racing read with a full unraced baseline
+    /// ([`MIN_UNRACED_BASELINE_SAMPLES`] served siblings on the same node
+    /// under the same concern) so obligation (c) is exercised too.
     fn healthy_run() -> Vec<ReadRecord> {
         vec![
             served(Probe::at(0), 1_000, &["r-0", "r-1"]),
+            served(Probe::at(3), 1_000, &["r-0", "r-1"]),
             served(Probe::at(7), 1_000, &["r-0", "r-1"]),
             served(Probe::racing(7, 6), 1_000, &["r-0", "r-1"]),
         ]
@@ -591,7 +747,7 @@ mod tests {
             &healthy_run(),
             DEFAULT_MAX_RACING_READ_MS,
         );
-        // Two cross-state comparisons (states 7 and 7-racing against the
+        // Three cross-state comparisons (states 3, 7 and 7-racing against the
         // state-0 reference) plus one obligation-(c) judgment.
         assert!(matches!(verdict, Verdict::Pass { .. }), "got {verdict:?}");
         assert_eq!(verdict.exit_code(), 0);
@@ -712,11 +868,13 @@ mod tests {
 
     #[test]
     fn a_racing_read_held_past_both_bars_is_a_blocked_read() {
-        // Obligation (c): the unraced baseline for this query is 5ms, and
-        // the racing read took 4s — past the ceiling and two orders of
-        // magnitude past what the query costs when nothing is evicting.
+        // Obligation (c): the unraced baseline for this query is a 5ms
+        // median over three samples, and the racing read took 4s — past the
+        // ceiling and two orders of magnitude past what the query costs when
+        // nothing is evicting.
         let reads = vec![
             served(Probe::at(0), 1_000, &["r-0"]),
+            served(Probe::at(3), 1_000, &["r-0"]),
             served(Probe::at(7), 1_000, &["r-0"]),
             served(Probe::racing(7, 4_000), 1_000, &["r-0"]),
         ];
@@ -738,26 +896,57 @@ mod tests {
         // ~4s, racing or not, so nothing about the racing one implicates a
         // lock. Would catch an absolute-ceiling-only rule.
         let reads = vec![
-            served(
-                Probe {
-                    latency_ms: 4_000,
-                    ..Probe::at(0)
-                },
-                1_000,
-                &["r-0"],
-            ),
-            served(
-                Probe {
-                    latency_ms: 4_100,
-                    ..Probe::at(7)
-                },
-                1_000,
-                &["r-0"],
-            ),
-            served(Probe::racing(7, 4_050), 1_000, &["r-0"]),
+            served(Probe::at(0).taking(4_000), 1_000, &["r-0"]),
+            served(Probe::at(3).taking(4_050), 1_000, &["r-0"]),
+            served(Probe::at(7).taking(4_100), 1_000, &["r-0"]),
+            served(Probe::racing(7, 4_040), 1_000, &["r-0"]),
         ];
         let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
         assert!(matches!(verdict, Verdict::Pass { .. }), "got {verdict:?}");
+    }
+
+    #[test]
+    fn one_slow_unraced_read_does_not_excuse_a_genuinely_blocked_racing_read() {
+        // ACPR finding MEDIUM-1, as a permanent regression test. The unraced
+        // reads are 5ms, 5ms, 5ms and ONE 30s outlier — a cold first read or
+        // a GC pause. Under the old `max` baseline that outlier raised the
+        // bar above the 30s racing read and the run reported a healthy
+        // `Pass` with a nonzero check count; the median is unmoved by it, so
+        // the blocked read is convicted. Would catch any baseline statistic
+        // a single unraced sample can drag past the ceiling.
+        let reads = vec![
+            served(Probe::at(0), 1_000, &["r-0"]),
+            served(Probe::at(1), 1_000, &["r-0"]),
+            served(Probe::at(2), 1_000, &["r-0"]),
+            served(Probe::at(3).taking(30_000), 1_000, &["r-0"]),
+            served(Probe::racing(3, 30_000), 1_000, &["r-0"]),
+        ];
+        let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
+        match verdict {
+            Verdict::Violation(findings) => assert!(
+                findings
+                    .iter()
+                    .any(|f| matches!(f, CacheTransparencyFinding::BlockedRead { .. })),
+                "got {findings:?}"
+            ),
+            other => panic!("expected a BlockedRead violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn too_few_unraced_samples_are_no_baseline_at_all() {
+        // The median only stops following a single outlier at three samples
+        // (module docs), so two unraced reads are not a bar — and a racing
+        // read judged against a two-sample "median" would be judged against
+        // whichever of the two happened to be slower. No baseline, no
+        // statement, no check counted, no `Pass`.
+        let reads = vec![
+            served(Probe::at(0), 1_000, &["r-0"]),
+            served(Probe::at(3), 1_000, &["r-0"]),
+            served(Probe::racing(3, 30_000), 1_000, &["r-0"]),
+        ];
+        let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
+        assert!(matches!(verdict, Verdict::NoVerdict(_)), "got {verdict:?}");
     }
 
     #[test]
@@ -768,6 +957,7 @@ mod tests {
         // baseline-only rule.
         let reads = vec![
             served(Probe::at(0), 1_000, &["r-0"]),
+            served(Probe::at(3), 1_000, &["r-0"]),
             served(Probe::at(7), 1_000, &["r-0"]),
             served(Probe::racing(7, 9), 1_000, &["r-0"]),
         ];
@@ -832,30 +1022,21 @@ mod tests {
     #[test]
     fn a_refused_unraced_read_is_not_used_as_a_latency_baseline() {
         // A refusal's latency is the cost of failing closed, not of
-        // answering (the baseline's own note). Would catch a baseline built
-        // from the 1ms refusal, against which the 1.5s racing read looks
-        // blocked — convicting a fleet on a comparison between two different
-        // operations. Here the only unraced SERVED read of this query took
-        // 2s, so the racing read is well within it.
+        // answering (the baseline's own note). This query genuinely costs
+        // ~4s to answer, so the 2s racing read is well inside its 4s median
+        // and must not be convicted. Would catch a baseline that POOLED the
+        // four 1ms refusals in: the pooled seven-sample median is 1ms, and
+        // the racing read then clears both bars and is convicted — a fleet
+        // convicted on a comparison between two different operations.
         let reads = vec![
-            served(Probe::at(0), 1_000, &["r-0"]),
-            served(Probe::at(7), 1_000, &["r-0"]),
-            served(
-                Probe {
-                    latency_ms: 2_000,
-                    ..Probe::at(7)
-                },
-                1_000,
-                &["r-0"],
-            ),
-            refused(
-                Probe {
-                    latency_ms: 1,
-                    ..Probe::at(7)
-                },
-                "unrelated refusal",
-            ),
-            served(Probe::racing(7, 1_500), 1_000, &["r-0"]),
+            served(Probe::at(0).taking(4_000), 1_000, &["r-0"]),
+            served(Probe::at(3).taking(4_000), 1_000, &["r-0"]),
+            served(Probe::at(7).taking(4_000), 1_000, &["r-0"]),
+            refused(Probe::at(7).taking(1), "unrelated refusal"),
+            refused(Probe::at(7).taking(1), "unrelated refusal"),
+            refused(Probe::at(7).taking(1), "unrelated refusal"),
+            refused(Probe::at(7).taking(1), "unrelated refusal"),
+            served(Probe::racing(7, 2_000), 1_000, &["r-0"]),
         ];
         let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
         assert!(matches!(verdict, Verdict::Pass { .. }), "got {verdict:?}");
@@ -918,36 +1099,143 @@ mod tests {
     fn obligation_c_grades_reads_of_any_concern() {
         // A lock does not care what concern a read ran under (module docs'
         // scope table). Would catch a `complete`-only filter applied to the
-        // lock half, which would narrow a live check for no reason.
+        // lock half, which would narrow a live check for no reason. The
+        // `available` reads carry their OWN baseline, because obligation
+        // (c)'s evidence is never pooled across concerns (HIGH-1).
         let reads = vec![
             served(Probe::at(0), 1_000, &["r-0"]),
             served(Probe::at(7), 1_000, &["r-0"]),
-            served(
-                Probe {
-                    concern: ReadConcern::Available,
-                    ..Probe::at(7)
-                },
-                1_000,
-                &["r-0"],
-            ),
-            served(
-                Probe {
-                    concern: ReadConcern::Available,
-                    ..Probe::racing(7, 8_000)
-                },
-                1_000,
-                &["r-0"],
-            ),
+            served(Probe::at(0).available(), 1_000, &["r-0"]),
+            served(Probe::at(3).available(), 1_000, &["r-0"]),
+            served(Probe::at(7).available(), 1_000, &["r-0"]),
+            served(Probe::racing(7, 8_000).available(), 1_000, &["r-0"]),
         ];
         let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
         match verdict {
             Verdict::Violation(findings) => assert!(
-                findings
-                    .iter()
-                    .any(|f| matches!(f, CacheTransparencyFinding::BlockedRead { .. })),
+                findings.iter().any(|f| matches!(
+                    f,
+                    CacheTransparencyFinding::BlockedRead {
+                        concern: ReadConcern::Available,
+                        ..
+                    }
+                )),
                 "got {findings:?}"
             ),
             other => panic!("expected a violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_served_available_read_never_closes_a_complete_refusals_bracket() {
+        // ACPR finding HIGH-1, as a permanent regression test. This is the
+        // exact shape the bracket exists to ACQUIT: coverage regressed once
+        // through the `DeclareLoss` ceremony (§5.8), so every later
+        // `complete` read of the question refuses — but an `available` read
+        // keeps being served, because §7.6 says it narrows silently instead
+        // of failing closed. Pooling that served `available` read into the
+        // bracket closes its upper half and convicts the legitimate
+        // regression. Would catch a `LockQuestion` with no concern
+        // dimension.
+        let reads = vec![
+            served(Probe::at(0), 1_000, &["r-0"]),
+            served(Probe::at(1), 1_000, &["r-0"]),
+            refused(Probe::racing(5, 5), "declared loss"),
+            served(Probe::at(9).available(), 1_000, &["r-0"]),
+        ];
+        let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
+        assert!(matches!(verdict, Verdict::NoVerdict(_)), "got {verdict:?}");
+    }
+
+    #[test]
+    fn another_nodes_residency_counter_never_closes_a_bracket() {
+        // ACPR finding HIGH-2, as a permanent regression test. Node A is a
+        // busy drainer whose counter has reached 900; node B refuses while
+        // racing at its own counter's 5→6. The counters are counts of lines
+        // in two different journals (`CacheProbe::serving_node`'s own doc
+        // comment), so node A's 900 is not "after" node B's 6 in any sense —
+        // and with any second node in the pool there is always some higher
+        // count somewhere, which is why HIGH-1's defence does not hold
+        // without this one. Would catch a bracket closed across nodes.
+        let reads = vec![
+            served(Probe::at(0).on(NODE_A), 1_000, &["r-0"]),
+            served(Probe::at(900).on(NODE_A), 1_000, &["r-0"]),
+            served(Probe::at(0).on(NODE_B), 1_000, &["r-0"]),
+            refused(Probe::racing(5, 5).on(NODE_B), "declared loss"),
+        ];
+        let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
+        assert!(matches!(verdict, Verdict::NoVerdict(_)), "got {verdict:?}");
+    }
+
+    #[test]
+    fn a_bracket_closed_inside_one_nodes_own_journal_still_convicts() {
+        // The other side of HIGH-2: node scoping must not disarm the rule it
+        // narrows. Node B answers this question at its own cache states 0
+        // and 9 and fails closed only in between, which is exactly §2.4's
+        // corollary — and node A's unrelated traffic changes nothing.
+        let reads = vec![
+            served(Probe::at(400).on(NODE_A), 1_000, &["r-0"]),
+            served(Probe::at(0).on(NODE_B), 1_000, &["r-0"]),
+            served(Probe::at(9).on(NODE_B), 1_000, &["r-0"]),
+            refused(Probe::racing(5, 5).on(NODE_B), "cache miss"),
+        ];
+        let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
+        match verdict {
+            Verdict::Violation(findings) => assert!(
+                findings.iter().any(|f| matches!(
+                    f,
+                    CacheTransparencyFinding::RefusedWhileRacing { serving_node, .. }
+                        if serving_node.as_str() == NODE_B
+                )),
+                "got {findings:?}"
+            ),
+            other => panic!("expected a violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn another_nodes_unraced_reads_are_not_a_latency_baseline() {
+        // HIGH-2's latency half. Node A answers this query in 5ms and is the
+        // busier of the two; node B is on slower hardware and answers it in
+        // 4s, racing or not. Pooling the two nodes' samples produces a 5ms
+        // median that convicts node B's perfectly ordinary racing read.
+        // Scoped per node, node B has its own 4s median and is not convicted
+        // — and node B's three unraced reads are what make the check count
+        // at all.
+        let reads = vec![
+            served(Probe::at(0).on(NODE_A), 1_000, &["r-0"]),
+            served(Probe::at(1).on(NODE_A), 1_000, &["r-0"]),
+            served(Probe::at(2).on(NODE_A), 1_000, &["r-0"]),
+            served(Probe::at(3).on(NODE_A), 1_000, &["r-0"]),
+            served(Probe::at(4).on(NODE_A), 1_000, &["r-0"]),
+            served(Probe::at(0).on(NODE_B).taking(4_000), 1_000, &["r-0"]),
+            served(Probe::at(1).on(NODE_B).taking(4_000), 1_000, &["r-0"]),
+            served(Probe::at(2).on(NODE_B).taking(4_000), 1_000, &["r-0"]),
+            served(Probe::racing(2, 3_900).on(NODE_B), 1_000, &["r-0"]),
+        ];
+        let verdict = check(&churning_journals(9), &reads, DEFAULT_MAX_RACING_READ_MS);
+        assert!(matches!(verdict, Verdict::Pass { .. }), "got {verdict:?}");
+    }
+
+    #[test]
+    fn an_obligation_c_finding_needs_residency_evidence_to_rest_on() {
+        // ACPR finding MEDIUM-2, as a permanent regression test. Not one
+        // node journaled a Demote/Evict/DropWindow line, yet a probe claims
+        // it raced one. Both obligation-(c) findings rest entirely on that
+        // claim, so the contradictory-evidence gate has to be reached BEFORE
+        // they can convict. Would catch the gate being ordered after an
+        // early `Violation` return.
+        let reads = vec![
+            served(Probe::at(0), 1_000, &["r-0"]),
+            served(Probe::at(9), 1_000, &["r-0"]),
+            refused(Probe::racing(5, 5), "cache miss"),
+        ];
+        let verdict = check(&churning_journals(0), &reads, DEFAULT_MAX_RACING_READ_MS);
+        match verdict {
+            Verdict::NoVerdict(reason) => {
+                assert!(reason.contains("contradictory evidence"), "{reason}");
+            }
+            other => panic!("expected NoVerdict, got {other:?}"),
         }
     }
 }

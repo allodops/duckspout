@@ -57,17 +57,48 @@
 //! would then acquit exactly what `ExpireUncovered` (the armed broken
 //! variant, §3.6) is armed to catch.
 //!
-//! # `lake ∪ expired`, not `lake`
+//! # The covering set is READ-BACK ONLY — `\E s \in lake`, exactly as written
 //!
-//! Read-back is the authority on which snapshots the lake holds *now*. But
-//! a snapshot that itself expired later — legitimately, under a newer one —
-//! is gone from read-back and was still in the lake when it covered. The
-//! spec handles this the same way: "`InLake` in the invariants reads
-//! `lake ∪ expired`" (`specs/formal-core.md`'s `Expire` note). So the
-//! covering set here is read-back snapshots UNION snapshot parts this run's
-//! journals show being EXPIRED. Journaled snapshot *seals* are deliberately
-//! NOT in that union: a seal that never committed proves nothing, and
-//! trusting it would let a node vouch for itself.
+//! `SnapshotCovered` quantifies the covering snapshot over `lake`, the live
+//! lake, and nothing else:
+//!
+//! ```text
+//! \A e \in expired : … => \E s \in lake : …
+//! ```
+//!
+//! So the covering set here is the read-back of committed snapshots, full
+//! stop. **No journaled line ever joins it** — neither a `SnapshotSeal` nor
+//! an `Expire` of a snapshot part. Both would be the same mistake, and it is
+//! the mistake this module's own accusation shape makes fatal: obligation
+//! (A)'s *charge* is a journaled `Expire` line, so admitting a journaled line
+//! as the *defence* lets the subject acquit itself. A retention scheduler
+//! that expires uncovered changelog parts would only have to journal one
+//! more `Expire` line, for a snapshot that was never in any lake, claiming
+//! whatever coverage it needed (ACPR finding MEDIUM-3, with an executed
+//! repro — now [`tests::a_journaled_snapshot_expiry_does_not_vouch_for_an_expiry`]).
+//! Read-back is the one piece of evidence the expiring node does not write.
+//!
+//! An earlier draft of this module took the covering set to be
+//! `lake ∪ expired`, citing `specs/formal-core.md`'s `Expire` note. That
+//! citation was a misreading: the union in that note defines `InLake(k)` for
+//! **`NoAckedLoss`** — a different invariant, about whether an acked
+//! record's key is still reachable — and `SnapshotCovered` is written two
+//! screens later over bare `lake`. The spec is explicit about why it can
+//! afford to be: "In the checked scope snapshots themselves are
+//! keep-forever (a snapshot expires only under a newer covering snapshot,
+//! which the small configuration never seals)."
+//!
+//! That rule is what makes read-back-only correct rather than merely strict.
+//! `docs/design/drain.md` §7 (§6.7) builds changelog retention as **snapshot
+//! rollover**: a newer snapshot is sealed covering at least what the one it
+//! retires covered, and only then does the older one become expirable. So a
+//! part legitimately expired under a snapshot that has itself since been
+//! retired is covered by that snapshot's successor — which IS in read-back.
+//! A partition whose only covering snapshot is gone from the lake with no
+//! successor is not a false positive: it is a partition whose expired
+//! changelog parts really have no committed covering snapshot, which is
+//! precisely Keep Rule 10's charge
+//! ([`tests::a_rolled_over_snapshots_successor_is_what_acquits_the_expiry`]).
 //!
 //! # What this judge deliberately does NOT convict
 //!
@@ -83,17 +114,26 @@
 //! retention-honesty `Violation` mean "something, somewhere, is wrong with
 //! the latest view."
 //!
-//! # Vacuity teeth
+//! # Vacuity teeth, PER OBLIGATION
 //!
-//! `checked` counts obligation (A)'s guarded expiries plus obligation (B)'s
-//! attributed rows, and nothing else. A run that expired only `event` parts,
-//! or only snapshots, or whose expiries touched no acked row's last value,
-//! therefore checks zero things and reports `NoVerdict` through
-//! [`Verdict::pass`] — never a `Pass` earned by having had nothing to say.
-//! A run with no journaled `Expire` descriptor at all short-circuits to
-//! `NoVerdict` before any read-back is attempted, which is the state EVERY
-//! run in this workspace is in today: nothing journals `Expire`
-//! (`crate::journal`'s producer-status note).
+//! The two obligations are counted separately and gated separately, exactly
+//! as `crate::predicates::cache_transparency` gates its own
+//! `equivalence_checked` and `lock_checked`. A single summed scalar hid a
+//! real hazard: obligation (B) contributes zero whenever the journaled
+//! partition ids and the served view's partition ids fail to line up — a
+//! spelling drift, a tenant scoping change — and obligation (A)'s count
+//! alone was enough to report a `Pass`, certifying a sentence half of which
+//! had silently gone unexercised.
+//!
+//! So a `Pass` now requires BOTH: at least one guarded expiry evaluated
+//! against read-back, and at least one acked row attributed to an expired
+//! part's arrival range. A run that expired only `event` parts, or only
+//! snapshots, or whose expiries touched no acked row's last value, reports
+//! `NoVerdict` and says which half was empty. A run with no journaled
+//! `Expire` descriptor at all short-circuits to `NoVerdict` before any
+//! read-back is attempted, which is the state EVERY run in this workspace is
+//! in today: nothing journals `Expire` (`crate::journal`'s producer-status
+//! note).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -242,7 +282,7 @@ pub fn check<P: CommittedParts, V: LatestView>(
         );
     }
 
-    let mut checked = 0usize;
+    let mut expiries_checked = 0usize;
     let mut findings = Vec::new();
 
     // Obligation (A). Snapshots are read back once per (dataset, partition)
@@ -275,24 +315,14 @@ pub fn check<P: CommittedParts, V: LatestView>(
             }
         }
     }
-    // `lake ∪ expired` (module docs): a snapshot this run itself expired was
-    // in the lake when it covered, so it stays in the covering set.
-    for part in expired.iter().copied() {
-        if part.part_kind == PartKind::Snapshot {
-            covering
-                .entry((part.dataset.clone(), part.partition.clone()))
-                .or_default()
-                .push(CommittedSnapshot {
-                    dataset: part.dataset.clone(),
-                    partition: part.partition.clone(),
-                    part: part.part.clone(),
-                    origin_coverage: part.origin_coverage.clone(),
-                });
-        }
-    }
+    // Nothing is added to `covering` here, and that omission is the rule:
+    // `\E s \in lake` is read-back and only read-back (module docs' covering-
+    // set section). A journaled snapshot seal or a journaled snapshot expiry
+    // would both let the node whose `Expire` line is on trial write its own
+    // acquittal.
 
     for part in guarded {
-        checked += 1;
+        expiries_checked += 1;
         let scope = (part.dataset.clone(), part.partition.clone());
         let snapshots = covering.get(&scope).map_or(&[][..], Vec::as_slice);
         if !snapshots
@@ -310,24 +340,48 @@ pub fn check<P: CommittedParts, V: LatestView>(
     }
 
     // Obligation (B).
-    match check_last_values(journals, &expired, view) {
+    let rows_checked = match check_last_values(journals, &expired, view) {
         Ok((rows_checked, mut row_findings)) => {
-            checked += rows_checked;
             findings.append(&mut row_findings);
+            rows_checked
         }
         Err(reason) => return Verdict::NoVerdict(reason),
+    };
+
+    // A conviction outranks both vacuity gates: the honest headline for a
+    // convicted run is the conviction, not "inconclusive" (the same ordering
+    // `crate::predicates::cache_transparency::check` states for itself).
+    if !findings.is_empty() {
+        return Verdict::Violation(findings);
+    }
+    if expiries_checked == 0 {
+        return Verdict::NoVerdict(
+            "this run's journaled expiries were all of snapshot or `event` parts, so obligation \
+             (A) — the §3 guard itself — evaluated nothing. Keep Rule 10 guards neither kind, and \
+             a run that never expired a guarded changelog part certifies nothing about it (§8.4 \
+             vacuity teeth)"
+                .to_owned(),
+        );
+    }
+    if rows_checked == 0 {
+        return Verdict::NoVerdict(
+            "no acked row's winning changelog entry fell inside any expired part's arrival range, \
+             so obligation (B) — no acked record's last value became unreachable through expiry — \
+             evaluated nothing. That is also what a partition-id or tenant spelling drift between \
+             the journals and the served view looks like, which is exactly why obligation (A)'s \
+             own count is not allowed to carry a `Pass` on its own (§8.4 vacuity teeth)"
+                .to_owned(),
+        );
     }
 
-    if findings.is_empty() {
-        Verdict::pass(
-            checked,
-            "this run's journaled expiries were all of snapshot or `event` parts, and none of \
-             them held any acked row's last value — Keep Rule 10 guards neither, so nothing was \
-             checked (§8.4 vacuity teeth)",
-        )
-    } else {
-        Verdict::Violation(findings)
-    }
+    Verdict::pass(
+        expiries_checked + rows_checked,
+        // Unreachable: both gates above already returned when their own count
+        // was zero, so the sum is positive here. `Verdict::pass` is still the
+        // constructor used, so this predicate can never grow a path that
+        // reports a zero-check `Pass`.
+        "nothing was checked",
+    )
 }
 
 /// Obligation (B): every acked row whose winning entry sat inside an expired
@@ -510,6 +564,24 @@ mod tests {
         JournalSet { lines }
     }
 
+    /// Obligation (B)'s own subject, for the fixtures whose point is
+    /// obligation (A): an acked row whose winning entry sits inside
+    /// `part-0`'s expired 1..=9 range and which the served view still
+    /// serves. Without one of these, the per-obligation vacuity gate is
+    /// (correctly) what decides the verdict, and the test would stop being
+    /// about the guard at all. Its own correctness is what
+    /// `a_last_value_preserved_through_a_covering_snapshot_passes` asserts.
+    fn preserved_row() -> (JournalLine, InMemoryLatestView) {
+        (
+            acked_changelog(0, "kept", 3, Some("carol")),
+            InMemoryLatestView::new().with_view(
+                DATASET,
+                TENANT,
+                [("kept".to_owned(), "carol".to_owned())],
+            ),
+        )
+    }
+
     #[test]
     fn no_expire_evidence_is_no_verdict_not_a_pass() {
         // The state every run in this workspace is in today: nothing
@@ -528,12 +600,38 @@ mod tests {
     fn a_covered_changelog_expiry_passes() {
         let parts =
             InMemoryCommittedParts::new().with_snapshot(snapshot("snap-0", vec![range(1, 20)]));
+        let (row, view) = preserved_row();
+        let verdict = check(
+            &journals(vec![
+                expired_changelog_part(0, "part-0", vec![range(1, 9)]),
+                row,
+            ]),
+            &parts,
+            &view,
+        );
+        // Two checks: the guarded expiry, and the row it held.
+        assert_eq!(verdict, Verdict::Pass { checked: 2 });
+    }
+
+    #[test]
+    fn obligation_a_alone_cannot_carry_a_pass() {
+        // Per-obligation vacuity teeth (module docs). The guard evaluated a
+        // real, covered expiry — but no acked row was attributed to it, and
+        // "no attributed row" is also what a partition-id spelling drift
+        // between the journals and the served view looks like. Would catch a
+        // single summed `checked` scalar letting (A)'s count certify a
+        // sentence whose other half never ran.
+        let parts =
+            InMemoryCommittedParts::new().with_snapshot(snapshot("snap-0", vec![range(1, 20)]));
         let verdict = check(
             &journals(vec![expired_changelog_part(0, "part-0", vec![range(1, 9)])]),
             &parts,
             &InMemoryLatestView::new(),
         );
-        assert_eq!(verdict, Verdict::Pass { checked: 1 });
+        match verdict {
+            Verdict::NoVerdict(reason) => assert!(reason.contains("obligation (B)"), "{reason}"),
+            other => panic!("expected NoVerdict, got {other:?}"),
+        }
     }
 
     #[test]
@@ -622,11 +720,54 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_this_run_itself_expired_still_counts_as_covering() {
-        // `lake ∪ expired` (module docs): a snapshot retired under a newer
-        // one is absent from read-back but WAS in the lake when it covered.
-        // Would catch a judge that read only the live lake and convicted a
-        // correct fleet for its own legitimate snapshot rollover.
+    fn a_journaled_snapshot_expiry_does_not_vouch_for_an_expiry() {
+        // ACPR finding MEDIUM-3, as a permanent regression test, and the
+        // reviewer's own repro verbatim: an uncovered changelog expiry over a
+        // real key range against an EMPTY lake, acquitted by adding one extra
+        // `Expire` line claiming broad coverage for a snapshot that never
+        // existed in the lake. Obligation (A)'s charge is a journaled
+        // `Expire` line; admitting a journaled `Expire` line as the defence
+        // lets the subject write its own acquittal (module docs' covering-set
+        // section). `\E s \in lake` is read-back and only read-back.
+        let verdict = check(
+            &journals(vec![
+                expired_changelog_part(0, "part-0", vec![range(1, 9)]),
+                part_line(
+                    1,
+                    TraceEvent::Expire,
+                    "snap-that-never-was",
+                    PartKind::Snapshot,
+                    DatasetKind::Changelog,
+                    vec![range(1, 20)],
+                ),
+            ]),
+            &InMemoryCommittedParts::new(),
+            &InMemoryLatestView::new(),
+        );
+        match verdict {
+            Verdict::Violation(findings) => assert!(matches!(
+                findings.as_slice(),
+                [RetentionFinding::UncoveredExpiry {
+                    snapshots_considered: 0,
+                    ..
+                }]
+            )),
+            other => panic!("expected a violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rolled_over_snapshots_successor_is_what_acquits_the_expiry() {
+        // The legitimate case the read-back-only rule has to keep acquitting,
+        // and the reason it does (module docs): changelog retention is
+        // SNAPSHOT ROLLOVER (`docs/design/drain.md` §7) — the newer snapshot
+        // covers at least what the one it retires covered, and only then does
+        // the older one become expirable. So the successor is in read-back
+        // and covers the part directly; the retired snapshot's own journaled
+        // expiry is never needed, and is not consulted.
+        let parts =
+            InMemoryCommittedParts::new().with_snapshot(snapshot("snap-new", vec![range(1, 40)]));
+        let (row, view) = preserved_row();
         let verdict = check(
             &journals(vec![
                 expired_changelog_part(0, "part-0", vec![range(1, 9)]),
@@ -638,19 +779,19 @@ mod tests {
                     DatasetKind::Changelog,
                     vec![range(1, 20)],
                 ),
+                row,
             ]),
-            &InMemoryCommittedParts::new(),
-            &InMemoryLatestView::new(),
+            &parts,
+            &view,
         );
-        assert_eq!(verdict, Verdict::Pass { checked: 1 });
+        assert_eq!(verdict, Verdict::Pass { checked: 2 });
     }
 
     #[test]
     fn a_journaled_snapshot_seal_does_not_vouch_for_an_expiry() {
         // A seal that never committed proves nothing (module docs): only
-        // read-back, or a journaled snapshot EXPIRY, puts a snapshot in the
-        // covering set. Would catch a judge that let the expiring node
-        // vouch for itself.
+        // read-back puts a snapshot in the covering set. Would catch a judge
+        // that let the expiring node vouch for itself.
         let verdict = check(
             &journals(vec![
                 part_line(
@@ -759,21 +900,26 @@ mod tests {
 
     #[test]
     fn a_row_no_expiry_touched_is_left_to_the_latest_view_judge() {
-        // Narrowing (module docs): the winning entry at seq 40 sits outside
-        // the expired part's 1..=9 range, so retention is not what removed
-        // it. Convicting it here would report one fault twice and blur what
-        // a retention-honesty violation means.
+        // Narrowing (module docs): `u1`'s winning entry at seq 40 sits
+        // outside the expired part's 1..=9 range, so retention is not what
+        // removed it — and the view does not serve it. Convicting it here
+        // would report one fault twice and blur what a retention-honesty
+        // violation means. `kept` (seq 3, inside the range, still served) is
+        // what obligation (B) actually judges, so the `Pass` is earned rather
+        // than vacuous.
         let parts =
             InMemoryCommittedParts::new().with_snapshot(snapshot("snap-0", vec![range(1, 20)]));
+        let (row, view) = preserved_row();
         let verdict = check(
             &journals(vec![
                 expired_changelog_part(0, "part-0", vec![range(1, 9)]),
-                acked_changelog(0, "u1", 40, Some("alice")),
+                row,
+                acked_changelog(1, "u1", 40, Some("alice")),
             ]),
             &parts,
-            &InMemoryLatestView::new(),
+            &view,
         );
-        assert_eq!(verdict, Verdict::Pass { checked: 1 });
+        assert_eq!(verdict, Verdict::Pass { checked: 2 });
     }
 
     #[test]
@@ -783,18 +929,21 @@ mod tests {
         // have landed, so its absence from the view proves nothing.
         let parts =
             InMemoryCommittedParts::new().with_snapshot(snapshot("snap-0", vec![range(1, 20)]));
-        let mut timeout = acked_changelog(1, "u1", 7, Some("alice"));
+        let (row, view) = preserved_row();
+        let mut timeout = acked_changelog(2, "u1", 7, Some("alice"));
         timeout.event = TraceEvent::ClientTimeout;
         let verdict = check(
             &journals(vec![
                 expired_changelog_part(0, "part-0", vec![range(1, 9)]),
-                acked_changelog(0, "u1", 7, Some("alice")),
+                row,
+                acked_changelog(1, "u1", 7, Some("alice")),
                 timeout,
             ]),
             &parts,
-            &InMemoryLatestView::new(),
+            &view,
         );
-        assert_eq!(verdict, Verdict::Pass { checked: 1 });
+        // `u1` is not judged in either direction; `kept` is, and passes.
+        assert_eq!(verdict, Verdict::Pass { checked: 2 });
     }
 
     #[test]

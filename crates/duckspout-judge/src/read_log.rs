@@ -125,7 +125,13 @@ use serde::Deserialize;
 /// the judge grades only `complete` reads (a narrowed `available` answer is
 /// correct by definition, so treating it as evidence of completeness would
 /// manufacture violations out of documented behaviour).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+///
+/// `Ord` is derived because the concern is part of the key
+/// `crate::predicates::cache_transparency` groups its obligation-(c)
+/// evidence by: an `available` read's silent narrowing means a served
+/// `available` read can never stand in for a `complete` one, so the two
+/// concerns must not share a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadConcern {
     /// `duckspout_read_concern = 'complete'` — the default (§7.6).
@@ -175,6 +181,12 @@ pub struct CacheProbe {
     /// journal spells it (`node/incarnation`) — the residency counters below
     /// are counts within THAT node's journal, so a probe naming a different
     /// node's counter would be comparing two unrelated clocks.
+    ///
+    /// `crate::predicates::cache_transparency` therefore keys obligation
+    /// (c)'s evidence on this field: a busy node's high residency count says
+    /// nothing about a quiet node's, and a bracket or a baseline built across
+    /// two nodes would be exactly the unrelated-clocks comparison this doc
+    /// comment warns about (ACPR finding HIGH-2).
     pub serving_node: NodeId,
     /// `Demote` + `Evict` + `DropWindow` lines in `serving_node`'s journal
     /// when the read was ISSUED — the cache-state label (module docs).
