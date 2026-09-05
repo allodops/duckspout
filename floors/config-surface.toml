@@ -101,6 +101,30 @@ default = "(required)"
 since = "0.0.1"
 
 [[setting]]
+name = "lake.s3_endpoint"
+type = "string"
+default = "none (lake.uri is a local filesystem path)"
+since = "0.0.1"
+
+[[setting]]
+name = "lake.s3_region"
+type = "string"
+default = "us-east-1"
+since = "0.0.1"
+
+[[setting]]
+name = "lake.s3_access_key_id"
+type = "string"
+default = "none (required when lake.s3_endpoint is set)"
+since = "0.0.1"
+
+[[setting]]
+name = "lake.s3_secret_access_key_file"
+type = "path"
+default = "none (required when lake.s3_endpoint is set)"
+since = "0.0.1"
+
+[[setting]]
 name = "hot.window"
 type = "duration"
 default = "60s"

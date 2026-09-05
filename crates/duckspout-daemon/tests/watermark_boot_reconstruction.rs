@@ -196,7 +196,7 @@ impl RunningDaemon {
     /// readiness.
     async fn start(config_path: &std::path::Path) -> Self {
         let config = duckspout_daemon::config::load(Some(config_path)).unwrap();
-        let daemon = Daemon::boot(&config, 0).await.expect("daemon boots");
+        let daemon = Daemon::boot(&config, 0, None).await.expect("daemon boots");
         let handle = daemon.handle();
         let otlp_addr = daemon.otlp_addr();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();

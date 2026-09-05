@@ -7,7 +7,7 @@
 //! No Rust parsing in JS: this binary is the single producer of the truth.
 //!
 //! The list must stay in lockstep with [`crate::config`]; the unit test
-//! pins the ratchet count (32) and agreement with the default functions.
+//! pins the ratchet count (36) and agreement with the default functions.
 
 use serde::Serialize;
 
@@ -44,8 +44,9 @@ fn spec(name: &'static str, value_type: &'static str, default: impl Into<String>
     }
 }
 
-/// The §9.6.1 surface: 27 rows, 32 settings — the ratchet counts settings.
+/// The §9.6.1 surface: 28 rows, 36 settings — the ratchet counts settings.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one flat list, one row per setting
 pub fn settings() -> Vec<SettingSpec> {
     vec![
         spec("node.data_dir", "path", "(required)"),
@@ -85,6 +86,22 @@ pub fn settings() -> Vec<SettingSpec> {
         spec("tls.ca", "path", "(required, no default)"),
         spec("lake.committer", "string", defaults::lake_committer()),
         spec("lake.uri", "string", "(required)"),
+        spec(
+            "lake.s3_endpoint",
+            "string",
+            "none (lake.uri is a local filesystem path)",
+        ),
+        spec("lake.s3_region", "string", defaults::lake_s3_region()),
+        spec(
+            "lake.s3_access_key_id",
+            "string",
+            "none (required when lake.s3_endpoint is set)",
+        ),
+        spec(
+            "lake.s3_secret_access_key_file",
+            "path",
+            "none (required when lake.s3_endpoint is set)",
+        ),
         spec("hot.window", "duration", defaults::hot_window()),
         spec("hot.max_bytes", "bytes", "75% of volume at startup"),
         spec("drain.max_age", "duration", defaults::drain_max_age()),
@@ -159,9 +176,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_ratchet_counts_exactly_32_settings() {
-        // §9.6.1: 27 rows, 32 settings — the ratchet baseline (Rule 12).
-        assert_eq!(settings().len(), 32);
+    fn the_ratchet_counts_exactly_36_settings() {
+        // §9.6.1: 28 rows, 36 settings — the ratchet baseline (Rule 12),
+        // raised from 27/32 by issue #201's `lake.s3_*` row.
+        assert_eq!(settings().len(), 36);
     }
 
     #[test]
@@ -173,7 +191,7 @@ mod tests {
         assert_eq!(names.len(), all.len(), "duplicate setting names");
 
         let rendered = render_toml().expect("render");
-        assert_eq!(rendered.matches("[[setting]]").count(), 32);
+        assert_eq!(rendered.matches("[[setting]]").count(), 36);
         assert!(rendered.contains("name = \"tls.mode\""));
         assert!(rendered.contains("default = \"(required, no default)\""));
     }

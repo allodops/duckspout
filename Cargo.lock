@@ -998,7 +998,16 @@ dependencies = [
 name = "duckspout-fleet"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "clap",
+ "duckspout-daemon",
+ "futures",
+ "opentelemetry-proto",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
