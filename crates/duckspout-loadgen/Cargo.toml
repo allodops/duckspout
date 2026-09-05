@@ -10,6 +10,24 @@ repository.workspace = true
 [dependencies]
 clap = { workspace = true }
 duckspout-types = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+opentelemetry-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# s§3.3: anyhow in the four bin crates (ctl, fleet, judge, loadgen) only.
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# The smoke test spins up a real `duckspout-accept` OTLP service on a
+# loopback listener (the same real wire protocol a fleet accept endpoint
+# serves) rather than the full daemon binary (DuckDB + object store), so the
+# loadgen's real client/journal path is exercised end-to-end without the
+# heavier daemon composition (docs/verification.md §8.4; issue #202's own
+# scope note that a full fleet is not exercisable in this PR).
+duckspout-accept = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tokio-stream = { workspace = true }
 
 [lints]
 workspace = true
