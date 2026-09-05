@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use duckspout_loadgen::client::{connect, request_id, send_and_journal};
-use duckspout_loadgen::journal::LoadgenJournal;
+use duckspout_loadgen::client::{connect, request_id, send_and_journal, source_incarnation};
+use duckspout_loadgen::journal::{LoadgenJournal, RequestIdentity};
 use duckspout_loadgen::outcome::RequestResolution;
 use duckspout_types::NodeId;
 use serde::Serialize;
@@ -224,6 +224,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    // Also captured once, not per request (ACPR HIGH-2): the same
+    // process-incarnation identity `request_id` already embeds, spelled out
+    // so it can ride the RECORD payload too (`client::source_incarnation`
+    // docs) — this is the fix for the first_index aliasing bug.
+    let incarnation = source_incarnation(&node, start_nonce);
 
     let mut tasks = tokio::task::JoinSet::new();
     let mut sent: u64 = 0;
@@ -261,17 +266,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let batch_size = cli.batch_size;
         let first_index = sent * batch_size as u64;
         let id = request_id(&node, start_nonce, sent);
+        let incarnation = incarnation.clone();
         tasks.spawn(async move {
-            let resolution = send_and_journal(
-                &mut client,
-                &journal,
-                &tenant,
-                id,
-                batch_size,
+            let identity = RequestIdentity {
+                request_id: id,
+                tenant,
+                record_count: batch_size,
                 first_index,
-                ack_timeout,
-            )
-            .await;
+                source_incarnation: incarnation,
+            };
+            let resolution = send_and_journal(&mut client, &journal, identity, ack_timeout).await;
             stats.record(resolution);
         });
         sent += 1;

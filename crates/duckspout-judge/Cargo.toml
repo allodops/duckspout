@@ -8,7 +8,24 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# s§3.3 permits anyhow in the four bin crates (ctl, fleet, judge, loadgen)
+# only; this crate does not need it — `main.rs` is a thin wrapper around
+# `duckspout_judge::runner::run`, which returns a typed `RunOutcome` rather
+# than propagating errors, so every module (including the bin) uses
+# `thiserror` for typed, matchable errors (ACPR finding MEDIUM-HIGH-4's
+# `runner` split made this possible; `duckspout-loadgen`'s bin, by contrast,
+# still needs anyhow for its own `main.rs`'s `?`-propagating I/O setup).
 clap = { workspace = true }
+duckspout-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Unique on-disk fixture files for the journal-ingestion tests (real
+# filesystem reads, not just in-memory parsing) — same use as
+# `duckspout-daemon`/`duckspout-staging`'s own dev-dependency.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

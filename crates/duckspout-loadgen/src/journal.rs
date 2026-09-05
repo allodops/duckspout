@@ -74,8 +74,18 @@ pub struct RequestIdentity {
     /// `[first_index, first_index + record_count)` range a future judge
     /// (#205) needs to match an acked request back to its records, without
     /// reverse-engineering `main.rs`'s `sent * batch_size` arithmetic
-    /// (ACPR finding MEDIUM-HIGH-3).
+    /// (ACPR finding MEDIUM-HIGH-3). NOTE: `first_index` alone ALIASES
+    /// across fleet members and across one member's restart (ACPR HIGH-2,
+    /// `crate::client::source_incarnation` docs) — a judge must combine it
+    /// with `source_incarnation` below, never use it bare as a global key.
     pub first_index: u64,
+    /// The `(node, start_nonce)` pair naming the specific loadgen process
+    /// incarnation that sent this request (ACPR HIGH-2,
+    /// `crate::client::source_incarnation`) — what makes
+    /// `{source_incarnation}-{index}` (the actual `loadgen.index` attribute
+    /// value on the wire, `crate::client::synthetic_batch`) unique across
+    /// the whole fleet's lifetime rather than just within one process.
+    pub source_incarnation: String,
 }
 
 /// One journaled line: the frozen `{node, seq, event}` triple plus the
@@ -172,6 +182,7 @@ mod tests {
             tenant: "tenant-a".to_owned(),
             record_count: 7,
             first_index: 42,
+            source_incarnation: "loadgen-0-1000".to_owned(),
         }
     }
 
@@ -188,6 +199,7 @@ mod tests {
         assert_eq!(value["tenant"], "tenant-a");
         assert_eq!(value["record_count"], 7);
         assert_eq!(value["first_index"], 42);
+        assert_eq!(value["source_incarnation"], "loadgen-0-1000");
     }
 
     #[test]

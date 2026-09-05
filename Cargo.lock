@@ -1015,6 +1015,11 @@ name = "duckspout-judge"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "duckspout-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
