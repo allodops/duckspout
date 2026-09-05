@@ -17,15 +17,36 @@
 //! `node`/`event`/`seq` — so this journal is a strict superset of what a
 //! node's journal contains, not a divergent format.
 //!
-//! What is deliberately **not** journaled here: a "request sent" line. §3.3
-//! has no such action (the vocabulary is closed at 27 node-journaled
-//! variants plus `ClientTimeout`, D-6) — a client-side "sent" marker with no
-//! ClientAck/ClientTimeout to follow it (the loadgen crashed mid-run) is
-//! exactly the §8.4 vacuity-teeth case "a node whose journals simply stop…
-//! accuses nothing and certifies nothing," which already covers a vanished
-//! loadgen the same way it covers a vanished node. The identity needed to
-//! journal a *resolution* is tracked in memory by the caller (`crate::client`)
-//! between send and resolution instead.
+//! What is deliberately **not** journaled here, and why (ACPR finding
+//! MEDIUM-HIGH-4): a "request sent" line, through *this* NDJSON stream.
+//! `docs/verification.md` §8.4 does say the load generator "journals every
+//! request sent" — but the trace-event vocabulary is closed at exactly 27
+//! node-journaled variants plus `ClientTimeout` (D-6, `docs/seed.md`
+//! Appendix B, `docs/trace-mapping.md`), transcribed **verbatim** from
+//! §3.3's action set, which has no client-side "send" action at all
+//! (`Requests` simply exist in the model; `Accept` is the node-side
+//! transition out of `"unsent"`). Adding a `Sent` variant to `TraceEvent`
+//! to carry this would be a real amendment to a settled decision (D-6),
+//! not a mechanical fix available inside this PR
+//! (`AGENTS.md`: settled decisions go through the s§9.6 procedure, never
+//! re-litigated in a PR) — flagged here rather than done unilaterally.
+//!
+//! The concern the finding raises is nonetheless real and worth closing:
+//! without *some* durable record of in-flight requests, a loadgen killed
+//! mid-run with genuinely unresolved requests looks identical, journal-wise,
+//! to one that completed cleanly. The fix that stays inside the frozen
+//! vocabulary: `main.rs` writes a separate, non-journal summary artifact
+//! (`{journal_path}.summary.json`) at exit, tallying every
+//! [`crate::outcome::RequestResolution`] the run produced — including
+//! `Rejected` and the new `Ambiguous` bucket (module docs,
+//! `crate::outcome`), neither of which produces a journal line — so a
+//! judge or operator can see the run was incomplete (`sent > acked +
+//! timed_out + rejected + ambiguous`) without the frozen §3.3 vocabulary
+//! growing a client-side "send" event by fiat. A first-class `Sent`
+//! variant, if the design settles on wanting one, is a follow-up amendment,
+//! not a workaround smuggled into this PR. The identity needed to journal a
+//! *resolution* is tracked in memory by the caller (`crate::client`)
+//! between send and resolution.
 
 use std::io::Write;
 use std::sync::Mutex;
@@ -47,6 +68,14 @@ pub struct RequestIdentity {
     pub tenant: String,
     /// Number of log records the request carried.
     pub record_count: usize,
+    /// The 0-based index of the first record the request carried
+    /// (`loadgen.index`/`time_unix_nano` on the wire, `crate::client`'s
+    /// `synthetic_batch`) — together with `record_count` this is the exact
+    /// `[first_index, first_index + record_count)` range a future judge
+    /// (#205) needs to match an acked request back to its records, without
+    /// reverse-engineering `main.rs`'s `sent * batch_size` arithmetic
+    /// (ACPR finding MEDIUM-HIGH-3).
+    pub first_index: u64,
 }
 
 /// One journaled line: the frozen `{node, seq, event}` triple plus the
@@ -142,6 +171,7 @@ mod tests {
             request_id: id.to_owned(),
             tenant: "tenant-a".to_owned(),
             record_count: 7,
+            first_index: 42,
         }
     }
 
@@ -157,6 +187,7 @@ mod tests {
         assert_eq!(value["request_id"], "req-1");
         assert_eq!(value["tenant"], "tenant-a");
         assert_eq!(value["record_count"], 7);
+        assert_eq!(value["first_index"], 42);
     }
 
     #[test]

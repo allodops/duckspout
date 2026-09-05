@@ -12,6 +12,10 @@ clap = { workspace = true }
 duckspout-types = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+# tonic's own google.rpc details companion, to read `RetryInfo` back off a
+# `Status` (`outcome`'s HIGH-1 fix: distinguishing an explicit application
+# rejection from a transport-level failure, §3.7).
+tonic-types = { workspace = true }
 opentelemetry-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

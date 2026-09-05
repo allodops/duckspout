@@ -111,7 +111,7 @@ pub async fn send_and_journal<W: std::io::Write + Send>(
     );
 
     let raced = match tokio::time::timeout(ack_timeout, client.export(request)).await {
-        Ok(result) => RaceOutcome::Settled(result),
+        Ok(result) => RaceOutcome::Settled(result.map(tonic::Response::into_inner)),
         Err(_elapsed) => RaceOutcome::DeadlineFirst,
     };
 
@@ -119,22 +119,38 @@ pub async fn send_and_journal<W: std::io::Write + Send>(
         request_id,
         tenant: tenant.to_owned(),
         record_count,
+        first_index,
     };
     let resolution = resolve(&raced);
     match resolution {
         RequestResolution::Acked => journal.record_client_ack(&identity),
+        // The one positively-confirmed case (`outcome`'s module docs,
+        // HIGH-1): a transport-level failure vacuously satisfies the
+        // model's `ClientTimeout` precondition.
         RequestResolution::TimedOut => journal.record_client_timeout(&identity),
-        // §3.3 has no client-journaled action for an explicit, prompt
-        // rejection (`outcome`'s module docs) — nothing to journal.
-        RequestResolution::Failed => {}
+        // Rejected: §3.3 has no client-journaled action for an explicit,
+        // prompt rejection (`outcome`'s module docs) — accept already
+        // journaled its own `Throttle`/`Refuse`. Ambiguous: journaling
+        // either `ClientAck` or `ClientTimeout` here would assert something
+        // the loadgen cannot confirm (`outcome`'s module docs, HIGH-1).
+        // Neither is journaled to the frozen §3.3 vocabulary; `main`'s run
+        // summary counts both so they stay visible.
+        RequestResolution::Rejected | RequestResolution::Ambiguous => {}
     }
     resolution
 }
 
-/// A request id doubling as the OTLP idempotency key (§4.4.1): unique per
-/// loadgen instance for the lifetime of the process, so two requests from
-/// the same fleet member never collide on the server's dedup key.
+/// A request id doubling as the OTLP idempotency key (§4.4.1): unique
+/// across loadgen invocations that reuse the same `--node-id`, not just
+/// within one process's lifetime (ACPR finding HIGH-2's second half —
+/// `--journal-path` must be fresh per invocation, `main.rs`'s `Cli` docs,
+/// but a restarted fleet member conventionally keeps the *same* `--node-id`
+/// for its D-6 slot; a bare `{node}-{sequence}` would then reuse ids
+/// starting from `-0` again, silently colliding with a prior run's dedup
+/// key). `start_nonce` is one value captured once per process start
+/// (`main.rs`, not per request, and never written anywhere durable — no
+/// recovery state needed, matching the journal's own fresh-file choice).
 #[must_use]
-pub fn request_id(node: &NodeId, sequence: u64) -> String {
-    format!("{node}-{sequence}")
+pub fn request_id(node: &NodeId, start_nonce: u128, sequence: u64) -> String {
+    format!("{node}-{start_nonce}-{sequence}")
 }
