@@ -1,0 +1,255 @@
+//! The zero-acked-lost predicate (the W-shaped judge, write-side; §8.4):
+//! every record whose `ClientAck` the load generator journaled must be
+//! present in the final system (hot or lake), regardless of what the fault
+//! schedule did.
+//!
+//! # System-class exclusion (§2.2)
+//!
+//! System-class datasets are excluded **by definition**: the `_self` and
+//! `_canary` system tenants' ingest path never issues durable acks
+//! (`docs/design/data-model.md` §2.2's "System tenants" — inverted defaults,
+//! `DurableAck`/`NoAckedLoss` "not implicated rather than carved out"), so
+//! there are no acks to lose for them. In a correctly-behaving fleet this
+//! exclusion is normally vacuous here — nothing about the loadgen's own
+//! journal format prevents a `_`-prefixed tenant from appearing in a
+//! `ClientAck` line, but a real accept-side node never issues a durable ack
+//! for one — so this filter should never actually remove anything from a
+//! real run's journal. It is applied unconditionally anyway, matching the
+//! spec's literal exclusion rather than relying on that absence holding.
+
+use std::collections::BTreeSet;
+
+use duckspout_types::TraceEvent;
+
+use crate::final_state::FinalSystemState;
+use crate::journal::{JournalSet, RequestIdentity};
+
+/// The reserved system-tenant prefix (§2.2): `_self`/`_canary`, and any
+/// future `_`-prefixed system tenant.
+const SYSTEM_TENANT_PREFIX: char = '_';
+
+/// One acked request whose record range was not entirely present in the
+/// final system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckedLostFinding {
+    /// The lost request's idempotency key, for correlating back to the
+    /// journal.
+    pub request_id: String,
+    /// The tenant the request was sent as.
+    pub tenant: String,
+    /// The specific `loadgen.index` values acked but not found present.
+    pub missing_indices: BTreeSet<u64>,
+}
+
+/// The predicate's own three-valued verdict (§8.4's vacuity teeth). Kept
+/// local to this predicate rather than folded into one crate-wide `Verdict`
+/// shared by every predicate: how a multi-predicate run's verdicts combine
+/// (must all five pass? reported individually?) is #206/#207/#208's
+/// territory, not decided by this issue. `crate::main` maps this to the
+/// judge binary's own `EXIT_CONTRACT` (0/2/3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZeroAckedLostVerdict {
+    /// At least one non-system-tenant `ClientAck` was checked, and every
+    /// one's full record range was present.
+    Pass {
+        /// How many acked requests were checked.
+        checked: usize,
+    },
+    /// At least one acked request's record range was not entirely present.
+    Violation(Vec<AckedLostFinding>),
+    /// No non-system-tenant `ClientAck` was journaled by any loadgen member
+    /// — this predicate had nothing to check, so it must not report a
+    /// vacuous `Pass` (§8.4's vacuity teeth: "a judge that never rejects
+    /// anything is indistinguishable from one too weak to reject
+    /// anything").
+    NoVerdict(String),
+}
+
+/// Runs the predicate against `journals`' loadgen-journaled `ClientAck`
+/// identities and `final_state`'s read-back.
+#[must_use]
+pub fn check<S: FinalSystemState>(journals: &JournalSet, final_state: &S) -> ZeroAckedLostVerdict {
+    let acks: Vec<&RequestIdentity> = journals
+        .identity_events(TraceEvent::ClientAck)
+        .map(|(_, identity)| identity)
+        .filter(|identity| !identity.tenant.starts_with(SYSTEM_TENANT_PREFIX))
+        .collect();
+
+    if acks.is_empty() {
+        return ZeroAckedLostVerdict::NoVerdict(
+            "no ClientAck was journaled by any loadgen member for a non-system tenant — \
+             the zero-acked-lost predicate had nothing to check (§8.4 vacuity teeth)"
+                .to_owned(),
+        );
+    }
+
+    let mut findings = Vec::new();
+    for identity in &acks {
+        let missing: BTreeSet<u64> = (identity.first_index
+            ..identity.first_index + identity.record_count as u64)
+            .filter(|index| !final_state.contains(&identity.tenant, *index))
+            .collect();
+        if !missing.is_empty() {
+            findings.push(AckedLostFinding {
+                request_id: identity.request_id.clone(),
+                tenant: identity.tenant.clone(),
+                missing_indices: missing,
+            });
+        }
+    }
+
+    if findings.is_empty() {
+        ZeroAckedLostVerdict::Pass {
+            checked: acks.len(),
+        }
+    } else {
+        ZeroAckedLostVerdict::Violation(findings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use duckspout_types::NodeId;
+
+    use super::*;
+    use crate::final_state::InMemoryFinalState;
+    use crate::journal::JournalLine;
+
+    fn ack_line(
+        node: &str,
+        seq: u64,
+        tenant: &str,
+        first_index: u64,
+        record_count: usize,
+    ) -> JournalLine {
+        JournalLine {
+            source: PathBuf::from("test"),
+            line_no: usize::try_from(seq).expect("test seq fits in usize") + 1,
+            node: NodeId::new(node),
+            seq,
+            event: TraceEvent::ClientAck,
+            identity: Some(RequestIdentity {
+                request_id: format!("{node}-{seq}"),
+                tenant: tenant.to_owned(),
+                record_count,
+                first_index,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_clean_run_passes() {
+        // Every acked record's index is present in the final state.
+        let journals = JournalSet {
+            lines: vec![ack_line("loadgen-0", 0, "tenant-a", 0, 5)],
+        };
+        let final_state = InMemoryFinalState::new().with_present_range("tenant-a", 0, 5);
+        assert_eq!(
+            check(&journals, &final_state),
+            ZeroAckedLostVerdict::Pass { checked: 1 }
+        );
+    }
+
+    #[test]
+    fn a_genuinely_lost_acked_record_is_convicted() {
+        // The seeded-violation-replay fixture this predicate must convict
+        // (mission scope: "a REAL, deliberately-broken test fixture ...
+        // that this predicate must correctly convict"): index 3 was acked
+        // but the final system never has it — the exact W-shaped defect
+        // this judge exists to catch.
+        let journals = JournalSet {
+            lines: vec![ack_line("loadgen-0", 0, "tenant-a", 0, 5)],
+        };
+        // Present everywhere in [0, 5) EXCEPT index 3.
+        let final_state = InMemoryFinalState::new()
+            .with_present_range("tenant-a", 0, 3)
+            .with_present_range("tenant-a", 4, 1);
+        let verdict = check(&journals, &final_state);
+        match verdict {
+            ZeroAckedLostVerdict::Violation(findings) => {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].request_id, "loadgen-0-0");
+                assert_eq!(findings[0].tenant, "tenant-a");
+                assert_eq!(findings[0].missing_indices, BTreeSet::from([3]));
+            }
+            other => panic!("expected Violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_client_acks_is_no_verdict_not_a_vacuous_pass() {
+        // The vacuity-teeth case: nothing to check must never look like a
+        // clean pass.
+        let journals = JournalSet::default();
+        let final_state = InMemoryFinalState::new();
+        assert!(matches!(
+            check(&journals, &final_state),
+            ZeroAckedLostVerdict::NoVerdict(_)
+        ));
+    }
+
+    #[test]
+    fn only_system_tenant_acks_is_still_no_verdict() {
+        // `_self`/`_canary` acks (if any somehow appeared) must not count
+        // toward "something was checked" — would catch the system-tenant
+        // filter being applied to the VIOLATION search but not to the
+        // vacuity check, which would let a run with only system-tenant
+        // traffic (i.e. nothing this predicate is meant to certify) report
+        // a real Pass.
+        let journals = JournalSet {
+            lines: vec![ack_line("loadgen-0", 0, "_self", 0, 3)],
+        };
+        let final_state = InMemoryFinalState::new(); // even if all missing
+        assert!(matches!(
+            check(&journals, &final_state),
+            ZeroAckedLostVerdict::NoVerdict(_)
+        ));
+    }
+
+    #[test]
+    fn system_tenant_acks_are_excluded_even_when_mixed_with_real_ones() {
+        // A lost `_canary` record must NOT convict the run — §2.2's
+        // by-definition exclusion — while a real tenant's ack is still
+        // checked normally.
+        let journals = JournalSet {
+            lines: vec![
+                ack_line("loadgen-0", 0, "_canary", 0, 3), // entirely missing below
+                ack_line("loadgen-0", 1, "tenant-a", 0, 2),
+            ],
+        };
+        let final_state = InMemoryFinalState::new().with_present_range("tenant-a", 0, 2);
+        assert_eq!(
+            check(&journals, &final_state),
+            ZeroAckedLostVerdict::Pass { checked: 1 }
+        );
+    }
+
+    #[test]
+    fn client_timeout_lines_are_not_mistaken_for_acks() {
+        let journals = JournalSet {
+            lines: vec![JournalLine {
+                source: PathBuf::from("test"),
+                line_no: 1,
+                node: NodeId::new("loadgen-0"),
+                seq: 0,
+                event: TraceEvent::ClientTimeout,
+                identity: Some(RequestIdentity {
+                    request_id: "req-1".to_owned(),
+                    tenant: "tenant-a".to_owned(),
+                    record_count: 5,
+                    first_index: 0,
+                }),
+            }],
+        };
+        let final_state = InMemoryFinalState::new(); // nothing present
+        // A timeout is not an ack — nothing was promised, so there is
+        // nothing to check, and the honest verdict is NoVerdict, not a
+        // Violation manufactured from an ack that was never made.
+        assert!(matches!(
+            check(&journals, &final_state),
+            ZeroAckedLostVerdict::NoVerdict(_)
+        ));
+    }
+}
