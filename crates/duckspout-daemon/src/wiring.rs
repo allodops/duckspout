@@ -439,6 +439,16 @@ impl Daemon {
     /// production default is `None` — `duckspout-daemon`'s own CLI only
     /// builds one when `--trace-out` is given (`main.rs`).
     ///
+    /// `fault_drain_commit_delay`, when non-zero, wraps the real
+    /// `LakeCommitter` handed to `DrainCoordinator` in a
+    /// [`crate::fault::StallingLakeCommitter`] (module docs there: §8.4,
+    /// issue #203) — a fault-injection-only seam widening the real
+    /// `PutPart`→`LakeCommit` window so `duckspout-fleet`'s node-kill
+    /// injector can land a real `SIGKILL` inside it deterministically. The
+    /// production default is `Duration::ZERO`, an exact pass-through —
+    /// `duckspout-daemon`'s own CLI only sets it non-zero when
+    /// `--fault-drain-commit-delay-ms` is given (`main.rs`).
+    ///
     /// # Errors
     ///
     /// See [`BootError`].
@@ -447,6 +457,7 @@ impl Daemon {
         config: &DaemonConfig,
         status_port: u16,
         trace_sink: Option<Arc<dyn TraceSink>>,
+        fault_drain_commit_delay: std::time::Duration,
     ) -> Result<Self, BootError> {
         let node_id = system::detect_node_id(system::V01_FIXED_INCARNATION);
         let clock = SystemClock::new();
@@ -494,10 +505,24 @@ impl Daemon {
         let scratch_storage: Arc<dyn Storage> =
             Arc::new(FsStorage::create(config.node.data_dir.clone())?);
 
+        // §8.4/issue #203: the drain-side committer is wrapped in the
+        // fault-injection-only stall decorator when
+        // `fault_drain_commit_delay` is non-zero (`crate::fault`'s module
+        // docs) — a zero delay (the production default) is an exact
+        // pass-through, so this branch changes nothing for a real
+        // deployment that never passes `--fault-drain-commit-delay-ms`.
+        let drain_committer: Arc<dyn LakeCommitter> = if fault_drain_commit_delay.is_zero() {
+            Arc::clone(&committer) as Arc<dyn LakeCommitter>
+        } else {
+            Arc::new(crate::fault::StallingLakeCommitter::new(
+                Arc::clone(&committer) as Arc<dyn LakeCommitter>,
+                fault_drain_commit_delay,
+            ))
+        };
         let mut drain = DrainCoordinator::new(
             Arc::clone(&seal_surface) as Arc<dyn SealSurface>,
             Arc::clone(&ledger) as Arc<dyn duckspout_types::WatermarkBookkeeping>,
-            Arc::clone(&committer) as Arc<dyn LakeCommitter>,
+            drain_committer,
             parts_store,
             scratch_storage,
             Arc::new(clock) as Arc<dyn duckspout_types::Clock>,

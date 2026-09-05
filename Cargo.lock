@@ -1003,6 +1003,7 @@ dependencies = [
  "duckspout-daemon",
  "futures",
  "opentelemetry-proto",
+ "serde",
  "serde_json",
  "tokio",
  "tonic",

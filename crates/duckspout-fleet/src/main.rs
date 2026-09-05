@@ -24,6 +24,8 @@
 #![forbid(unsafe_code)]
 
 mod backend_check;
+mod fault;
+mod faultlog;
 mod load;
 mod process;
 mod topology;
@@ -198,6 +200,59 @@ struct Cli {
     /// Grace period for each node's SIGTERM shutdown before a hard kill.
     #[arg(long, default_value_t = 10)]
     shutdown_grace_secs: u64,
+
+    // --- Fault injection (§8.4, issue #203) ---
+    /// Node index (0-based) to `SIGKILL` as a real fault. Absent by
+    /// default: no node-kill fault runs.
+    #[arg(long)]
+    fault_kill_node: Option<u16>,
+
+    /// Times `--fault-kill-node`'s kill to land inside the real
+    /// `PutPart`→`LakeCommit` window — §8.4's sharpest fault ("the
+    /// partition owner mid-drain") — rather than firing after a plain
+    /// delay. Requires `--fault-kill-node`; boots that one node with
+    /// `--fault-drain-commit-delay-ms` set to
+    /// `--fault-kill-drain-stall-ms` so the window is wide enough to hit
+    /// deterministically (`fault`'s module docs). Enforced by clap
+    /// (`requires`), not merely documented (R-3/vacuity-avoidance,
+    /// `AGENTS.md`) — an ACPR finding: this flag without
+    /// `--fault-kill-node` used to silently arm nothing.
+    #[arg(long, requires = "fault_kill_node")]
+    fault_kill_mid_drain: bool,
+
+    /// Delay before firing `--fault-kill-node`'s kill, when
+    /// `--fault-kill-mid-drain` is NOT set.
+    #[arg(long, default_value_t = 5)]
+    fault_kill_delay_secs: u64,
+
+    /// The target node's `--fault-drain-commit-delay-ms` stall (only
+    /// applied to that one node's boot), used only when
+    /// `--fault-kill-mid-drain` is set.
+    #[arg(long, default_value_t = 3_000)]
+    fault_kill_drain_stall_ms: u64,
+
+    /// How long `--fault-kill-mid-drain`'s journal watch waits for a
+    /// `PutPart` line before giving up (e.g. a drive-load pass that never
+    /// produces a drainable window).
+    #[arg(long, default_value_t = 60)]
+    fault_kill_mid_drain_timeout_secs: u64,
+
+    /// Node index (0-based) to `SIGSTOP`/`SIGCONT` as a real pause fault
+    /// (§8.4's `FencedZombie` fault). Absent by default: no SIGSTOP fault
+    /// runs.
+    #[arg(long)]
+    fault_sigstop_node: Option<u16>,
+
+    /// Delay before sending `SIGSTOP` to `--fault-sigstop-node`.
+    #[arg(long, default_value_t = 5)]
+    fault_sigstop_delay_secs: u64,
+
+    /// How long to hold `--fault-sigstop-node` paused before `SIGCONT` —
+    /// the default comfortably exceeds
+    /// `duckspout_daemon::constants::HEARTBEAT_TTL_SECS`, so the pause is
+    /// "long enough to expire claims" per §8.4's own wording.
+    #[arg(long, default_value_t = duckspout_daemon::constants::HEARTBEAT_TTL_SECS + 5)]
+    fault_sigstop_duration_secs: u64,
 }
 
 /// This runner's own smoke-loop status codes — **not** `duckspout-judge`'s
@@ -271,8 +326,26 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         spawn_loadgen_best_effort(loadgen_bin, &nodes[0]).await;
     }
 
-    let load_results = drive_load_all(&nodes, &cli).await;
-    let all_accepted = load_results.iter().all(load::LoadResult::fully_accepted);
+    // §8.4/issue #203: whichever `--fault-*` faults were armed run
+    // CONCURRENTLY with the drive-load/settle passes below — a fault fired
+    // only after the smoke loop already finished would prove nothing about
+    // the system under load. `fault_log` and `running` are separate
+    // bindings from `nodes` (module docs of `run_armed_faults`), so this
+    // borrows nothing the drive-load/settle futures also touch.
+    let fault_log = faultlog::FaultLog::create(&work_dir.join("faults.ndjson"))
+        .with_context(|| format!("creating {}", work_dir.join("faults.ndjson").display()))?;
+    let (fault_result, load_results, drain_confirmed) = tokio::join!(
+        run_armed_faults(&cli, &mut running, &fault_log),
+        drive_load_all(&nodes, &cli),
+        wait_for_any_watermark(&nodes, Duration::from_secs(cli.settle_timeout_secs)),
+    );
+    if let Err(error) = fault_result {
+        tracing::error!(%error, "fault injection failed");
+        shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
+        report_work_dir(&work_dir);
+        return Err(error);
+    }
+    let all_accepted = all_batches_accepted(&cli, &load_results);
     for (node, result) in nodes.iter().zip(&load_results) {
         tracing::info!(
             node = %node.name,
@@ -282,9 +355,6 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             "drive-load pass complete"
         );
     }
-
-    let drain_confirmed =
-        wait_for_any_watermark(&nodes, Duration::from_secs(cli.settle_timeout_secs)).await;
 
     shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
 
@@ -303,6 +373,31 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         return Ok(EXIT_DRAIN_UNCONFIRMED);
     }
     Ok(EXIT_OK)
+}
+
+/// Whether every node's drive-load pass counts as fully accepted for
+/// `run()`'s own exit-code purposes.
+///
+/// §8.4's own design premise (quoted in this crate's module docs): the
+/// fleet must be free to misbehave during the run and still be convicted
+/// precisely AFTERWARD by a separate judge (`duckspout-judge`, #205–#208),
+/// never by this runner's own exit code. A node named by `cli.fault_kill_node`
+/// is exempted from the "every batch accepted" check: by the time `run()`
+/// calls this, `run_armed_faults`'s own `Err` has already short-circuited
+/// the whole function (module docs of [`run`]), so a still-configured
+/// `--fault-kill-node` at this point means that node was successfully,
+/// intentionally killed (`fault::run_node_kill` only returns `Ok` once it
+/// confirmed a real exit) — its own necessarily-incomplete batch acceptance
+/// is the fault working as scheduled, not a fleet-run failure. An ACPR
+/// finding: the pre-fix check counted a successful, scheduled kill as an
+/// `all_accepted` failure, causing `duckspout-fleet` to `bail!` on exactly
+/// the outcome it was told to produce.
+fn all_batches_accepted(cli: &Cli, load_results: &[load::LoadResult]) -> bool {
+    load_results.iter().enumerate().all(|(index, result)| {
+        let intentionally_killed =
+            u16::try_from(index).is_ok_and(|index| cli.fault_kill_node == Some(index));
+        intentionally_killed || result.fully_accepted()
+    })
 }
 
 /// Probes Postgres and (when not `--local-lake`) `MinIO` before touching a
@@ -356,6 +451,13 @@ fn build_plan(cli: &Cli, work_dir: &std::path::Path) -> anyhow::Result<FleetPlan
 /// Spawns every node and waits for all of them to report ready, leaving
 /// whatever subset already started in `running` even on failure — the
 /// caller is responsible for shutting those down.
+///
+/// The node named by `--fault-kill-node`, when `--fault-kill-mid-drain` is
+/// also set, is booted with `--fault-drain-commit-delay-ms` set to
+/// `--fault-kill-drain-stall-ms` (`fault`'s module docs on why: it is what
+/// makes that node's `PutPart`→`LakeCommit` window wide enough for a
+/// scheduled kill to land inside it deterministically) — every other node
+/// boots exactly as it did before this issue.
 async fn boot_fleet(
     daemon_bin: &std::path::Path,
     nodes: &[NodeSpec],
@@ -363,12 +465,62 @@ async fn boot_fleet(
     running: &mut Vec<process::RunningNode>,
 ) -> anyhow::Result<()> {
     for node in nodes {
-        running.push(process::spawn_node(daemon_bin, node)?);
+        let fault_drain_commit_delay_ms = (cli.fault_kill_mid_drain
+            && cli.fault_kill_node == Some(node.index))
+        .then_some(cli.fault_kill_drain_stall_ms);
+        running.push(process::spawn_node(
+            daemon_bin,
+            node,
+            fault_drain_commit_delay_ms,
+        )?);
     }
     let timeout = Duration::from_secs(cli.boot_timeout_secs);
     for node in running.iter_mut() {
         process::wait_until_ready(node, timeout).await?;
         tracing::info!(node = %node.spec.name, "node ready");
+    }
+    Ok(())
+}
+
+/// Runs whichever faults `cli` armed (§8.4, issue #203), sequentially
+/// against `running` (module docs of [`fault`] for why this need not be
+/// concurrent-safe across faults: at most one of each kind runs per fleet
+/// invocation today, and both take `&mut running[..]` by index, which
+/// `tokio::join!`ing this future alongside the unrelated drive-load/settle
+/// futures in [`run`] already runs them concurrent with the REST of the
+/// smoke loop). A fault whose target index is out of range is a plain
+/// `--fault-*-node` misconfiguration, reported as an error rather than
+/// silently skipped (R-3).
+async fn run_armed_faults(
+    cli: &Cli,
+    running: &mut [process::RunningNode],
+    log: &faultlog::FaultLog,
+) -> anyhow::Result<()> {
+    if let Some(index) = cli.fault_kill_node {
+        let target = running
+            .get_mut(index as usize)
+            .ok_or_else(|| anyhow::anyhow!("--fault-kill-node {index}: no such node"))?;
+        let timing = if cli.fault_kill_mid_drain {
+            fault::KillTiming::MidDrainCommit {
+                journal_poll_timeout: Duration::from_secs(cli.fault_kill_mid_drain_timeout_secs),
+            }
+        } else {
+            fault::KillTiming::AfterDelay(Duration::from_secs(cli.fault_kill_delay_secs))
+        };
+        fault::run_node_kill("node-kill-0", target, timing, log).await?;
+    }
+    if let Some(index) = cli.fault_sigstop_node {
+        let target = running
+            .get_mut(index as usize)
+            .ok_or_else(|| anyhow::anyhow!("--fault-sigstop-node {index}: no such node"))?;
+        fault::run_sigstop_pause(
+            "sigstop-pause-0",
+            target,
+            Duration::from_secs(cli.fault_sigstop_delay_secs),
+            Duration::from_secs(cli.fault_sigstop_duration_secs),
+            log,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -485,6 +637,10 @@ fn print_summary(
         if drain_confirmed { "yes" } else { "NO" }
     );
     println!("  work dir: {}", work_dir.display());
+    println!(
+        "  fault-window journal: {} (§8.4, issue #203)",
+        work_dir.join("faults.ndjson").display()
+    );
 }
 
 fn report_work_dir(work_dir: &std::path::Path) {
@@ -575,6 +731,14 @@ mod tests {
             load_interval_ms: 200,
             settle_timeout_secs: 60,
             shutdown_grace_secs: 10,
+            fault_kill_node: None,
+            fault_kill_mid_drain: false,
+            fault_kill_delay_secs: 5,
+            fault_kill_drain_stall_ms: 3_000,
+            fault_kill_mid_drain_timeout_secs: 60,
+            fault_sigstop_node: None,
+            fault_sigstop_delay_secs: 5,
+            fault_sigstop_duration_secs: duckspout_daemon::constants::HEARTBEAT_TTL_SECS + 5,
         }
     }
 
@@ -646,5 +810,291 @@ mod tests {
         let dir = scratch_dir("daemon-bin-missing");
         let bin = dir.join("does-not-exist");
         assert!(resolve_daemon_bin(Some(&bin)).is_err());
+    }
+
+    /// An ACPR finding (LOW-MEDIUM-7): `--fault-kill-mid-drain` without
+    /// `--fault-kill-node` used to silently arm nothing, despite its own
+    /// doc comment claiming "Requires `--fault-kill-node`" — clap's
+    /// `requires` on the field must turn this into a reported CLI error,
+    /// not a silent vacuous no-op (R-3, `AGENTS.md`).
+    #[test]
+    fn fault_kill_mid_drain_without_fault_kill_node_is_a_clap_error() {
+        let result = Cli::try_parse_from([
+            "duckspout-fleet",
+            "--fault-kill-mid-drain",
+            "--skip-backend-check",
+        ]);
+        assert!(
+            result.is_err(),
+            "--fault-kill-mid-drain without --fault-kill-node must be rejected by clap"
+        );
+    }
+
+    /// The same flag combination, but WITH `--fault-kill-node`, must parse
+    /// fine — `requires` must not have accidentally banned the legitimate
+    /// combination it is meant to allow.
+    #[test]
+    fn fault_kill_mid_drain_with_fault_kill_node_parses() {
+        let result = Cli::try_parse_from([
+            "duckspout-fleet",
+            "--fault-kill-node",
+            "0",
+            "--fault-kill-mid-drain",
+            "--skip-backend-check",
+        ]);
+        assert!(
+            result.is_ok(),
+            "--fault-kill-mid-drain with --fault-kill-node must parse: {result:?}"
+        );
+    }
+
+    fn load_result(attempted: u32, accepted: u32) -> load::LoadResult {
+        load::LoadResult {
+            batches_attempted: attempted,
+            batches_accepted: accepted,
+            records_accepted: 0,
+        }
+    }
+
+    /// The MEDIUM-6 ACPR finding's baseline: with no kill fault configured,
+    /// a node that did not fully accept its batches must still fail the
+    /// check — this fix must not accidentally turn `all_batches_accepted`
+    /// into an always-true rubber stamp.
+    #[test]
+    fn all_batches_accepted_is_false_for_an_unexplained_partial_acceptance() {
+        let cli = base_cli("no-fault");
+        let results = vec![load_result(10, 10), load_result(10, 7)];
+        assert!(!all_batches_accepted(&cli, &results));
+    }
+
+    /// The MEDIUM-6 fix itself: a node named by `--fault-kill-node` is
+    /// exempted from the full-acceptance check — a scheduled, successful
+    /// kill must not fail `run()`'s own exit code (§8.4: the judge, not the
+    /// runner, convicts misbehavior).
+    #[test]
+    fn all_batches_accepted_exempts_the_intentionally_killed_node() {
+        let mut cli = base_cli("kill-exempt");
+        cli.fault_kill_node = Some(1);
+        let results = vec![load_result(10, 10), load_result(10, 3)];
+        assert!(
+            all_batches_accepted(&cli, &results),
+            "the node named by --fault-kill-node must be exempted from the check"
+        );
+    }
+
+    /// The exemption is scoped to exactly the named node index — a
+    /// DIFFERENT node's own unexplained partial acceptance must still fail
+    /// the check even while a kill fault is configured elsewhere.
+    #[test]
+    fn all_batches_accepted_does_not_exempt_a_different_node() {
+        let mut cli = base_cli("kill-elsewhere");
+        cli.fault_kill_node = Some(0);
+        let results = vec![load_result(10, 10), load_result(10, 3)];
+        assert!(
+            !all_batches_accepted(&cli, &results),
+            "only the node named by --fault-kill-node may be exempted"
+        );
+    }
+
+    /// A minimal [`NodeSpec`] for the offline (no real daemon) tests below —
+    /// only `status_port`/`otlp_port` are ever dialed by the functions under
+    /// test here.
+    fn test_node_spec(name: &str, status_port: u16, otlp_port: u16) -> NodeSpec {
+        let dir = std::env::temp_dir().join(format!(
+            "duckspout-fleet-main-test-{}-{name}",
+            std::process::id()
+        ));
+        NodeSpec {
+            index: 0,
+            name: name.to_owned(),
+            otlp_port,
+            flight_port: 0,
+            peer_port: 0,
+            status_port,
+            data_dir: dir.join("data"),
+            config_path: dir.join("config.toml"),
+            journal_path: dir.join("journal.ndjson"),
+            stdout_path: dir.join("stdout.log"),
+            stderr_path: dir.join("stderr.log"),
+        }
+    }
+
+    /// Binds a real listener that answers every `/status` request with
+    /// `body` and returns its port — a stand-in `duckspout-daemon` for
+    /// `wait_for_any_watermark`'s own tests below, matching
+    /// `process::tests::fetch_status_parses_a_real_http_response_body`'s
+    /// own wire-shape convention.
+    async fn spawn_fake_status_server(body: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    /// `wait_for_any_watermark` returns `true` as soon as ANY node's
+    /// `/status` reports a non-empty `watermarks` array — the proof the
+    /// accept→drain→lake-commit loop actually closed, `run()`'s own reason
+    /// for calling this (module docs of [`wait_for_any_watermark`]).
+    #[tokio::test]
+    async fn wait_for_any_watermark_returns_true_once_a_node_reports_one() {
+        let port =
+            spawn_fake_status_server(r#"{"ready":true,"watermarks":[{"partition":"p0"}]}"#).await;
+        let node = test_node_spec("watermark-yes", port, 0);
+        assert!(
+            wait_for_any_watermark(&[node], Duration::from_secs(2)).await,
+            "a node reporting a non-empty watermarks array must resolve true"
+        );
+    }
+
+    /// The other side of the same check: every node reporting an EMPTY
+    /// `watermarks` array must time out to `false`, not hang or
+    /// false-positive on the array's mere presence.
+    #[tokio::test]
+    async fn wait_for_any_watermark_returns_false_when_none_ever_advances() {
+        let port = spawn_fake_status_server(r#"{"ready":true,"watermarks":[]}"#).await;
+        let node = test_node_spec("watermark-no", port, 0);
+        assert!(
+            !wait_for_any_watermark(&[node], Duration::from_millis(300)).await,
+            "an always-empty watermarks array must never resolve true"
+        );
+    }
+
+    /// `spawn_loadgen_best_effort`'s own contract (module docs): a
+    /// successfully-run loadgen is logged, never propagated as a failure —
+    /// there is nothing to assert on besides "this never panics regardless
+    /// of outcome," which IS the actual behavioral contract for a function
+    /// with no return value whose whole job is best-effort logging.
+    #[tokio::test]
+    async fn spawn_loadgen_best_effort_never_panics_on_a_successful_exit() {
+        let node = test_node_spec("loadgen-ok", 0, 0);
+        spawn_loadgen_best_effort(std::path::Path::new("/bin/true"), &node).await;
+    }
+
+    /// The non-zero-exit arm (the loadgen stub's current documented
+    /// behavior, issue #202) must also be swallowed, not propagated.
+    #[tokio::test]
+    async fn spawn_loadgen_best_effort_never_panics_on_a_nonzero_exit() {
+        let node = test_node_spec("loadgen-nonzero", 0, 0);
+        spawn_loadgen_best_effort(std::path::Path::new("/bin/false"), &node).await;
+    }
+
+    /// The spawn-itself-failed arm (a wrong `--loadgen-bin` path) must also
+    /// be swallowed, not propagated or panicked on.
+    #[tokio::test]
+    async fn spawn_loadgen_best_effort_never_panics_when_the_binary_does_not_exist() {
+        let node = test_node_spec("loadgen-missing", 0, 0);
+        spawn_loadgen_best_effort(
+            std::path::Path::new("/no/such/duckspout-loadgen-binary"),
+            &node,
+        )
+        .await;
+    }
+
+    /// `check_backends` succeeds once both a real Postgres-shaped listener
+    /// and a real S3-shaped listener are reachable — the plain TCP-only
+    /// reachability probe `main.rs`'s own module docs describe, proven here
+    /// against real (fake) listeners rather than only unit-testing
+    /// `backend_check::check_reachable` in isolation.
+    #[tokio::test]
+    async fn check_backends_succeeds_when_both_backends_are_reachable() {
+        let pg_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pg_port = pg_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if pg_listener.accept().await.is_err() {
+                    return;
+                }
+            }
+        });
+        let s3_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s3_port = s3_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if s3_listener.accept().await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut cli = base_cli("check-backends-ok");
+        cli.postgres_dsn = format!("postgres://duckspout@127.0.0.1:{pg_port}/duckspout_catalog");
+        cli.local_lake = false;
+        cli.s3_endpoint = format!("127.0.0.1:{s3_port}");
+        cli.backend_check_timeout_secs = 2;
+
+        assert!(check_backends(&cli).await.is_ok());
+    }
+
+    /// `check_backends` fails closed when Postgres is unreachable — proven
+    /// against the SAME well-known, never-listening port
+    /// `backend_check::tests::check_reachable_fails_closed_against_a_closed_port`
+    /// already uses, rather than inventing a second convention for "a port
+    /// nothing binds to."
+    #[tokio::test]
+    async fn check_backends_fails_closed_when_postgres_is_unreachable() {
+        let mut cli = base_cli("check-backends-fail");
+        cli.postgres_dsn = "postgres://duckspout@127.0.0.1:1/duckspout_catalog".to_owned();
+        cli.backend_check_timeout_secs = 1;
+        assert!(check_backends(&cli).await.is_err());
+    }
+
+    /// With no `--daemon-bin` given, this test binary's own directory
+    /// (`target/.../deps/`) never contains a sibling `duckspout-daemon`, and
+    /// a real PATH scan of a clean CI runner finds none either — exercises
+    /// both the sibling-of-current-exe check and the real PATH scan, both
+    /// falling through to the documented error rather than panicking.
+    /// (A developer machine with `duckspout-daemon` already on `PATH` from
+    /// a prior `cargo install` could make this find one — an accepted,
+    /// disclosed limitation of testing a PATH scan without mutating the
+    /// process-global `PATH` env var, which this test binary shares with
+    /// `process::tests`' own PATH-dependent subprocess tests and must not
+    /// disturb.)
+    #[test]
+    fn resolve_daemon_bin_with_no_explicit_path_falls_through_to_a_reported_error() {
+        let result = resolve_daemon_bin(None);
+        assert!(
+            result.is_err(),
+            "expected no duckspout-daemon binary next to the test binary or on PATH, got {result:?}"
+        );
+    }
+
+    /// `print_summary` and `report_work_dir` are pure disclosure (stdout
+    /// `println!`/`tracing::info!`) with no return value — exercising both
+    /// branches of `drain_confirmed` and a multi-node summary is the only
+    /// thing left to verify: that formatting a real `LoadResult` set never
+    /// panics (e.g. on a `nodes`/`load_results` length mismatch the `zip`
+    /// would otherwise silently truncate rather than crash on, but a
+    /// mismatched summary would itself be a bug worth a loud failure in
+    /// this test if one were ever introduced).
+    #[test]
+    fn print_summary_and_report_work_dir_do_not_panic_for_a_typical_run() {
+        let nodes = vec![
+            test_node_spec("summary-0", 9095, 4317),
+            test_node_spec("summary-1", 9096, 4318),
+        ];
+        let results = vec![load_result(10, 10), load_result(10, 3)];
+        let work_dir = scratch_dir("print-summary");
+        print_summary(&nodes, &results, true, &work_dir);
+        print_summary(&nodes, &results, false, &work_dir);
+        report_work_dir(&work_dir);
     }
 }

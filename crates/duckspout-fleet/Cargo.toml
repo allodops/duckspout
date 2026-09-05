@@ -32,6 +32,10 @@ futures = { workspace = true }
 # ClientAck/ClientTimeout journaling) are `duckspout-loadgen`'s own scope
 # (issue #202), not duplicated here.
 opentelemetry-proto = { workspace = true }
+# `crate::faultlog`'s `FaultKind`/`FaultPhase`/`FaultWindowLine` derive
+# `Serialize` (issue #203) — the same NDJSON-line convention
+# `duckspout_loadgen::journal::LoadgenJournal` already uses.
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = [
   "process",
