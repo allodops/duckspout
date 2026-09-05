@@ -1266,4 +1266,37 @@ mod tests {
             other => panic!("expected NoVerdict, got {other:?}"),
         }
     }
+
+    /// [`render_keys`]' three branches, each of which a finding message
+    /// depends on and none of which had a test (an ACPR finding). The
+    /// diverging keys are in the finding text because an operator's first
+    /// question about a transparency breach is WHICH row moved; a count sends
+    /// them back to the raw read log to find out.
+    #[test]
+    fn diverging_keys_are_listed_exactly_until_the_cap_and_counted_past_it() {
+        // Empty: the side of the diff that has nothing in it still has to
+        // render as something readable, since both sides are always printed.
+        assert_eq!(render_keys(&[]), "none");
+
+        // At and below the cap: every key listed, no elision.
+        let eight: Vec<String> = (0..8).map(|i| format!("r-{i}")).collect();
+        let listed = render_keys(&eight);
+        assert!(listed.contains("\"r-0\""), "{listed}");
+        assert!(listed.contains("\"r-7\""), "{listed}");
+        assert!(!listed.contains("more)"), "{listed}");
+
+        // Past it: the first eight, then an EXACT remainder count — the
+        // count is the part an operator can act on, so it is never elided.
+        let nine: Vec<String> = (0..9).map(|i| format!("r-{i}")).collect();
+        let capped = render_keys(&nine);
+        assert!(capped.contains("\"r-7\""), "{capped}");
+        assert!(!capped.contains("\"r-8\""), "{capped}");
+        assert!(capped.ends_with("… (1 more)"), "{capped}");
+
+        let many: Vec<String> = (0..1_000).map(|i| format!("r-{i}")).collect();
+        assert!(
+            render_keys(&many).ends_with("… (992 more)"),
+            "the remainder count is exact, not rounded or capped"
+        );
+    }
 }

@@ -90,12 +90,24 @@ impl RunManifest {
 
     /// Decodes a manifest from its JSON text.
     ///
+    /// Same fail-closed posture as `crate::journal` and
+    /// `crate::fault_ledger`: a repeated TOP-LEVEL key is rejected rather
+    /// than silently resolved last-value-wins. The hazard here is the same
+    /// shape as the fault ledger's duplicated `phase` — a repeated `nodes`
+    /// key would let one roster silently replace another, and a repeated
+    /// `sample_interval_ms` would change the tolerance every exemption in
+    /// `crate::vacuity` is computed with. Consistency across the three
+    /// evidence readers is the point: a judge that fails closed on one
+    /// evidence file and open on another is only as honest as its weakest
+    /// reader.
+    ///
     /// # Errors
     ///
-    /// Any `serde_json` decode error — a manifest that does not parse is not
-    /// a manifest, and the caller reports `NoVerdict` rather than judging the
-    /// run's roster from nothing.
+    /// Any `serde_json` decode error, duplicate top-level keys included — a
+    /// manifest that does not parse is not a manifest, and the caller reports
+    /// `NoVerdict` rather than judging the run's roster from nothing.
     pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
+        crate::journal::reject_duplicate_keys(text)?;
         serde_json::from_str(text)
     }
 }
@@ -125,6 +137,17 @@ pub fn parse_run_manifest(path: &Path) -> Result<RunManifest, String> {
 /// reporting the same machine as two, one of which "vanished". An id with no
 /// `/` at all — the shape a hand-written fixture or a non-fleet journal uses
 /// — is its own host.
+///
+/// This is also the projection that joins the fault ledger to the roster:
+/// `duckspout_fleet::fault`'s `rendered_node_id` writes the RENDERED form
+/// into `faults.ndjson`'s `target_node` while `duckspout_fleet::runlog`
+/// writes the bare form into the manifest, so `crate::fault_ledger` runs
+/// every lookup through here too.
+///
+/// The other half of "a restart is one machine" lives on the producer side:
+/// `duckspout_fleet::runlog::JournalProgress::sample` re-baselines a node
+/// whose journal was truncated by a restart, so a restart is progress in the
+/// sample series rather than a gap in it.
 #[must_use]
 pub fn node_host(node_id: &str) -> &str {
     node_id.split('/').next().unwrap_or(node_id)
@@ -196,6 +219,23 @@ mod tests {
         let err =
             parse_run_manifest(Path::new("/nonexistent/run.json")).expect_err("must not succeed");
         assert!(err.contains("run.json"), "{err}");
+    }
+
+    /// The same fail-closed posture `crate::fault_ledger` documents and
+    /// tests, on the file that feeds two of the four run-level rules. Would
+    /// catch a bare `serde_json::from_str` here: under last-value-wins a
+    /// second `nodes` key silently replaces the roster, and a second
+    /// `sample_interval_ms` silently changes every exemption's tolerance.
+    #[test]
+    fn a_duplicated_top_level_key_is_rejected_not_resolved_last_value_wins() {
+        let err = RunManifest::from_json(
+            r#"{"started_at_ms":1,"ended_at_ms":2,"sample_interval_ms":500,
+                "nodes":[{"name":"n","journal_path":"/j","journal_lines":1,
+                          "last_progress_at_ms":1,"exited_early":false}],
+                "nodes":[]}"#,
+        )
+        .expect_err("must not succeed");
+        assert!(err.to_string().contains("nodes"), "{err}");
     }
 
     #[test]

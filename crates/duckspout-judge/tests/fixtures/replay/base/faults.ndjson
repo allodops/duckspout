@@ -1,3 +1,3 @@
-{"fault_id":"kill-0","kind":"node_kill","target_node":"n2","phase":"armed","at_ms":20000}
-{"fault_id":"kill-0","kind":"node_kill","target_node":"n2","phase":"started","at_ms":20040,"detail":{"pid":4242}}
-{"fault_id":"kill-0","kind":"node_kill","target_node":"n2","phase":"ended","at_ms":20090,"detail":{"confirmed_exited":true}}
+{"fault_id":"kill-0","kind":"node_kill","target_node":"n2/1","phase":"armed","at_ms":20000}
+{"fault_id":"kill-0","kind":"node_kill","target_node":"n2/1","phase":"started","at_ms":20040,"detail":{"pid":4242}}
+{"fault_id":"kill-0","kind":"node_kill","target_node":"n2/1","phase":"ended","at_ms":20090,"detail":{"confirmed_exited":true}}

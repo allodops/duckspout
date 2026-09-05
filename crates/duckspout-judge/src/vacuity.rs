@@ -55,12 +55,40 @@
 //! nobody — §8.4's own framing ("it accuses nothing and certifies nothing").
 //! A fault that never fired is not a bug in `DuckSpout`; it is a reason this
 //! run cannot be used to argue `DuckSpout` is correct.
+//!
+//! # Disclosed gap: `cross-node-contention` cannot Pass on any run today
+//!
+//! Stated here rather than left to be discovered, in the same posture #206
+//! and #207 took for their own producer-shaped gaps.
+//!
+//! [`check_cross_node_contention`] recognises `Forward`/`PeerApply`,
+//! `Receipt`, and `TakeoverDrain` against `ClaimAdvertise`/`LakeCommitOk`.
+//! As of today NOTHING in a real run journals the first three: the OTLP
+//! accept path does not call `duckspout_replication::forward::forward_to_peers`
+//! at all (`duckspout_daemon::wiring`'s own module docs — there is no peer
+//! transport to forward through yet, issue #52's follow-up), so no `Forward`,
+//! no `PeerApply` and no `Receipt` ever reach a journal; and no crate in the
+//! workspace journals `TakeoverDrain`, so the ownership relation has no
+//! producer either. `LakeCommitOk` alone cannot satisfy the rule — it is only
+//! ever the passive half of the ownership pair.
+//!
+//! The consequence is exact and should not be discovered by surprise: on a
+//! real ≥2-node fleet run today this rule reports `NoVerdict`, so the
+//! distributed tier cannot exit `0` until a peer transport lands. That is the
+//! honest outcome — a fleet whose nodes genuinely never contended certifies
+//! nothing multi-node, and the judge saying so before the producer exists is
+//! the rule working, not failing. It is called out because a rule that can
+//! only ever answer one way is indistinguishable from a broken one until its
+//! producer arrives, and nobody should have to rediscover which of the two
+//! this is. The rule is exercised end-to-end today by the seeded-replay
+//! fixture and its unit tests; the gate it guards arms with `ctk-distributed`
+//! (staged, nightly, v0.2), by which point the producer is in scope.
 
 use std::collections::BTreeSet;
 
 use duckspout_types::TraceEvent;
 
-use crate::fault_ledger::FaultLedger;
+use crate::fault_ledger::{AlibiTolerance, FaultLedger};
 use crate::journal::JournalSet;
 use crate::run_manifest::{RunManifest, node_host};
 use crate::summary::{self, SummaryFinding};
@@ -196,9 +224,10 @@ impl std::fmt::Display for VacuityFinding {
             VacuityFinding::NoCrossNodeContention { roster_nodes } => write!(
                 f,
                 "{roster_nodes}-node run with no observed cross-node contention: no roster node \
-                 journaled a Forward that another journaled a PeerApply for, and no TakeoverDrain \
-                 landed against another node's advertised claim — a multi-node run that never \
-                 made two nodes meet certifies nothing multi-node (§8.4)"
+                 journaled a Forward that another journaled a PeerApply for, no roster node \
+                 journaled a Receipt attesting a peer's forward, and no TakeoverDrain landed \
+                 against another node's advertised claim — a multi-node run that never made two \
+                 nodes meet certifies nothing multi-node (§8.4)"
             ),
             VacuityFinding::NodeNeverJournaled { node } => write!(
                 f,
@@ -387,35 +416,61 @@ fn cross_pairs(
 /// whose nodes never touched each other has exercised a co-located
 /// single-node system with extra processes. The evidence for "they touched"
 /// has to come from the journals themselves (the manifest only says how many
-/// nodes there were), and the frozen §3.3 vocabulary has exactly two
-/// inter-node relations in it:
+/// nodes there were), and the recognised shapes are the ones the frozen §3.3
+/// vocabulary has and that real code actually journals:
 ///
-/// - **Replication.** `Forward` is journaled by the owner sending a batch to
-///   its peers; `PeerApply` by the peer that applied it
+/// - **Replication, applied.** `Forward` is journaled by the owner sending a
+///   batch to its peers; `PeerApply` by the peer that durably applied it
 ///   (`duckspout_replication::forward` / `::peer_apply`, and
 ///   `docs/trace-mapping.md`). One of each, on two different roster nodes, is
 ///   the write path actually crossing a machine boundary.
+/// - **Replication, attested.** A bare `Receipt` on a roster node, with no
+///   `PeerApply` beside it, is `duckspout_replication::peer_apply`'s
+///   `DuplicateAcked` shape: a forward whose range this node had already
+///   applied, re-acked idempotently. That is the NORMAL shape of a forward
+///   retried after a partition heals — precisely what a chaos schedule
+///   produces — and it needs no partner line to be inter-node evidence,
+///   because `apply_forward` refuses `origin == self_node` before it can
+///   journal anything. A `Receipt` in a roster node's journal is therefore,
+///   by construction, that node attesting a DIFFERENT node's forward.
+///   Requiring an adjacent `PeerApply` here was an ACPR finding: it made a
+///   healed-partition retry read as "no inter-node traffic at all".
 /// - **Ownership.** `TakeoverDrain` is journaled by a replica taking over a
 ///   dead owner's partitions, and `ClaimAdvertise`/`LakeCommitOk` by a node
 ///   that held or advanced one. A takeover on one node while another node
 ///   held claims is ownership genuinely changing hands.
 ///
-/// Both halves must come from nodes on the manifest's ROSTER, so a journal
+/// Every half must come from a node on the manifest's ROSTER, so a journal
 /// attributed to a node the runner never provisioned cannot supply the
 /// evidence.
 ///
-/// # The honest limit
+/// # The honest limits — two of them
 ///
-/// `Forward`, `PeerApply` and `Receipt` lines carry no correlation payload
-/// today (`crate::journal`'s payload table: only `request_id`,
-/// `complete_through_ms`, `changelog_key` and `part` are decoded, and none of
-/// them ride these events), so this cannot prove that node B's `PeerApply`
-/// applied node A's `Forward` — only that both happened, on two different
-/// machines, in one run. That makes this rule a FLOOR and not a matcher, and
-/// the floor is deliberately the direction that cannot produce a false
-/// `NoVerdict`: it fires only when there is no inter-node evidence
-/// whatsoever. Sharpening it into a real pairing is a change to the wire
-/// shape (a forwarded batch's identity on both lines), not to this rule.
+/// **It is a floor, not a matcher.** `Forward`, `PeerApply` and `Receipt`
+/// lines carry no correlation payload today (`crate::journal`'s payload
+/// table: only `request_id`, `complete_through_ms`, `changelog_key` and
+/// `part` are decoded, and none of them ride these events), so this cannot
+/// prove that node B's `PeerApply` applied node A's `Forward` — only that
+/// both happened, on two different machines, in one run. Sharpening it into a
+/// real pairing is a change to the wire shape (a forwarded batch's identity
+/// on both lines), not to this rule.
+///
+/// **Some real inter-node traffic is invisible to it, and that direction is
+/// a false `NoVerdict`.** An earlier version of this comment claimed the
+/// floor "cannot produce a false `NoVerdict`". That was wrong, and it is
+/// worth stating exactly how, because the gap is on the producer side and
+/// cannot be closed here: `duckspout_replication::peer_apply::apply_forward`
+/// journals NOTHING at all for its `Fenced` (the §8.4 FencedZombie/SIGSTOP
+/// window — a stale incarnation rejected, which is itself two nodes'
+/// incarnations meeting), `GapRefused`, `SuspectDuplicate` and `ApplyFailed`
+/// outcomes. A run whose only inter-node traffic took those paths is real
+/// contention this rule reports as none. Making it visible means journaling
+/// at those tracepoints — a change to the producer and to
+/// `docs/trace-mapping.md`, not a rule this judge can widen — so it is
+/// disclosed here rather than papered over with a proxy (`FenceBoot`, which
+/// every node journals at boot, or the fault ledger, which §8.4 forbids
+/// reading contention out of). The error direction is the safe one:
+/// `NoVerdict`, never a false `Pass`.
 ///
 /// # Errors
 ///
@@ -459,12 +514,20 @@ pub fn check_cross_node_contention(
     let mut pairs = cross_pairs("replication", &forwarders, &appliers);
     pairs.extend(cross_pairs("ownership", &takers, &holders));
 
-    if pairs.is_empty() {
+    // A `Receipt` needs no partner line to be cross-node evidence (this
+    // function's docs): only `apply_forward` journals one, and only after it
+    // has refused a self-origin forward, so the attesting node is already
+    // known to be a different machine from the origin. Each attesting roster
+    // node counts once.
+    let attesters = hosts_journaling(journals, &roster, TraceEvent::Receipt);
+
+    let evidence = pairs.len() + attesters.len();
+    if evidence == 0 {
         Err(vec![VacuityFinding::NoCrossNodeContention {
             roster_nodes: roster.len(),
         }])
     } else {
-        Ok(pairs.len())
+        Ok(evidence)
     }
 }
 
@@ -487,6 +550,11 @@ pub fn check_cross_node_contention(
 /// - **the alibi** for the remaining interval is a fault window that COVERS
 ///   it end to end (`FaultWindow::covers`) — a partition lifted halfway
 ///   through, after which the node still never spoke, is not an alibi.
+///
+/// The manifest names its roster bare and the ledger names its targets
+/// rendered (`<name>/<incarnation>`); `FaultLedger::windows_targeting` is
+/// what reconciles the two, and passing a roster name straight into it is
+/// correct only because it does.
 ///
 /// Every exemption here is derived from the injectors' LEDGER, never from the
 /// run's `--fault-*` flags, so an armed-but-unfired fault excuses nothing; it
@@ -528,12 +596,20 @@ pub fn check_node_continuity(
                 .to_owned(),
         }]);
     };
-    // The manifest's progress stamps are only as precise as its own sampling
-    // interval, so every comparison against a fault window's wall-clock
-    // `at_ms` is widened by one interval. Without this, a node killed 400 ms
-    // after its last 500 ms-grain sample would look as if it had gone quiet
-    // BEFORE the fault that killed it.
-    let slack_ms = manifest.sample_interval_ms;
+    // The alibi tolerance, asymmetric on purpose
+    // (`crate::fault_ledger::AlibiTolerance`'s own docs). The END end
+    // forgives only the manifest's sampling grain, since a node killed 400 ms
+    // after its last 500 ms-grain sample must not look as if it had gone
+    // quiet BEFORE the fault that killed it. The START end additionally
+    // forgives this rule's OWN silence budget: below, silence shorter than
+    // `budget_ms` is not a finding at all, so a fault that fired within
+    // `budget_ms` of a node's last progress must be allowed to explain the
+    // silence that followed it. Forgiving only the grain there convicted a
+    // node whose legitimate journaling cadence was slower than one sample.
+    let tolerance = AlibiTolerance {
+        start_slack_ms: budget_ms.saturating_add(manifest.sample_interval_ms),
+        end_slack_ms: manifest.sample_interval_ms,
+    };
     let ingested: BTreeSet<&str> = journals
         .lines
         .iter()
@@ -546,7 +622,7 @@ pub fn check_node_continuity(
         ledger.is_some_and(|ledger| {
             ledger
                 .windows_targeting(node)
-                .any(|window| window.covers(from, until, slack_ms))
+                .any(|window| window.covers(from, until, tolerance))
         })
     };
     // When a terminal fault took `node` out of the run, if one did.
@@ -830,6 +906,56 @@ mod tests {
         assert!(check_cross_node_contention(&set, Some(&manifest)).is_err());
     }
 
+    /// The ACPR regression for the `DuplicateAcked` shape: a forward retried
+    /// after a partition heals journals a `Receipt` and NO `PeerApply`
+    /// (`duckspout_replication::peer_apply::apply_forward`), which is exactly
+    /// what a chaos schedule produces. Would catch a relation set that
+    /// required an adjacent `PeerApply`, under which a healed-partition retry
+    /// read as "no inter-node traffic at all".
+    #[test]
+    fn a_bare_receipt_is_contention_even_with_no_peer_apply_beside_it() {
+        let set = journals(vec![
+            line("n1/1", 0, TraceEvent::Forward),
+            line("n2/1", 0, TraceEvent::Receipt),
+        ]);
+        let manifest = manifest(vec![node("n1", Some(2), false), node("n2", Some(2), false)]);
+        assert_eq!(check_cross_node_contention(&set, Some(&manifest)), Ok(1));
+    }
+
+    /// And it needs no `Forward` on the other side either: `apply_forward`
+    /// refuses `origin == self_node` before journaling anything, so a
+    /// `Receipt` on a roster node is by construction that node attesting
+    /// SOMEBODY ELSE's forward — even if the origin's own journal was lost
+    /// with the machine that wrote it.
+    #[test]
+    fn a_receipt_alone_is_the_attesting_nodes_own_proof_it_met_a_peer() {
+        let set = journals(vec![line("n2/1", 0, TraceEvent::Receipt)]);
+        let manifest = manifest(vec![node("n1", Some(2), false), node("n2", Some(2), false)]);
+        assert_eq!(check_cross_node_contention(&set, Some(&manifest)), Ok(1));
+    }
+
+    /// The disclosed gap, pinned so it cannot be forgotten (module docs' own
+    /// "honest limits"): `apply_forward`'s `Fenced` outcome — §8.4's
+    /// FencedZombie/SIGSTOP window, a stale incarnation rejected — journals
+    /// NOTHING, so a run whose only inter-node traffic was fenced is real
+    /// contention this rule reports as none. This test asserts the current,
+    /// disclosed behaviour rather than endorsing it; when a tracepoint is
+    /// added at that outcome, this test must be updated to the new one.
+    #[test]
+    fn a_forward_the_peer_fenced_is_inter_node_traffic_this_rule_cannot_see() {
+        // All that reaches the journals is the origin's own Forward: the
+        // fencing peer writes no line at all for the rejection.
+        let set = journals(vec![line("n1/1", 0, TraceEvent::Forward)]);
+        let manifest = manifest(vec![node("n1", Some(2), false), node("n2", Some(2), false)]);
+        let findings =
+            check_cross_node_contention(&set, Some(&manifest)).expect_err("the disclosed gap");
+        assert_eq!(
+            findings,
+            vec![VacuityFinding::NoCrossNodeContention { roster_nodes: 2 }],
+            "the error direction is NoVerdict, never a false Pass"
+        );
+    }
+
     #[test]
     fn a_takeover_against_another_nodes_claim_is_ownership_contention() {
         let set = journals(vec![
@@ -928,6 +1054,110 @@ mod tests {
                 DEFAULT_MAX_JOURNAL_SILENCE_MS
             ),
             Ok(2)
+        );
+    }
+
+    /// The ACPR join-key regression, at the rule's own layer. Every fleet
+    /// injector writes the RENDERED `<name>/<incarnation>` id
+    /// (`duckspout_fleet::fault::rendered_node_id`, whose whole purpose is to
+    /// be joinable), while the manifest's roster is bare — so this is the
+    /// shape of every real run's ledger, and the one the hand-written fixture
+    /// above is not. Would catch the raw `target_node == node` join, under
+    /// which no real kill ever excused its own target and this legitimate
+    /// node-kill scenario produced a false `NodeExitedEarly`.
+    #[test]
+    fn a_kill_whose_ledger_names_the_rendered_node_id_still_excuses_its_target() {
+        let set = two_node_journals();
+        let m = manifest(vec![
+            node("n1", Some(90_000), false),
+            node("n2", Some(10_000), true),
+        ]);
+        let ledger = FaultLedger {
+            windows: vec![window(
+                "kill-0",
+                "node_kill",
+                "n2/1",
+                Some(10_200),
+                Some(10_400),
+            )],
+        };
+        assert_eq!(
+            check_node_continuity(
+                &set,
+                Some(&m),
+                Some(&ledger),
+                DEFAULT_MAX_JOURNAL_SILENCE_MS
+            ),
+            Ok(2)
+        );
+    }
+
+    /// The ACPR tolerance regression: a healthy node whose journaling cadence
+    /// is 5 s, partitioned 5 s after its last sample and never heard from
+    /// again. Its pre-fault silence is 5 s — well inside the rule's own 30 s
+    /// budget, which is to say the rule would not have convicted it for that
+    /// silence on its own — so the partition explains the rest. Would catch
+    /// an alibi whose from-end tolerance was the 500 ms sampling grain, which
+    /// convicted this run.
+    #[test]
+    fn a_fault_that_fired_within_the_silence_budget_explains_the_silence() {
+        let set = two_node_journals();
+        let m = manifest(vec![
+            node("n1", Some(90_000), false),
+            node("n2", Some(10_000), false),
+        ]);
+        let ledger = FaultLedger {
+            windows: vec![window(
+                "part-0",
+                "network_partition",
+                "n2",
+                Some(15_000),
+                None,
+            )],
+        };
+        assert_eq!(
+            check_node_continuity(
+                &set,
+                Some(&m),
+                Some(&ledger),
+                DEFAULT_MAX_JOURNAL_SILENCE_MS
+            ),
+            Ok(2)
+        );
+    }
+
+    /// And the tolerance is the BUDGET, not infinity: a node quiet for longer
+    /// than the budget before the fault fired vanished on its own first.
+    #[test]
+    fn a_fault_that_fired_long_after_the_silence_began_explains_nothing() {
+        let set = two_node_journals();
+        let m = manifest(vec![
+            node("n1", Some(90_000), false),
+            node("n2", Some(10_000), false),
+        ]);
+        let ledger = FaultLedger {
+            windows: vec![window(
+                "part-0",
+                "network_partition",
+                "n2",
+                Some(45_000),
+                None,
+            )],
+        };
+        let findings = check_node_continuity(
+            &set,
+            Some(&m),
+            Some(&ledger),
+            DEFAULT_MAX_JOURNAL_SILENCE_MS,
+        )
+        .expect_err("must be vacuous");
+        assert_eq!(
+            findings,
+            vec![VacuityFinding::NodeJournalStopped {
+                node: "n2".to_owned(),
+                silent_ms: 80_000,
+                budget_ms: DEFAULT_MAX_JOURNAL_SILENCE_MS,
+            }]
         );
     }
 

@@ -30,15 +30,18 @@
 //!
 //! # This is not the runner grading itself
 //!
-//! D-5 (§8.4: "the process that runs the system must not be the process that
-//! grades it") is about VERDICTS, and this file contains none: no threshold,
-//! no pass/fail, no judgement about whether a silent node was a problem.
-//! `duckspout-judge` owns every one of those decisions — including the
-//! silence budget and the exemption for a node an armed fault deliberately
-//! stopped, which it derives from `faults.ndjson` (each injector's own
-//! ledger, §8.4's own wording) and never from anything asserted here. The
-//! runner is a witness; the judge is the judge. `faults.ndjson` is written
-//! under exactly the same split, by the same runner, for the same reason.
+//! §8.4 splits the distributed tier into a fleet runner that drives the
+//! system and a **separate judge binary** that runs as a post-pass over the
+//! journals and produces the run's verdict — the process that runs the system
+//! is not the process that grades it. This file stays on the runner's side of
+//! that line, and contains no verdict at all: no threshold, no pass/fail, no
+//! judgement about whether a silent node was a problem. `duckspout-judge`
+//! owns every one of those decisions — including the silence budget and the
+//! exemption for a node an armed fault deliberately stopped, which it derives
+//! from `faults.ndjson` (each injector's own ledger, §8.4's own wording) and
+//! never from anything asserted here. The runner is a witness; the judge is
+//! the judge. `faults.ndjson` is written under exactly the same split, by the
+//! same runner, for the same reason.
 //!
 //! # Shape
 //!
@@ -137,21 +140,45 @@ impl JournalProgress {
     }
 
     /// One sampling pass: re-reads every node's journal length and, for each
-    /// node whose length GREW since the previous pass, stamps `at_ms` as that
-    /// node's newest progress.
+    /// node whose length CHANGED since the previous pass, stamps `at_ms` as
+    /// that node's newest progress.
     ///
-    /// A node's first-ever non-zero length counts as growth (from the implicit
-    /// `0` of a node that had not journaled yet), so a node that boots late
-    /// gets a real first-progress stamp rather than inheriting the run's
-    /// start.
+    /// A node's first-ever non-zero length counts as progress (from the
+    /// implicit `0` of a node that had not journaled yet), so a node that
+    /// boots late gets a real first-progress stamp rather than inheriting the
+    /// run's start.
+    ///
+    /// # Why CHANGED and not GREW
+    ///
+    /// `duckspout-daemon` opens its journal with `File::create`, which
+    /// TRUNCATES, so a node restarted inside one run (a supervisor restart, a
+    /// `membership_join` re-add) starts its line count over at zero. Under a
+    /// grew-only rule that node's `last_progress_at_ms` would then freeze at
+    /// its pre-restart value until the new journal climbed back past the old
+    /// high-water mark — a restart would read to the judge as a machine going
+    /// silent, which is the exact signal
+    /// `duckspout_judge::vacuity`'s node-continuity rule exists to detect and
+    /// which `duckspout_judge::run_manifest::node_host` explicitly claims a
+    /// restart survives. So a count that goes DOWN re-baselines this node
+    /// rather than being ignored. An ACPR finding (LOW-3).
+    ///
+    /// The stamp itself is still gated on a NON-ZERO count, which is the
+    /// difference between "the process rewrote its journal" and "the journal
+    /// is gone": `node_journal_line_count` answers `0` for an unreadable or
+    /// absent file, and a vanished journal must never be mistaken for a live
+    /// node. A restart caught mid-truncation therefore re-baselines on the
+    /// pass that sees `0` and stamps on the next one that sees a line, which
+    /// costs one sampling interval and cannot manufacture liveness.
     pub fn sample(&self, nodes: &[NodeSpec], at_ms: u64) {
         let mut seen = self.seen.lock().expect("journal-progress lock poisoned");
         for node in nodes {
             let lines = crate::fault::node_journal_line_count(&node.journal_path);
             let entry = seen.entry(node.name.clone()).or_default();
-            if lines > entry.lines {
+            if lines != entry.lines {
                 entry.lines = lines;
-                entry.last_progress_at_ms = Some(at_ms);
+                if lines > 0 {
+                    entry.last_progress_at_ms = Some(at_ms);
+                }
             }
         }
     }
@@ -275,6 +302,67 @@ mod tests {
         assert_eq!(roster[0].journal_lines, 2);
         assert_eq!(roster[1].last_progress_at_ms, Some(1_000));
         assert_eq!(roster[1].journal_lines, 1);
+    }
+
+    /// A node restarted inside one run truncates its own journal
+    /// (`duckspout-daemon` opens it with `File::create`), so its line count
+    /// starts over. That is a live process writing a fresh journal, and it
+    /// must not read as silence — otherwise a restart looks to the judge
+    /// exactly like the vanished machine its node-continuity rule convicts,
+    /// contradicting `duckspout_judge::run_manifest`'s own claim that a
+    /// restart within one run survives the join. An ACPR finding (LOW-3):
+    /// would catch the `lines > entry.lines` grew-only rule, under which
+    /// `last_progress_at_ms` froze at 1000 until the new journal climbed back
+    /// past three lines.
+    #[test]
+    fn a_journal_truncated_by_a_restart_is_progress_not_silence() {
+        let dir = scratch("restart");
+        let node = spec(&dir, "restarted");
+        let _ = std::fs::remove_file(&node.journal_path);
+        let nodes = vec![node.clone()];
+        let progress = JournalProgress::new();
+
+        append(&node.journal_path, 3);
+        progress.sample(&nodes, 1_000);
+
+        // The restart: a fresh, truncated journal with one line in it.
+        std::fs::write(&node.journal_path, "").unwrap();
+        append(&node.journal_path, 1);
+        progress.sample(&nodes, 2_000);
+
+        let roster = progress.roster(&nodes, &BTreeSet::new());
+        assert_eq!(roster[0].last_progress_at_ms, Some(2_000));
+        assert_eq!(roster[0].journal_lines, 1);
+
+        // And the new journal keeps advancing from its own baseline, rather
+        // than waiting to climb back past the pre-restart high-water mark.
+        append(&node.journal_path, 1);
+        progress.sample(&nodes, 3_000);
+        let roster = progress.roster(&nodes, &BTreeSet::new());
+        assert_eq!(roster[0].last_progress_at_ms, Some(3_000));
+        assert_eq!(roster[0].journal_lines, 2);
+    }
+
+    /// The other side of that line: a journal that DISAPPEARS is not a
+    /// restart. `node_journal_line_count` answers `0` for an absent or
+    /// unreadable file, and a zero must never stamp progress — otherwise a
+    /// deleted journal would manufacture liveness for a node that is gone.
+    #[test]
+    fn a_journal_that_vanished_does_not_stamp_progress() {
+        let dir = scratch("vanished");
+        let node = spec(&dir, "vanished");
+        let _ = std::fs::remove_file(&node.journal_path);
+        let nodes = vec![node.clone()];
+        let progress = JournalProgress::new();
+
+        append(&node.journal_path, 2);
+        progress.sample(&nodes, 1_000);
+
+        std::fs::remove_file(&node.journal_path).unwrap();
+        progress.sample(&nodes, 2_000);
+
+        let roster = progress.roster(&nodes, &BTreeSet::new());
+        assert_eq!(roster[0].last_progress_at_ms, Some(1_000));
     }
 
     /// A node that never journaled anything reports `None`, not the run's

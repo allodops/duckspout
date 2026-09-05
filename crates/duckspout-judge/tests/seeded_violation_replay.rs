@@ -53,6 +53,20 @@
 //! written in). A join that started using `journal_path` would fail
 //! [`the_clean_base_exits_pass`] immediately.
 //!
+//! # A second deliberate detail: `faults.ndjson` names a RENDERED node id
+//!
+//! `base/faults.ndjson` targets `"n2/1"`, not `"n2"`, because that is what
+//! every real injector writes (`duckspout_fleet::fault`'s `rendered_node_id`
+//! — `<roster name>/<incarnation>`), while `base/run.json` names its roster
+//! `"n2"`, which is what the real runner writes. The two forms differing is
+//! the real shape, and a judge that joined them raw would match nothing: the
+//! kill would stop excusing its own target, and `n2` — which this base has
+//! exiting early, as a killed node does — would be reported as a machine that
+//! vanished outside the fault schedule. [`the_clean_base_exits_pass`] is
+//! therefore also the end-to-end regression test for that join (an ACPR
+//! finding; the pre-fix fixture used bare names on both sides, a shape no
+//! real fleet run produces).
+//!
 //! # Why not one seed per §3 invariant
 //!
 //! §8.4 asks for one seeded violation per JUDGE, and that is what this is:

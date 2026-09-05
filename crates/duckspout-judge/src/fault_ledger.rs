@@ -23,11 +23,26 @@
 //! premise of D-5 is that the two are separate processes).
 //!
 //! ```json
-//! {"fault_id":"kill-0","kind":"node_kill","target_node":"fleet-0-1",
+//! {"fault_id":"kill-0","kind":"node_kill","target_node":"fleet-0-1/1",
 //!  "phase":"armed","at_ms":1700000010000}
-//! {"fault_id":"kill-0","kind":"node_kill","target_node":"fleet-0-1",
+//! {"fault_id":"kill-0","kind":"node_kill","target_node":"fleet-0-1/1",
 //!  "phase":"started","at_ms":1700000010040,"detail":{"pid":4242}}
 //! ```
+//!
+//! # The join key: `target_node` is a RENDERED node id, not a roster name
+//!
+//! Every fleet injector writes `duckspout_fleet::fault`'s `rendered_node_id`
+//! — `<roster name>/<incarnation>`, the id the target's OWN journal uses —
+//! and that function exists precisely so a judge can join a fault window to
+//! the target's journal on this field. The run manifest, meanwhile, names its
+//! roster by the bare `<roster name>`
+//! (`duckspout_fleet::runlog::NodeRun::name`). The two are therefore NOT
+//! string-equal, and joining them raw silently matches nothing: every window
+//! would look as if it targeted a node that was not in the run, so no kill
+//! would ever excuse its own target's silence. [`node_host`] is the
+//! projection that reconciles the two, and every lookup here goes through it
+//! ([`FaultLedger::windows_targeting`]) — an ACPR finding, caught only
+//! because a hand-written fixture used a shape no real injector emits.
 //!
 //! `detail` is deliberately ignored: it is the fault log's own free-form
 //! per-injector context (`duckspout_fleet::faultlog::FaultWindowLine::detail`
@@ -46,6 +61,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::run_manifest::node_host;
 
 /// Every fault kind whose effect on its target is PERMANENT: after the
 /// window, the node is gone for the rest of the run.
@@ -108,8 +125,11 @@ pub struct FaultWindow {
     /// Its kind, verbatim from the ledger
     /// ([`TERMINAL_FAULT_KINDS`] on why this is a `String`).
     pub kind: String,
-    /// The roster name of the node it targets
-    /// (`duckspout_fleet::topology::node_name`).
+    /// The node it targets, verbatim from the ledger: the RENDERED
+    /// `<roster name>/<incarnation>` id `duckspout_fleet::fault`'s
+    /// `rendered_node_id` writes, NOT the bare roster name the run manifest
+    /// uses (module docs). [`FaultWindow::target_host`] is the projection
+    /// that joins the two.
     pub target_node: String,
     /// When it was armed, if an `Armed` line was journaled.
     pub armed_at_ms: Option<u64>,
@@ -120,6 +140,32 @@ pub struct FaultWindow {
     pub ended_at_ms: Option<u64>,
 }
 
+/// How far outside an interval a fault window may sit and still be its
+/// alibi ([`FaultWindow::covers`]).
+///
+/// The two ends are NOT symmetric, and conflating them was an ACPR finding.
+/// The interval's END is a measurement — the fleet's own last journal
+/// activity — so the only thing that has to be forgiven there is the
+/// sampling grain the measurement was taken on. The interval's START is a
+/// node's last observed progress, and a node is allowed to be quiet for a
+/// while before anything at all is wrong with it: that budget is
+/// `crate::vacuity::DEFAULT_MAX_JOURNAL_SILENCE_MS`, and the same rule that
+/// declines to convict silence shorter than the budget must also let a fault
+/// that fired within the budget of a node's last progress explain the silence
+/// that followed. Forgiving only the sampling grain there convicted a node
+/// whose drain cadence was slower than 500 ms and which was then legitimately
+/// partitioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlibiTolerance {
+    /// How long BEFORE the fault started the node may already have been
+    /// quiet — the judge's own silence budget, widened by the sampling grain.
+    pub start_slack_ms: u64,
+    /// How far before the interval's end the fault may have been lifted —
+    /// the sampling grain alone (`RunManifest::sample_interval_ms`), since
+    /// silence after a lifted fault is silence the fault does not explain.
+    pub end_slack_ms: u64,
+}
+
 impl FaultWindow {
     /// Whether this window's effect is permanent
     /// ([`TERMINAL_FAULT_KINDS`]).
@@ -128,8 +174,15 @@ impl FaultWindow {
         TERMINAL_FAULT_KINDS.contains(&self.kind.as_str())
     }
 
+    /// The roster half of [`FaultWindow::target_node`] — the join key the
+    /// run manifest names its nodes by (module docs' "The join key").
+    #[must_use]
+    pub fn target_host(&self) -> &str {
+        node_host(&self.target_node)
+    }
+
     /// Whether this window was in effect across the WHOLE interval
-    /// `[from_ms, until_ms]`, given a sampling `slack_ms`.
+    /// `[from_ms, until_ms]`, within [`AlibiTolerance`].
     ///
     /// This is the alibi test for a target that journaled nothing over that
     /// interval, and it is deliberately a containment test, not an overlap
@@ -144,10 +197,6 @@ impl FaultWindow {
     /// `crate::vacuity::check_fault_schedule` rather than an excuse for
     /// somebody else's.
     ///
-    /// `slack_ms` widens both ends by the run manifest's own sampling
-    /// interval, since `last_progress_at_ms` is only that precise
-    /// (`crate::run_manifest::RunManifest::sample_interval_ms`).
-    ///
     /// Note what is NOT here: terminal-ness. A `node_kill`'s `Ended` line
     /// means "the process is confirmed dead", not "the node is back", so
     /// asking whether such a window *covers* the rest of the run would answer
@@ -155,17 +204,18 @@ impl FaultWindow {
     /// they belong — by shortening the interval a node is expected to journal
     /// over at all (`crate::vacuity::check_node_continuity`'s horizon).
     #[must_use]
-    pub fn covers(&self, from_ms: u64, until_ms: u64, slack_ms: u64) -> bool {
+    pub fn covers(&self, from_ms: u64, until_ms: u64, tolerance: AlibiTolerance) -> bool {
         let Some(started) = self.started_at_ms else {
             return false;
         };
-        if started > from_ms.saturating_add(slack_ms) {
-            // The node had already gone quiet before this fault touched it.
+        if started > from_ms.saturating_add(tolerance.start_slack_ms) {
+            // The node had already been quiet LONGER THAN THE BUDGET before
+            // this fault touched it, so the fault cannot be what silenced it.
             return false;
         }
         match self.ended_at_ms {
             None => true,
-            Some(ended) => ended.saturating_add(slack_ms) >= until_ms,
+            Some(ended) => ended.saturating_add(tolerance.end_slack_ms) >= until_ms,
         }
     }
 }
@@ -179,12 +229,18 @@ pub struct FaultLedger {
 }
 
 impl FaultLedger {
-    /// Every window targeting `node`.
+    /// Every window targeting `node`, which may be given either as a bare
+    /// roster name (the run manifest's shape) or as a rendered
+    /// `<name>/<incarnation>` id (the journals' and the ledger's shape): both
+    /// sides are projected through [`node_host`] before comparison, because
+    /// the producer of this file writes the rendered form and the producer of
+    /// the roster writes the bare one (module docs' "The join key").
     pub fn windows_targeting<'a>(
         &'a self,
         node: &'a str,
     ) -> impl Iterator<Item = &'a FaultWindow> + 'a {
-        self.windows.iter().filter(move |w| w.target_node == node)
+        let host = node_host(node);
+        self.windows.iter().filter(move |w| w.target_host() == host)
     }
 
     /// When a TERMINAL fault first took `node` out of the run for good, if
@@ -359,6 +415,13 @@ mod tests {
         }
     }
 
+    /// The tolerance `crate::vacuity` actually passes: the silence budget on
+    /// the start end, the sampling grain on the end end.
+    const TOLERANCE: AlibiTolerance = AlibiTolerance {
+        start_slack_ms: crate::vacuity::DEFAULT_MAX_JOURNAL_SILENCE_MS + 500,
+        end_slack_ms: 500,
+    };
+
     #[test]
     fn the_three_phases_reassemble_into_one_window() {
         let file = write_temp(&format!(
@@ -484,25 +547,55 @@ mod tests {
     #[test]
     fn a_lifted_window_does_not_cover_silence_that_outlasts_it() {
         let partition = window("network_partition", Some(1_000), Some(2_000));
-        assert!(partition.covers(1_500, 1_900, 100));
-        assert!(!partition.covers(1_500, 5_000, 100));
+        assert!(partition.covers(1_500, 1_900, TOLERANCE));
+        assert!(!partition.covers(1_500, 5_000, TOLERANCE));
     }
 
     /// A window still in effect when the run finished (no `Ended` line)
     /// covers any interval it started before.
     #[test]
     fn an_unresolved_window_covers_everything_after_its_start() {
+        let exact = AlibiTolerance {
+            start_slack_ms: 0,
+            end_slack_ms: 0,
+        };
         let partition = window("network_partition", Some(1_000), None);
-        assert!(partition.covers(1_500, 90_000, 0));
-        assert!(!partition.covers(500, 90_000, 0));
+        assert!(partition.covers(1_500, 90_000, exact));
+        assert!(!partition.covers(500, 90_000, exact));
     }
 
-    /// A node already silent BEFORE the fault touched it is not excused by
-    /// it — the fault cannot have caused a silence that predates it.
+    /// A node silent for LONGER THAN THE BUDGET before the fault touched it
+    /// is not excused by it — the fault cannot have caused a silence that
+    /// predates it by more than a healthy node is allowed to be quiet for.
     #[test]
-    fn a_window_that_started_after_the_silence_began_covers_nothing() {
-        let kill = window("node_kill", Some(5_000), Some(5_100));
-        assert!(!kill.covers(1_000, 5_100, 500));
+    fn a_window_that_started_long_after_the_silence_began_covers_nothing() {
+        let kill = window("node_kill", Some(60_000), Some(60_100));
+        assert!(!kill.covers(1_000, 60_100, TOLERANCE));
+    }
+
+    /// The other side of that line, and an ACPR regression: silence that
+    /// began WITHIN the budget of the fault's own start IS explained by the
+    /// fault. A node whose journaling cadence is 5 s and which is then
+    /// partitioned went quiet 5 s "early" only in the sense that its last
+    /// sample predates the fault — it was never silent for longer than the
+    /// rule's own budget allows, so convicting it contradicts the budget.
+    /// Would catch a from-end tolerance widened by the 500 ms sampling grain
+    /// instead of by the silence budget.
+    #[test]
+    fn a_fault_that_fired_within_the_silence_budget_still_covers() {
+        let partition = window("network_partition", Some(6_000), None);
+        assert!(partition.covers(1_000, 90_000, TOLERANCE));
+        assert!(
+            !partition.covers(
+                1_000,
+                90_000,
+                AlibiTolerance {
+                    start_slack_ms: 500,
+                    end_slack_ms: 500,
+                },
+            ),
+            "the pre-fix tolerance is what this test pins the fix against"
+        );
     }
 
     /// An armed-but-unfired fault is never an alibi: it did nothing to
@@ -510,7 +603,35 @@ mod tests {
     #[test]
     fn an_unfired_window_covers_nothing_at_all() {
         let unfired = window("node_kill", None, None);
-        assert!(!unfired.covers(1_000, 1_001, 5_000));
+        assert!(!unfired.covers(1_000, 1_001, TOLERANCE));
+    }
+
+    /// The ACPR join-key regression, at this module's own layer: every real
+    /// injector writes `<roster name>/<incarnation>`
+    /// (`duckspout_fleet::fault::rendered_node_id`), while the run manifest
+    /// names its roster bare — so a lookup by roster name must still find the
+    /// window. Would catch the raw `w.target_node == node` join, under which
+    /// EVERY real fleet run's exemptions matched nothing.
+    #[test]
+    fn a_rendered_target_id_joins_to_the_bare_roster_name() {
+        let ledger = FaultLedger {
+            windows: vec![FaultWindow {
+                fault_id: "kill-0".to_owned(),
+                kind: "node_kill".to_owned(),
+                target_node: "fleet-0-1/1".to_owned(),
+                armed_at_ms: Some(1_000),
+                started_at_ms: Some(2_000),
+                ended_at_ms: Some(2_100),
+            }],
+        };
+        assert_eq!(ledger.windows_targeting("fleet-0-1").count(), 1);
+        assert_eq!(ledger.windows_targeting("fleet-0-1/1").count(), 1);
+        assert_eq!(ledger.windows_targeting("fleet-0-1/2").count(), 1);
+        assert_eq!(ledger.terminal_horizon("fleet-0-1"), Some(2_000));
+        // And it is still a JOIN, not a prefix match: a different roster
+        // member is not excused by this window.
+        assert_eq!(ledger.windows_targeting("fleet-0-10").count(), 0);
+        assert_eq!(ledger.terminal_horizon("fleet-0-10"), None);
     }
 
     /// The horizon is the earliest TERMINAL start targeting a node, and only

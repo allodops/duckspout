@@ -67,12 +67,16 @@ const CONTENTION_LINES: &str = "{\"node\":\"n1\",\"seq\":5,\"event\":\"Forward\"
      {\"node\":\"n2\",\"seq\":1,\"event\":\"Receipt\"}\n";
 
 /// One fault window that really fired, in the injectors' own ledger shape
-/// (`duckspout_fleet::faultlog`): armed, started, ended.
+/// (`duckspout_fleet::faultlog`): armed, started, ended. `target_node` is the
+/// RENDERED `<roster name>/<incarnation>` id every injector actually writes
+/// (`duckspout_fleet::fault`'s `rendered_node_id`) and not the bare roster
+/// name the manifest below uses — the two differing is the real shape, and a
+/// join that ignored it would stop this kill from excusing its own target.
 const FAULT_LOG_FIRED: &str = "{\"fault_id\":\"kill-0\",\"kind\":\"node_kill\",\
-     \"target_node\":\"n2\",\"phase\":\"armed\",\"at_ms\":20000}\n\
-     {\"fault_id\":\"kill-0\",\"kind\":\"node_kill\",\"target_node\":\"n2\",\
+     \"target_node\":\"n2/1\",\"phase\":\"armed\",\"at_ms\":20000}\n\
+     {\"fault_id\":\"kill-0\",\"kind\":\"node_kill\",\"target_node\":\"n2/1\",\
      \"phase\":\"started\",\"at_ms\":20040}\n\
-     {\"fault_id\":\"kill-0\",\"kind\":\"node_kill\",\"target_node\":\"n2\",\
+     {\"fault_id\":\"kill-0\",\"kind\":\"node_kill\",\"target_node\":\"n2/1\",\
      \"phase\":\"ended\",\"at_ms\":20090}\n";
 
 /// The fleet runner's manifest for a two-node run in which both nodes stayed
