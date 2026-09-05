@@ -66,7 +66,7 @@
 //!   than its own advertisement provably had not happened yet when the
 //!   advertisement was made and cannot back it. Acquitting such an
 //!   advertisement via the run-wide maximum would discard evidence the
-//!   journals already hold ([`Coverage::bound_for_advertisement`]).
+//!   journals already hold (`Coverage::bound_for_advertisement`).
 //!
 //! # The assumption this rests on, stated
 //!
