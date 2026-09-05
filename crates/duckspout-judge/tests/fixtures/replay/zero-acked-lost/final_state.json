@@ -1,0 +1,16 @@
+{
+  "present": [
+    {
+      "tenant": "tenant-a",
+      "source_incarnation": "loadgen-0-1000",
+      "first_index": 0,
+      "count": 1
+    },
+    {
+      "tenant": "tenant-a",
+      "source_incarnation": "loadgen-0-1000",
+      "first_index": 2,
+      "count": 1
+    }
+  ]
+}

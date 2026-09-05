@@ -5,10 +5,14 @@
 //! Reads the per-node (plus loadgen) NDJSON journals of a fleet run and
 //! delivers exactly one verdict via its exit code — see [`EXIT_CONTRACT`].
 //! Seeded-violation replays must convict, and a run whose armed injectors
-//! never fired is vacuous — `NoVerdict`, never `Pass` (§8.3).
+//! never fired is vacuous — `NoVerdict`, never `Pass` (§8.4's vacuity teeth;
+//! the citation read §8.3 before #208 implemented the paragraph it names).
+//! Both are real and enforced as of #208: `duckspout_judge::vacuity` carries
+//! the four run-level `NoVerdict` rules, and
+//! `tests/seeded_violation_replay.rs` is the must-convict self-test.
 //!
-//! This binary is a thin `clap` wrapper: the actual pipeline
-//! (ingest → loadgen run-summary vacuity check → every predicate) lives in
+//! This binary is a thin `clap` wrapper: the actual pipeline (ingest → every
+//! predicate → every run-level vacuity rule) lives in
 //! `duckspout_judge::runner`, split out specifically so it is directly
 //! testable (ACPR finding MEDIUM-HIGH-4) without spawning a subprocess.
 //!
@@ -38,13 +42,17 @@ use clap::Parser;
 use duckspout_judge::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS;
 use duckspout_judge::runner::{RunArgs, RunOutcome, run};
 use duckspout_judge::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION;
+use duckspout_judge::vacuity::DEFAULT_MAX_JOURNAL_SILENCE_MS;
 use duckspout_judge::verdict::Verdict;
 
 /// The judge's exit contract (§8.4), stable for every caller:
 /// `0` = Pass, `2` = Violation, `3` = `NoVerdict` (inconclusive or vacuous).
 const EXIT_CONTRACT: &str = "Exit codes: 0 = Pass · 2 = Violation · 3 = NoVerdict\n\
-    Every predicate runs on every invocation; the run passes only if all of them do.\n\
-    A vacuous run (armed fault injectors that never fired, §8.3) is NoVerdict, never Pass.";
+    Every predicate AND every run-level vacuity rule (vacuity/…) runs on every\n\
+    invocation; the run passes only if all of them do.\n\
+    A vacuous run — armed fault injectors that never fired, no observed cross-node\n\
+    contention, too many ambiguous client outcomes, or a node whose journals simply\n\
+    stop (§8.4) — is NoVerdict, never Pass.";
 
 /// CTK judge (§8.4): grades a fleet run's journals.
 #[derive(Debug, Parser)]
@@ -94,12 +102,35 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_MAX_RACING_READ_MS)]
     max_racing_read_ms: u64,
 
+    /// The fleet run's fault-window ledger (`faults.ndjson`), written by
+    /// `duckspout-fleet`'s injectors. §8.4 requires the armed-but-unfired
+    /// rule to be measured from this file and NEVER assumed from which
+    /// `--fault-*` flags the run was given; omitted, that rule reports
+    /// `NoVerdict`.
+    #[arg(long)]
+    fault_log: Option<PathBuf>,
+
+    /// The fleet run's manifest (`run.json`), written by `duckspout-fleet` at
+    /// the end of the run: the node roster plus each node's journal-progress
+    /// samples. Omitted, the cross-node-contention and node-continuity rules
+    /// report `NoVerdict` — the D-6 journals carry neither a roster nor a
+    /// clock (`duckspout_judge::run_manifest` docs).
+    #[arg(long)]
+    run_manifest: Option<PathBuf>,
+
     /// Ceiling on the fraction of a loadgen's resolved requests that came
     /// back `Ambiguous` before its run summary is treated as unreliable
     /// evidence (ACPR finding HIGH-1; reasoning:
     /// `duckspout_judge::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION` docs).
     #[arg(long, default_value_t = DEFAULT_MAX_AMBIGUOUS_FRACTION)]
     max_ambiguous_fraction: f64,
+
+    /// How far a roster node's journal may fall behind the FLEET'S OWN last
+    /// journal activity, in milliseconds, before it counts as a node whose
+    /// journals simply stopped (reasoning:
+    /// `duckspout_judge::vacuity::DEFAULT_MAX_JOURNAL_SILENCE_MS` docs).
+    #[arg(long, default_value_t = DEFAULT_MAX_JOURNAL_SILENCE_MS)]
+    max_journal_silence_ms: u64,
 }
 
 fn main() {
@@ -110,7 +141,10 @@ fn main() {
         read_log: cli.read_log,
         latest_view_fixture: cli.latest_view_fixture,
         committed_parts_fixture: cli.committed_parts_fixture,
+        fault_log: cli.fault_log,
+        run_manifest: cli.run_manifest,
         max_ambiguous_fraction: cli.max_ambiguous_fraction,
+        max_journal_silence_ms: cli.max_journal_silence_ms,
         max_racing_read_ms: cli.max_racing_read_ms,
     });
     report(&outcome);
@@ -127,16 +161,6 @@ fn report(outcome: &RunOutcome) {
                  (ambiguity fails closed, §8.4)"
             );
         }
-        RunOutcome::SummaryVacuous(findings) => {
-            eprintln!(
-                "duckspout-judge: loadgen run-summary check found {} vacuity finding(s) — \
-                 NoVerdict (§8.4 vacuity teeth, ACPR finding HIGH-1):",
-                findings.len()
-            );
-            for finding in findings {
-                eprintln!("  {finding}");
-            }
-        }
         RunOutcome::Judged {
             journal_count,
             line_count,
@@ -144,7 +168,7 @@ fn report(outcome: &RunOutcome) {
         } => {
             eprintln!(
                 "duckspout-judge: {journal_count} journal(s) parsed OK ({line_count} record(s)); \
-                 {} predicate(s) judged:",
+                 {} predicate(s) and run-level vacuity rule(s) judged:",
                 reports.len()
             );
             for report in reports {

@@ -195,7 +195,14 @@ fn summary_path_for(journal_path: &Path) -> PathBuf {
 /// carries at least one payload-identity line (module docs) — and
 /// therefore should have a `{path}.summary.json` sidecar written by
 /// `duckspout-loadgen` at clean exit.
-fn loadgen_journal_sources(journals: &JournalSet) -> BTreeSet<PathBuf> {
+///
+/// Public because [`check_summaries`]'s `Ok(())` deliberately does not
+/// distinguish "every loadgen journal's summary was clean" from "there was no
+/// loadgen journal to check" — and `crate::vacuity` must, since the second is
+/// itself a `NoVerdict` (§8.4's ambiguous-outcome ceiling cannot be applied
+/// to a run with no client-side outcomes recorded at all).
+#[must_use]
+pub fn loadgen_journal_sources(journals: &JournalSet) -> BTreeSet<PathBuf> {
     journals
         .lines
         .iter()

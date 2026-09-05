@@ -10,6 +10,9 @@
 //! | [`journal`] | the fleet's + loadgen's NDJSON journals, and the payload shapes decoded off them |
 //! | [`read_log`] | the query client's served-read log — reads have no §3 action, so they cannot ride a journal ([`read_log`]'s own docs) |
 //! | [`summary`] | the loadgen's run-summary sidecar, the vacuity check on the evidence itself |
+//! | [`fault_ledger`] | each injector's own `Armed`/`Started`/`Ended` ledger — what the fault schedule actually did |
+//! | [`run_manifest`] | the fleet runner's roster and per-node journal-progress samples |
+//! | [`vacuity`] | §8.4's four RUN-level `NoVerdict` rules, over the two files above |
 //! | [`final_state`] | read-back of the final system: per-record presence, and each changelog dataset's served latest view |
 //! | [`predicates`] | one pure function per §8.4 judge, over that evidence |
 //! | [`verdict`] | the shared three-valued verdict and the 0/2/3 exit contract |
@@ -54,10 +57,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fault_ledger;
 pub mod final_state;
 pub mod journal;
 pub mod predicates;
 pub mod read_log;
+pub mod run_manifest;
 pub mod runner;
 pub mod summary;
+pub mod vacuity;
 pub mod verdict;

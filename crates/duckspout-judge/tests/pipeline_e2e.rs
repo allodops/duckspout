@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use duckspout_judge::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS;
 use duckspout_judge::runner::{RunArgs, RunOutcome, run};
 use duckspout_judge::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION;
+use duckspout_judge::vacuity::{DEFAULT_MAX_JOURNAL_SILENCE_MS, RULE_LOADGEN_OUTCOMES};
 use duckspout_judge::verdict::Verdict;
 
 /// One loadgen `ClientAck` line for a 3-record batch, carrying every #206
@@ -57,6 +58,40 @@ const EXPIRE_LINE: &str = "{\"node\":\"n1\",\"seq\":1,\"event\":\"Expire\",\
 const RESIDENCY_LINES: &str = "{\"node\":\"n1\",\"seq\":2,\"event\":\"DropWindow\"}\n\
      {\"node\":\"n1\",\"seq\":3,\"event\":\"DropWindow\"}\n\
      {\"node\":\"n1\",\"seq\":4,\"event\":\"DropWindow\"}\n";
+
+/// The write path actually crossing a machine boundary: `n1` forwarded a
+/// batch to its peer and `n2` applied it (#208's cross-node-contention rule
+/// — `duckspout_judge::vacuity`'s own definition of what counts).
+const CONTENTION_LINES: &str = "{\"node\":\"n1\",\"seq\":5,\"event\":\"Forward\"}\n\
+     {\"node\":\"n2\",\"seq\":0,\"event\":\"PeerApply\"}\n\
+     {\"node\":\"n2\",\"seq\":1,\"event\":\"Receipt\"}\n";
+
+/// One fault window that really fired, in the injectors' own ledger shape
+/// (`duckspout_fleet::faultlog`): armed, started, ended. `target_node` is the
+/// RENDERED `<roster name>/<incarnation>` id every injector actually writes
+/// (`duckspout_fleet::fault`'s `rendered_node_id`) and not the bare roster
+/// name the manifest below uses — the two differing is the real shape, and a
+/// join that ignored it would stop this kill from excusing its own target.
+const FAULT_LOG_FIRED: &str = "{\"fault_id\":\"kill-0\",\"kind\":\"node_kill\",\
+     \"target_node\":\"n2/1\",\"phase\":\"armed\",\"at_ms\":20000}\n\
+     {\"fault_id\":\"kill-0\",\"kind\":\"node_kill\",\"target_node\":\"n2/1\",\
+     \"phase\":\"started\",\"at_ms\":20040}\n\
+     {\"fault_id\":\"kill-0\",\"kind\":\"node_kill\",\"target_node\":\"n2/1\",\
+     \"phase\":\"ended\",\"at_ms\":20090}\n";
+
+/// The fleet runner's manifest for a two-node run in which both nodes stayed
+/// active to the end (`duckspout_fleet::runlog`'s wire shape). `n2` is on the
+/// roster even though the ledger above killed it — the kill is what EXCUSES
+/// its silence, and the judge derives that from the ledger, never from this
+/// file.
+const RUN_MANIFEST_HEALTHY: &str = r#"{"started_at_ms":1000,"ended_at_ms":100000,
+     "sample_interval_ms":500,
+     "nodes":[
+       {"name":"n1","journal_path":"/w/n1.ndjson","journal_lines":6,
+        "last_progress_at_ms":90000,"exited_early":false},
+       {"name":"n2","journal_path":"/w/n2.ndjson","journal_lines":2,
+        "last_progress_at_ms":20100,"exited_early":true}
+     ]}"#;
 
 /// A committed snapshot covering `EXPIRE_LINE`'s whole arrival range —
 /// Keep Rule 10 satisfied.
@@ -109,10 +144,32 @@ impl Evidence {
         let journal = dir.path().join("fleet.ndjson");
         write_file(
             &journal,
-            &format!("{COMMIT_LINE}{EXPIRE_LINE}{RESIDENCY_LINES}{ACK_LINE}{CHANGELOG_ACK_LINE}"),
+            &format!(
+                "{COMMIT_LINE}{EXPIRE_LINE}{RESIDENCY_LINES}{CONTENTION_LINES}\
+                 {ACK_LINE}{CHANGELOG_ACK_LINE}"
+            ),
         );
         write_clean_summary(&journal, 2);
+        write_file(&dir.path().join("faults.ndjson"), FAULT_LOG_FIRED);
+        write_file(&dir.path().join("run.json"), RUN_MANIFEST_HEALTHY);
         Self { dir, journal }
+    }
+
+    fn fault_log(&self) -> PathBuf {
+        self.dir.path().join("faults.ndjson")
+    }
+
+    fn run_manifest(&self) -> PathBuf {
+        self.dir.path().join("run.json")
+    }
+
+    /// Deletes the loadgen's run-summary sidecar — the SIGKILL-mid-run
+    /// signature (`duckspout_judge::summary`'s module docs), with every other
+    /// piece of evidence in this set left clean.
+    fn drop_summary(&self) {
+        let mut summary_path = self.journal.as_os_str().to_owned();
+        summary_path.push(".summary.json");
+        std::fs::remove_file(Path::new(&summary_path)).expect("remove summary");
     }
 
     /// The probed `complete` reads a healthy eviction storm produces: the
@@ -176,7 +233,10 @@ impl Evidence {
             read_log,
             latest_view_fixture: latest_view,
             committed_parts_fixture: committed_parts,
+            fault_log: Some(self.fault_log()),
+            run_manifest: Some(self.run_manifest()),
             max_ambiguous_fraction: DEFAULT_MAX_AMBIGUOUS_FRACTION,
+            max_journal_silence_ms: DEFAULT_MAX_JOURNAL_SILENCE_MS,
             max_racing_read_ms: DEFAULT_MAX_RACING_READ_MS,
         }
     }
@@ -191,7 +251,9 @@ fn verdict_of<'a>(outcome: &'a RunOutcome, predicate: &str) -> &'a Verdict<Strin
                 .expect("every predicate is reported")
                 .verdict
         }
-        other => panic!("expected a judged run, got {other:?}"),
+        other @ RunOutcome::IngestionFailed(_) => {
+            panic!("expected a judged run, got {other:?}")
+        }
     }
 }
 
@@ -217,7 +279,9 @@ fn a_clean_run_with_every_evidence_file_exits_pass() {
                 );
             }
         }
-        other => panic!("expected a judged run, got {other:?}"),
+        other @ RunOutcome::IngestionFailed(_) => {
+            panic!("expected a judged run, got {other:?}")
+        }
     }
     assert_eq!(outcome.exit_code(), 0);
 }
@@ -444,30 +508,29 @@ fn a_complete_answer_that_changed_with_the_cache_state_exits_violation() {
 /// piece of evidence says the run was clean.
 #[test]
 fn a_killed_mid_run_loadgen_missing_its_summary_exits_no_verdict_not_pass() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let journal_path = dir.path().join("fleet.ndjson");
-    write_file(&journal_path, &format!("{COMMIT_LINE}{ACK_LINE}"));
-    // Deliberately no `.summary.json` written — the SIGKILL-mid-run case.
-    let fixture_path = dir.path().join("final_state.json");
-    write_file(&fixture_path, FINAL_STATE_ALL_PRESENT);
-
-    let outcome = run(&RunArgs {
-        journals: vec![journal_path],
-        final_state_fixture: Some(fixture_path),
-        read_log: None,
-        latest_view_fixture: None,
-        committed_parts_fixture: None,
-        max_ambiguous_fraction: DEFAULT_MAX_AMBIGUOUS_FRACTION,
-        max_racing_read_ms: DEFAULT_MAX_RACING_READ_MS,
-    });
+    // Every other piece of evidence in this set is the clean one that exits
+    // `0` above — including the fault ledger and the run manifest — so the
+    // missing `.summary.json` is the ONLY difference, and the `3` below can
+    // only have come from it.
+    let evidence = Evidence::clean();
+    evidence.drop_summary();
+    let outcome = run(&evidence.args_with_parts(
+        Some(evidence.with_file("final_state.json", FINAL_STATE_ALL_PRESENT)),
+        Some(evidence.probed_reads("reads.ndjson")),
+        Some(evidence.with_file("latest_view.json", LATEST_VIEW_CORRECT)),
+        Some(evidence.with_file("committed_parts.json", COMMITTED_PARTS_COVERED)),
+    ));
     assert!(
-        matches!(outcome, RunOutcome::SummaryVacuous(_)),
+        matches!(
+            verdict_of(&outcome, RULE_LOADGEN_OUTCOMES),
+            Verdict::NoVerdict(_)
+        ),
         "expected the missing-summary vacuity finding, got {outcome:?}"
     );
     assert_eq!(
         outcome.exit_code(),
         3,
-        "a run this predicate never actually observed the end of must NEVER be exit 0"
+        "a run whose end nobody actually observed must NEVER be exit 0"
     );
 }
 
@@ -485,7 +548,10 @@ fn a_malformed_journal_line_exits_no_verdict() {
         read_log: None,
         latest_view_fixture: None,
         committed_parts_fixture: None,
+        fault_log: None,
+        run_manifest: None,
         max_ambiguous_fraction: DEFAULT_MAX_AMBIGUOUS_FRACTION,
+        max_journal_silence_ms: DEFAULT_MAX_JOURNAL_SILENCE_MS,
         max_racing_read_ms: DEFAULT_MAX_RACING_READ_MS,
     });
     assert!(matches!(outcome, RunOutcome::IngestionFailed(_)));

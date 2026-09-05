@@ -212,6 +212,20 @@ pub async fn wait_exited(node: &mut RunningNode, timeout: Duration) -> bool {
     }
 }
 
+/// Whether `node`'s child process has ALREADY exited, without waiting for
+/// it — the run-manifest observation `crate::runlog::NodeRun::exited_early`
+/// carries (§8.4's "a node whose journals simply stop").
+///
+/// Called once, immediately before teardown, so a `true` here means the node
+/// ended on its own rather than under the runner's own SIGTERM. Fails CLOSED
+/// in the same direction [`wait_exited`] does: a `try_wait` error reports
+/// `false` (not exited), because a wait error must never be reported as a
+/// confirmed early exit — that would manufacture a vacuity finding out of an
+/// OS hiccup and downgrade a legitimately clean run to `NoVerdict`.
+pub fn has_exited(node: &mut RunningNode) -> bool {
+    matches!(node.child.try_wait(), Ok(Some(_)))
+}
+
 /// Polls `node`'s `/status` endpoint (§9.3.2) every 250 ms until it reports
 /// `ready: true`, or fails as soon as the child process exits early
 /// (surfacing the tail of its own stderr log — waiting out the full

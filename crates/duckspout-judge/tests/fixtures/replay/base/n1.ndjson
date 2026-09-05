@@ -1,0 +1,7 @@
+{"node":"n1","seq":0,"event":"LakeCommitOk","partition":"t0-s0","complete_through_ms":2000}
+{"node":"n1","seq":1,"event":"Expire","dataset":"dim_users","partition":"tenant-a.4","part":"dim_users/tenant-a.4/3/primary/0.parquet","part_kind":"primary","dataset_kind":"changelog","origin_coverage":[{"origin":"n1","first_seq":1,"last_seq":5}]}
+{"node":"n1","seq":2,"event":"DropWindow"}
+{"node":"n1","seq":3,"event":"DropWindow"}
+{"node":"n1","seq":4,"event":"DropWindow"}
+{"node":"n1","seq":5,"event":"Forward"}
+{"node":"n1","seq":6,"event":"ClaimAdvertise","partition":"t0-s0","complete_through_ms":2000}

@@ -1,0 +1,3 @@
+{"node":"loadgen-0","seq":0,"event":"ClientAck","request_id":"loadgen-0-1000-0","tenant":"tenant-a","record_count":3,"first_index":0,"source_incarnation":"loadgen-0-1000","partition":"t0-s0","max_event_time_ms":1500,"complete_through_ms":1000}
+{"node":"loadgen-0","seq":1,"event":"ClientAck","dataset":"dim_users","partition":"tenant-a.4","tenant":"tenant-a","changelog_key":"u1","origin":"n1","changelog_seq":3,"value":"alice"}
+{"node":"loadgen-0","seq":2,"event":"ClientAck","dataset":"dim_users","partition":"tenant-a.4","tenant":"tenant-a","changelog_key":"u2","origin":"n1","changelog_seq":7,"value":"bob"}

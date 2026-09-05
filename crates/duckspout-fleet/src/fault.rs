@@ -125,7 +125,7 @@ fn rendered_node_id(spec: &NodeSpec) -> String {
 /// exist yet (the target hasn't booted, or hasn't written anything yet) —
 /// never an error: a fault log must never itself fail the fleet run over
 /// this best-effort correlation aid.
-fn node_journal_line_count(journal_path: &std::path::Path) -> u64 {
+pub(crate) fn node_journal_line_count(journal_path: &std::path::Path) -> u64 {
     std::fs::read_to_string(journal_path).map_or(0, |contents| {
         u64::try_from(contents.lines().count()).unwrap_or(u64::MAX)
     })
