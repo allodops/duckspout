@@ -112,8 +112,28 @@ fn shared_work_dir() -> PathBuf {
 /// journal after the run, not by asserting anything about the fleet
 /// binary's own exit code (it is deliberately not the judge, `main.rs`'s
 /// own module docs).
+///
+/// # The load-vs-fault arithmetic (an ACPR finding, MEDIUM-HIGH-2)
+///
+/// An earlier version of this test used `--load-batches 15
+/// --load-interval-ms 150` (total load wall-clock ≈ 14×150ms ≈ 2.1s), while
+/// the mid-drain kill only fires once `--hot-window 2s` + `--allowed-lateness
+/// 1s` (≈3s of simulated event time, plus daemon-side scheduling latency)
+/// has produced a `PutPart` line — i.e. the load pass had ALREADY finished
+/// by the time the kill fired, proving nothing about the system under load
+/// (exactly the failure mode this module's own doc comment warns against).
+/// `LOAD_BATCHES` below is sized so the load pass's wall-clock floor,
+/// `(LOAD_BATCHES - 1) * LOAD_INTERVAL_MS`, comfortably EXCEEDS that ≈3s
+/// PutPart-arrival estimate — verified after the run, not merely assumed,
+/// via the real node-0 journal's own `Accept` count (module docs at the
+/// assertion below).
 #[test]
 fn node_kill_mid_drain_lands_strictly_between_putpart_and_lakecommit() {
+    // (LOAD_BATCHES - 1) * LOAD_INTERVAL_MS ≈ 79 * 150ms ≈ 11.85s of load
+    // wall-clock — comfortably past the ≈3s PutPart estimate above.
+    const LOAD_BATCHES: u32 = 80;
+    const LOAD_INTERVAL_MS: u32 = 150;
+
     let Some(postgres_dsn) = postgres_dsn_from_env() else {
         eprintln!(
             "fault_injection: DUCKSPOUT_FLEET_TEST_POSTGRES_DSN unset — skipping (Docker-optional \
@@ -144,11 +164,11 @@ fn node_kill_mid_drain_lands_strictly_between_putpart_and_lakecommit() {
             "--allowed-lateness",
             "1s",
             "--load-batches",
-            "15",
+            &LOAD_BATCHES.to_string(),
             "--load-batch-size",
             "10",
             "--load-interval-ms",
-            "150",
+            &LOAD_INTERVAL_MS.to_string(),
             "--settle-timeout-secs",
             "30",
             "--boot-timeout-secs",
@@ -198,19 +218,73 @@ fn node_kill_mid_drain_lands_strictly_between_putpart_and_lakecommit() {
         "the real SIGKILL must have landed strictly between PutPart and any LakeCommit outcome; \
          node-0's journal: {node0_journal:#?}"
     );
+
+    // The MEDIUM-HIGH-2 ACPR finding's own verification ask: prove the kill
+    // genuinely fired DURING active load, not after it had already
+    // finished. `TraceEvent::Accept` journals once per admitted OTLP export
+    // batch (`duckspout-staging/src/stager.rs`'s own `stage_blocking`) — if
+    // the real SIGKILL had fired only after the whole drive-load pass
+    // finished, node-0's own journal would show all `LOAD_BATCHES` Accepts;
+    // strictly fewer is direct evidence the load pass was still in flight,
+    // mid-send, when the kill landed.
+    let accept_count = node0_journal
+        .iter()
+        .filter(|line| line["event"] == "Accept")
+        .count();
+    assert!(
+        accept_count < LOAD_BATCHES as usize,
+        "the kill must land while load is still active: node-0 accepted {accept_count} of \
+         {LOAD_BATCHES} batches — a count equal to (or exceeding) {LOAD_BATCHES} would mean the \
+         load pass had already finished before the kill fired"
+    );
 }
 
-/// The real SIGSTOP-pause fault: a real `SIGSTOP`, held past
-/// `duckspout_daemon::constants::HEARTBEAT_TTL_SECS`, then a real
-/// `SIGCONT` — both confirmed via `/proc/<pid>/stat`
-/// (`crate::process::is_stopped`), proven by reading `faults.ndjson` after
-/// the run. `crate::fault`'s own module docs disclose exactly what this
-/// does NOT verify (a peer actually rejecting the resumed incarnation —
-/// blocked on daemon composition not yet wiring `fence_boot`/`FenceTable`
-/// at all) and where that IS verified for real:
+/// The real SIGSTOP-pause fault: a real `SIGSTOP`, then a real `SIGCONT` —
+/// both confirmed via `/proc/<pid>/stat` (`crate::process::is_stopped`/
+/// `is_live_running`), proven by reading `faults.ndjson` after the run.
+/// `crate::fault`'s own module docs disclose exactly what this does NOT
+/// verify (a peer actually rejecting the resumed incarnation — blocked on
+/// daemon composition not yet wiring `fence_boot`/`FenceTable` at all) and
+/// where that IS verified for real:
 /// `crates/duckspout-replication/tests/fenced_zombie_pause_and_promote.rs`.
+///
+/// # The pause duration vs. `HEARTBEAT_TTL_SECS` (an ACPR finding, honesty
+/// correction)
+///
+/// §8.4 calls for the pause to be "long enough to expire claims," i.e. past
+/// `duckspout_daemon::constants::HEARTBEAT_TTL_SECS` (15s) — an earlier
+/// version of this doc comment claimed the pause was held past that
+/// threshold, while `--fault-sigstop-duration-secs` below is actually only
+/// 3s. This is a deliberate, disclosed proxy, not the claim this doc
+/// comment used to make: a real 15s+ hold is easy to add but slows every
+/// `cargo test`/CI run of this file by 15+ seconds for a duration this test
+/// does not otherwise need — everything it actually asserts (a real
+/// `SIGSTOP`/`SIGCONT` round trip, confirmed via `/proc/<pid>/stat`, and
+/// that it lands while load is genuinely still active, module docs below)
+/// is exercised identically at 3s as at 15s+. The `HEARTBEAT_TTL_SECS`-scale
+/// hold itself is not this file's concern: `duckspout-fleet` has no live
+/// heartbeat/claim-expiry peer to observe yet at all (this file's own
+/// module docs on the daemon-composition gap), so a longer hold here would
+/// not exercise any additional real behavior — only wall-clock time.
+///
+/// # The load-vs-fault arithmetic (an ACPR finding, MEDIUM-HIGH-2)
+///
+/// An earlier version of this test used `--load-batches 5
+/// --load-interval-ms 100` (total load wall-clock ≈ 4×100ms ≈ 0.4s), firing
+/// `SIGSTOP` only after `--fault-sigstop-delay-secs 1` — i.e. the load pass
+/// had ALREADY finished by the time the pause even started, proving nothing
+/// about the system under load. `LOAD_BATCHES`/`LOAD_INTERVAL_MS` below are
+/// sized so the load pass's wall-clock floor, `(LOAD_BATCHES - 1) *
+/// LOAD_INTERVAL_MS` ≈ 39×150ms ≈ 5.85s, comfortably exceeds
+/// `fault_sigstop_delay_secs + fault_sigstop_duration_secs` = 1+3 = 4s —
+/// verified after the run, not merely assumed, via the real node-0
+/// journal's own `Accept` count sliced at the fault's own journaled
+/// `node_journal_lines` anchor (module docs at the assertion below).
 #[test]
 fn sigstop_pause_is_a_real_confirmed_stop_and_resume() {
+    const LOAD_BATCHES: u32 = 40;
+    const LOAD_INTERVAL_MS: u32 = 150;
+
     let Some(postgres_dsn) = postgres_dsn_from_env() else {
         eprintln!(
             "fault_injection: DUCKSPOUT_FLEET_TEST_POSTGRES_DSN unset — skipping (see the other \
@@ -236,11 +310,11 @@ fn sigstop_pause_is_a_real_confirmed_stop_and_resume() {
             "--work-dir",
             work_dir.to_str().unwrap(),
             "--load-batches",
-            "5",
+            &LOAD_BATCHES.to_string(),
             "--load-batch-size",
             "5",
             "--load-interval-ms",
-            "100",
+            &LOAD_INTERVAL_MS.to_string(),
             "--settle-timeout-secs",
             "15",
             "--boot-timeout-secs",
@@ -287,5 +361,35 @@ fn sigstop_pause_is_a_real_confirmed_stop_and_resume() {
     assert!(
         Duration::from_millis(ended_at - started_at) >= Duration::from_secs(3),
         "the journaled window must span at least the configured 3s pause"
+    );
+
+    // The MEDIUM-HIGH-2 ACPR finding's own verification ask: prove the
+    // pause genuinely fired DURING active load, not after it had already
+    // finished. `Started`'s own journaled `node_journal_lines` (MEDIUM-4's
+    // fix) is an exact seq anchor into node-0's own real D-6 journal at the
+    // moment the SIGSTOP was confirmed — the journal is append-only, so
+    // slicing the FINAL journal at that same line count reproduces exactly
+    // what existed at that moment. If the load pass had already finished
+    // sending before the pause began, ALL `LOAD_BATCHES` `Accept` lines
+    // would already be in that slice; strictly fewer is direct evidence the
+    // load pass was still incomplete when the pause began.
+    let started_anchor =
+        usize::try_from(started["detail"]["node_journal_lines"].as_u64().unwrap()).unwrap();
+    let node0_journal = read_ndjson_lines(&work_dir.join("node-0").join("journal.ndjson"));
+    assert!(
+        started_anchor <= node0_journal.len(),
+        "the journal must only ever grow: anchor {started_anchor} exceeds final length {}",
+        node0_journal.len()
+    );
+    let accept_count_before_pause = node0_journal[..started_anchor]
+        .iter()
+        .filter(|line| line["event"] == "Accept")
+        .count();
+    assert!(
+        accept_count_before_pause < LOAD_BATCHES as usize,
+        "the pause must land while load is still active: node-0 had accepted only \
+         {accept_count_before_pause} of {LOAD_BATCHES} batches by the time SIGSTOP was \
+         confirmed — a count reaching {LOAD_BATCHES} would mean the load pass had already \
+         finished before the pause began"
     );
 }

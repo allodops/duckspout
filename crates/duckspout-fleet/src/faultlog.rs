@@ -9,20 +9,29 @@
 //! `ClientTimeout`) — every variant is something a NODE does, journaled BY
 //! that node, transcribed verbatim from the formal model's action set. A
 //! fault window is the opposite shape on every axis: it is something the
-//! FLEET RUNNER does *to* a node from outside, the node itself has no idea
-//! it is being faulted (and must not — a node that could observe its own
-//! fault schedule would not be exercising a real, uninstrumented failure
-//! mode), and "node kill" / "SIGSTOP pause" have no correspondence in the
-//! §3 formal action set at all (they are environment actions in the P/TLA+
-//! sense, `duckspout_types::EnvironmentEvent`'s own module docs — but that
-//! type is itself scoped to the CTK **in-memory** tier's schedule stream,
-//! module docs there, not this crate's real-process fault injection).
-//! Amending the frozen D-6 vocabulary to fit fault windows in would be a
-//! settled-decision amendment (`AGENTS.md`: "never re-litigate\[d\] in PRs"),
-//! not a mechanical fix available inside this issue's scope — so this
-//! module is deliberately its own small, informal, fleet-runner-owned NDJSON
-//! channel (`faults.ndjson`, one file per fleet run, shared across every
-//! injector) rather than a false-shoehorn into D-6.
+//! FLEET RUNNER does *to* a node from outside, and the node itself has no
+//! idea it is being faulted (and must not — a node that could observe its
+//! own fault schedule would not be exercising a real, uninstrumented
+//! failure mode).
+//!
+//! `duckspout_types::EnvironmentEvent::CrashNode` DOES have a §3
+//! correspondence for a node kill (its own doc comment: "Kill a node
+//! process; durable state survives" — `docs/trace-mapping.md` maps it to
+//! "§3.3 Crash and recovery"), and that type's module docs say it is
+//! "injected by the CTK's schedule stream, never journaled by a node" —
+//! which is consistent with, not against, reusing it here. `SigstopPause`,
+//! though, has no `EnvironmentEvent` variant at all — a SIGSTOP pause is
+//! not a crash. Mixing a `NodeKill` fault-log entry that DOES have a D-6
+//! correspondence with a `SigstopPause` entry that does NOT would make this
+//! channel inconsistent depending on which fault kind fired, so this module
+//! is deliberately ONE small, informal, fleet-runner-owned NDJSON channel
+//! (`faults.ndjson`, one file per fleet run, shared across every injector)
+//! for BOTH fault kinds uniformly — not a per-kind mix of "amend D-6 where
+//! there is a variant, informal channel where there isn't." Amending the
+//! frozen D-6 vocabulary to add a `SigstopPause` correspondence would be a
+//! settled-decision amendment (`AGENTS.md`: "never re-litigate\[d\] in
+//! PRs"), not a mechanical fix available inside this issue's scope, so this
+//! module does not attempt it for either fault kind.
 //!
 //! # Shape
 //!
@@ -157,9 +166,20 @@ impl FaultLog {
         out.flush().expect("fault-window journal flush");
     }
 
-    /// Journals `fault_id`'s [`FaultPhase::Armed`] line.
-    pub fn armed(&self, fault_id: &str, kind: FaultKind, target_node: &str) {
-        self.record(fault_id, kind, target_node, FaultPhase::Armed, None);
+    /// Journals `fault_id`'s [`FaultPhase::Armed`] line. `detail` carries
+    /// the same kind of correlation aid `started`/`ended` already accept
+    /// (`crate::fault`'s own callers snapshot the target's D-6 journal line
+    /// count here too, not only at `Started`/`Ended` — a judge locating
+    /// "how far had this node's own journal gotten when this fault was
+    /// scheduled" needs the Armed-phase anchor as much as the later ones).
+    pub fn armed(
+        &self,
+        fault_id: &str,
+        kind: FaultKind,
+        target_node: &str,
+        detail: Option<serde_json::Value>,
+    ) {
+        self.record(fault_id, kind, target_node, FaultPhase::Armed, detail);
     }
 
     /// Journals `fault_id`'s [`FaultPhase::Started`] line.
@@ -225,7 +245,7 @@ mod tests {
     fn armed_started_ended_share_the_fault_id_and_appear_in_order() {
         let path = scratch("lifecycle");
         let log = FaultLog::create(&path).unwrap();
-        log.armed("kill-0", FaultKind::NodeKill, "fleet-0-1");
+        log.armed("kill-0", FaultKind::NodeKill, "fleet-0-1", None);
         log.started(
             "kill-0",
             FaultKind::NodeKill,
@@ -263,7 +283,7 @@ mod tests {
     fn an_armed_only_fault_journals_without_error() {
         let path = scratch("armed-only");
         let log = FaultLog::create(&path).unwrap();
-        log.armed("pause-1", FaultKind::SigstopPause, "fleet-0-2");
+        log.armed("pause-1", FaultKind::SigstopPause, "fleet-0-2", None);
         let lines = read_lines(&path);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["phase"], "armed");
@@ -276,7 +296,7 @@ mod tests {
     fn absent_detail_is_omitted_not_null() {
         let path = scratch("no-detail");
         let log = FaultLog::create(&path).unwrap();
-        log.armed("kill-2", FaultKind::NodeKill, "fleet-0-0");
+        log.armed("kill-2", FaultKind::NodeKill, "fleet-0-0", None);
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
             !raw.contains("detail"),
@@ -296,7 +316,7 @@ mod tests {
             for i in 0..8 {
                 let log = std::sync::Arc::clone(&log);
                 scope.spawn(move || {
-                    log.armed(&format!("f-{i}"), FaultKind::NodeKill, "fleet-0-0");
+                    log.armed(&format!("f-{i}"), FaultKind::NodeKill, "fleet-0-0", None);
                 });
             }
         });

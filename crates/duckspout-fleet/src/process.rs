@@ -123,19 +123,19 @@ pub async fn send_signal(node: &RunningNode, signal: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Whether the OS currently reports `pid` as stopped (`/proc/<pid>/stat`'s
-/// process-state field is `T`, "stopped (on a signal)" — `proc(5)`) —
-/// Linux-only best-effort confirmation that a `SIGSTOP` actually landed,
-/// not merely that the signal was sent. `crate::fault`'s SIGSTOP-pause
-/// injector uses this to journal the fault window's `Started` phase only
-/// once the pause is observably real (§8.4: "each window journaled with
-/// start/end").
+/// The raw `/proc/<pid>/stat` process-state character (`proc(5)`: `R`
+/// running, `S` sleeping, `D` uninterruptible sleep, `Z` zombie (exited, not
+/// yet reaped), `T`/`t` stopped, `X`/`x` dead, ...) — the one parse
+/// [`is_stopped`] and [`is_live_running`] both build on, so they can never
+/// disagree on where the field sits in the line.
 ///
 /// # Errors
 ///
-/// If `/proc/<pid>/stat` cannot be read (the process already exited, or
-/// this is not Linux).
-pub fn is_stopped(pid: u32) -> anyhow::Result<bool> {
+/// If `/proc/<pid>/stat` cannot be read (the process already exited AND has
+/// been reaped, or this is not Linux), or the state field is missing
+/// entirely (a malformed/truncated read — never actually observed, but not
+/// silently swallowed into a wrong answer).
+fn process_state(pid: u32) -> anyhow::Result<char> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .with_context(|| format!("reading /proc/{pid}/stat"))?;
     // The second field is `(comm)`, which may itself contain spaces or
@@ -144,20 +144,66 @@ pub fn is_stopped(pid: u32) -> anyhow::Result<bool> {
     let after_comm = stat
         .rsplit_once(')')
         .map_or(stat.as_str(), |(_, rest)| rest);
-    let state = after_comm.split_whitespace().next();
-    Ok(matches!(state, Some("T" | "t")))
+    after_comm
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.chars().next())
+        .context("/proc/<pid>/stat has no state field after `(comm)`")
+}
+
+/// Whether the OS currently reports `pid` as stopped (state `T`/`t`,
+/// "stopped (on a signal)" — `proc(5)`) — Linux-only best-effort
+/// confirmation that a `SIGSTOP` actually landed, not merely that the
+/// signal was sent. `crate::fault`'s SIGSTOP-pause injector uses this to
+/// journal the fault window's `Started` phase only once the pause is
+/// observably real (§8.4: "each window journaled with start/end").
+/// Deliberately `false` (not an error) for a zombie (`Z`): a process that
+/// exited on its own was never actually paused by this injector, and
+/// `crate::fault::run_sigstop_pause` relies on exactly that to refuse to
+/// journal a false-positive `Started` (see the ACPR finding in its own
+/// module docs).
+///
+/// # Errors
+///
+/// If `/proc/<pid>/stat` cannot be read (the process already exited and was
+/// reaped, or this is not Linux).
+pub fn is_stopped(pid: u32) -> anyhow::Result<bool> {
+    Ok(matches!(process_state(pid)?, 'T' | 't'))
+}
+
+/// Whether the OS currently reports `pid` as genuinely alive and running —
+/// state `R` (running), `S` (sleeping), or `D` (uninterruptible sleep), the
+/// three "not stopped, not exited, not a zombie" states `proc(5)` defines.
+/// Deliberately **not** simply `!is_stopped`: a zombie (`Z`, exited but
+/// unreaped) is neither `T`/`t` nor genuinely live, and satisfying
+/// `!is_stopped` on a zombie is exactly the false-positive an ACPR found in
+/// `crate::fault::run_sigstop_pause`'s resume confirmation — a node that
+/// crashed on its own, not one this injector actually paused and resumed,
+/// must not read as "confirmed resumed."
+///
+/// # Errors
+///
+/// If `/proc/<pid>/stat` cannot be read (the process already exited and was
+/// reaped, or this is not Linux).
+pub fn is_live_running(pid: u32) -> anyhow::Result<bool> {
+    Ok(matches!(process_state(pid)?, 'R' | 'S' | 'D'))
 }
 
 /// Polls `node`'s process every 100 ms until [`Child::try_wait`] reports it
 /// has exited, or `timeout` elapses. `crate::fault`'s node-kill injector
 /// uses this to confirm a `SIGKILL` actually landed before journaling the
-/// fault window's `Ended` phase (§8.4).
+/// fault window's `Ended` phase (§8.4). Fails CLOSED on a `try_wait` error
+/// — treated the same as "not yet exited" (keeps polling until `timeout`,
+/// then reports `false`), matching [`is_stopped`]'s and [`send_signal`]'s
+/// own fail-closed posture: a genuine wait error must never read as
+/// "confirmed exited" (an ACPR finding — the pre-fix code did exactly that,
+/// which would have suppressed `run_node_kill`'s own fail-closed `bail!` on
+/// a real confirmation failure).
 pub async fn wait_exited(node: &mut RunningNode, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match node.child.try_wait() {
-            Ok(Some(_)) | Err(_) => return true,
-            Ok(None) => {}
+        if matches!(node.child.try_wait(), Ok(Some(_))) {
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -270,9 +316,78 @@ fn stderr_tail(path: &std::path::Path) -> String {
     }
 }
 
+/// Test-only construction helpers shared with `crate::fault`'s own tests
+/// (the zombie-process false-positive reproduction, its module docs) —
+/// [`RunningNode::child`] is private to this module, so a cross-module test
+/// needs a seam to build one wrapping an arbitrary already-spawned
+/// [`Child`], not a real `duckspout-daemon` boot.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{Command, NodeSpec, RunningNode};
+
+    /// A minimal [`NodeSpec`] for fault-signal tests — its paths are never
+    /// actually read/written by a real daemon, only carried for
+    /// [`RunningNode::spec`]'s sake.
+    pub(crate) fn dummy_spec() -> NodeSpec {
+        let dir = std::env::temp_dir().join(format!(
+            "duckspout-fleet-process-fault-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        NodeSpec {
+            index: 0,
+            name: "fault-test-node".to_owned(),
+            otlp_port: 0,
+            flight_port: 0,
+            peer_port: 0,
+            status_port: 0,
+            data_dir: dir.join("data"),
+            config_path: dir.join("config.toml"),
+            journal_path: dir.join("journal.ndjson"),
+            stdout_path: dir.join("stdout.log"),
+            stderr_path: dir.join("stderr.log"),
+        }
+    }
+
+    /// Spawns a REAL long-lived process (`sleep <seconds>`) wrapped as a
+    /// [`RunningNode`] — a stand-in "node" for exercising real OS signal
+    /// semantics without needing a built `duckspout-daemon` binary.
+    pub(crate) fn spawn_sleep(seconds: u64) -> RunningNode {
+        let child = Command::new("sleep")
+            .arg(seconds.to_string())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning `sleep` (must be on PATH)");
+        RunningNode {
+            spec: dummy_spec(),
+            child,
+        }
+    }
+
+    /// Spawns a REAL process that exits almost immediately (`true`) and is
+    /// deliberately never `wait`/`try_wait`ed on by the caller — the exact
+    /// precondition for the OS to keep it around as a real zombie (`Z`
+    /// state) for as long as the test needs
+    /// (`crate::fault`'s zombie-reproduction test, its module docs).
+    pub(crate) fn spawn_short_lived() -> RunningNode {
+        let child = Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning `true` (must be on PATH)");
+        RunningNode {
+            spec: dummy_spec(),
+            child,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_support::spawn_sleep;
 
     #[test]
     fn stderr_tail_reports_a_placeholder_for_a_missing_file() {
@@ -361,51 +476,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// A minimal [`NodeSpec`] for the fault-signal tests below — its paths
-    /// are never actually read/written by `sleep`, only carried for
-    /// [`RunningNode::spec`]'s sake.
-    fn dummy_spec() -> NodeSpec {
-        let dir = std::env::temp_dir().join(format!(
-            "duckspout-fleet-process-fault-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        NodeSpec {
-            index: 0,
-            name: "fault-test-node".to_owned(),
-            otlp_port: 0,
-            flight_port: 0,
-            peer_port: 0,
-            status_port: 0,
-            data_dir: dir.join("data"),
-            config_path: dir.join("config.toml"),
-            journal_path: dir.join("journal.ndjson"),
-            stdout_path: dir.join("stdout.log"),
-            stderr_path: dir.join("stderr.log"),
-        }
-    }
-
-    /// Spawns a REAL long-lived process (`sleep 30`) wrapped as a
-    /// [`RunningNode`] — a stand-in "node" for exercising
-    /// `send_signal`/`is_stopped`/`wait_exited` against real OS signal
-    /// semantics without needing a built `duckspout-daemon` binary. `sleep`
-    /// is chosen because it is present on every Linux CI runner this repo
-    /// targets and does nothing that could race with signal delivery.
-    fn spawn_sleep(seconds: u64) -> RunningNode {
-        let child = Command::new("sleep")
-            .arg(seconds.to_string())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawning `sleep` (must be on PATH)");
-        RunningNode {
-            spec: dummy_spec(),
-            child,
-        }
-    }
-
     /// Polls `check` every 20 ms until it returns `true` or `timeout`
     /// elapses — a small local helper so the tests below do not depend on
     /// signal delivery being instantaneous.
@@ -457,6 +527,77 @@ mod tests {
         );
 
         send_signal(&node, "-KILL").await.unwrap();
+    }
+
+    /// The `is_live_running` half of the same real-OS round trip: a freshly
+    /// spawned process reads as live, a real `SIGSTOP` makes it read as NOT
+    /// live, and a real `SIGCONT` makes it read as live again —
+    /// `crate::fault::run_sigstop_pause`'s resume confirmation relies on
+    /// exactly this.
+    #[tokio::test]
+    async fn send_signal_stop_then_cont_round_trips_through_is_live_running() {
+        let node = spawn_sleep(30);
+        let pid = pid(&node).unwrap();
+        assert!(
+            is_live_running(pid).unwrap(),
+            "a freshly spawned sleep must read as live"
+        );
+
+        send_signal(&node, "-STOP").await.unwrap();
+        assert!(
+            poll_until(Duration::from_secs(2), || !is_live_running(pid)
+                .unwrap_or(true))
+            .await,
+            "is_live_running must observe false while genuinely stopped"
+        );
+
+        send_signal(&node, "-CONT").await.unwrap();
+        assert!(
+            poll_until(Duration::from_secs(2), || is_live_running(pid)
+                .unwrap_or(false))
+            .await,
+            "is_live_running must observe true again after a real SIGCONT"
+        );
+
+        send_signal(&node, "-KILL").await.unwrap();
+    }
+
+    /// The exact false-positive an ACPR found empirically: for a process
+    /// that exited on its own and was never reaped (a real zombie, `Z`
+    /// state — confirmed by the scratch experiment behind this test),
+    /// `is_stopped` must read `false` (it correctly already did) AND
+    /// `is_live_running` must ALSO read `false` (the actual bug: the old
+    /// `!is_stopped` resume check was satisfied by a zombie). Both readings
+    /// must hold for as long as the zombie is left unreaped, not just at
+    /// one poll.
+    #[tokio::test]
+    async fn zombie_process_reads_as_neither_stopped_nor_live_running() {
+        let node = test_support::spawn_short_lived();
+        let pid = pid(&node).unwrap();
+        // Give the (near-instant) `true` process time to actually exit
+        // without anyone reaping it — deliberately never calling
+        // `try_wait`/`wait`, the exact precondition for a real zombie.
+        let became_zombie = poll_until(Duration::from_secs(2), || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .map(|(_, rest)| rest.trim_start())
+                    .is_some_and(|rest| rest.starts_with('Z'))
+            })
+        })
+        .await;
+        assert!(
+            became_zombie,
+            "the spawned `true` process must become a real zombie (Z) before this test proceeds"
+        );
+
+        assert!(
+            !is_stopped(pid).unwrap(),
+            "a zombie must not read as stopped"
+        );
+        assert!(
+            !is_live_running(pid).unwrap(),
+            "a zombie must not read as live-running — this is the exact ACPR false positive"
+        );
     }
 
     /// `wait_exited` confirms a real `SIGKILL` actually reaped the process,
