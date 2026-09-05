@@ -54,11 +54,19 @@ const RUNS_DIR = join(CARGO_TARGET_DIR, "ctk-distributed");
 const REPLAY_FIXTURES = join(repoRoot, "crates/duckspout-judge/tests/fixtures/replay");
 
 // The drive-load pass every profile runs: 300 batches × 200 ms ≈ 60 s of
-// sustained load (§8.4 asks for sustained load, not a burst). Sized to
-// OUTLAST every fault window below — the longest is the SIGSTOP pause, whose
-// default duration is `HEARTBEAT_TTL_SECS + 5` = 20 s after a 5 s delay — so
-// no window ever opens on an already-idle fleet, which is the failure mode
-// `duckspout-fleet`'s own `--load-batches` docs warn about.
+// sustained load (§8.4 asks for sustained load, not a burst). Two separate
+// lower bounds, both of which this clears by an order of magnitude:
+//
+//   1. It must OUTLAST every fault window below — the longest is the SIGSTOP
+//      pause, whose default duration is `HEARTBEAT_TTL_SECS + 5` = 20 s after
+//      a 5 s delay — so no window ever opens on an already-idle fleet, the
+//      failure mode `duckspout-fleet`'s own `--load-batches` docs warn about.
+//   2. It must outlast `--hot-window` + `--allowed-lateness` several times
+//      over, or NOTHING EVER DRAINS: a window is noted closed only once a
+//      newer one has been allocated for its partition, and the stager only
+//      allocates that when data arrives after `hot.window` has elapsed
+//      (`warmUpCatalog`'s own docs carry the full reasoning and the run this
+//      was learned from).
 const LOAD_BATCHES = 300;
 const LOAD_INTERVAL_MS = 200;
 const SETTLE_TIMEOUT_SECS = 120;
@@ -226,6 +234,24 @@ function fleetCommonArgs(tenantSuffix, p) {
  * the loadgen member started and exited cleanly, since `fleetCommonArgs`
  * passes `--loadgen-bin` here too — every verdict after it would be a
  * statement about the harness, not about DuckSpout.
+ *
+ * # Why this passes no `--load-batches` / `--load-interval-ms`
+ *
+ * It inherits `duckspout-fleet`'s own defaults (60 × 200 ms ≈ 12 s), and it
+ * must: a window is noted closed only once a NEWER window has been allocated
+ * for its `(dataset, partition)` (`duckspout_daemon::wiring`'s
+ * `note_closed_windows`: `window.window.0 < high_water.0`), and the stager
+ * only allocates the next window when data arrives after `hot.window` has
+ * elapsed on the current one. A load pass shorter than `--hot-window` +
+ * `--allowed-lateness` therefore rolls no window, closes none, drains none,
+ * and commits nothing — with no error anywhere, because nothing went wrong;
+ * there was simply never a second window. The first version of this step
+ * passed `--load-batches 20 --load-interval-ms 100` (≈2 s against the 5 s
+ * default `--hot-window`) and did exactly that: 227 Accept/StageCommit/
+ * ClientAck triples in the node's journal, not one `SealWindow`, and a
+ * 120-second settle timeout. The judged profiles are not at risk of it
+ * (`LOAD_BATCHES` × `LOAD_INTERVAL_MS` ≈ 60 s), but they are not the reason
+ * this is safe — running the runner's own sized default is.
  */
 async function warmUpCatalog() {
   const workDir = join(RUNS_DIR, "catalog-warmup");
@@ -238,8 +264,6 @@ async function warmUpCatalog() {
       "--nodes", "1",
       "--work-dir", workDir,
       ...fleetCommonArgs("warmup", ports(PROFILES.length)),
-      "--load-batches", "20",
-      "--load-interval-ms", "100",
     ]),
   );
   if (code !== 0)
