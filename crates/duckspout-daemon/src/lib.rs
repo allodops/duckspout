@@ -22,6 +22,7 @@
 pub mod clock;
 pub mod config;
 pub mod constants;
+pub mod fault;
 pub mod manifest;
 pub mod serving;
 pub mod status;

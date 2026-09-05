@@ -24,6 +24,8 @@
 #![forbid(unsafe_code)]
 
 mod backend_check;
+mod fault;
+mod faultlog;
 mod load;
 mod process;
 mod topology;
@@ -198,6 +200,56 @@ struct Cli {
     /// Grace period for each node's SIGTERM shutdown before a hard kill.
     #[arg(long, default_value_t = 10)]
     shutdown_grace_secs: u64,
+
+    // --- Fault injection (§8.4, issue #203) ---
+    /// Node index (0-based) to `SIGKILL` as a real fault. Absent by
+    /// default: no node-kill fault runs.
+    #[arg(long)]
+    fault_kill_node: Option<u16>,
+
+    /// Times `--fault-kill-node`'s kill to land inside the real
+    /// `PutPart`→`LakeCommit` window — §8.4's sharpest fault ("the
+    /// partition owner mid-drain") — rather than firing after a plain
+    /// delay. Requires `--fault-kill-node`; boots that one node with
+    /// `--fault-drain-commit-delay-ms` set to
+    /// `--fault-kill-drain-stall-ms` so the window is wide enough to hit
+    /// deterministically (`fault`'s module docs).
+    #[arg(long)]
+    fault_kill_mid_drain: bool,
+
+    /// Delay before firing `--fault-kill-node`'s kill, when
+    /// `--fault-kill-mid-drain` is NOT set.
+    #[arg(long, default_value_t = 5)]
+    fault_kill_delay_secs: u64,
+
+    /// The target node's `--fault-drain-commit-delay-ms` stall (only
+    /// applied to that one node's boot), used only when
+    /// `--fault-kill-mid-drain` is set.
+    #[arg(long, default_value_t = 3_000)]
+    fault_kill_drain_stall_ms: u64,
+
+    /// How long `--fault-kill-mid-drain`'s journal watch waits for a
+    /// `PutPart` line before giving up (e.g. a drive-load pass that never
+    /// produces a drainable window).
+    #[arg(long, default_value_t = 60)]
+    fault_kill_mid_drain_timeout_secs: u64,
+
+    /// Node index (0-based) to `SIGSTOP`/`SIGCONT` as a real pause fault
+    /// (§8.4's `FencedZombie` fault). Absent by default: no SIGSTOP fault
+    /// runs.
+    #[arg(long)]
+    fault_sigstop_node: Option<u16>,
+
+    /// Delay before sending `SIGSTOP` to `--fault-sigstop-node`.
+    #[arg(long, default_value_t = 5)]
+    fault_sigstop_delay_secs: u64,
+
+    /// How long to hold `--fault-sigstop-node` paused before `SIGCONT` —
+    /// the default comfortably exceeds
+    /// `duckspout_daemon::constants::HEARTBEAT_TTL_SECS`, so the pause is
+    /// "long enough to expire claims" per §8.4's own wording.
+    #[arg(long, default_value_t = duckspout_daemon::constants::HEARTBEAT_TTL_SECS + 5)]
+    fault_sigstop_duration_secs: u64,
 }
 
 /// This runner's own smoke-loop status codes — **not** `duckspout-judge`'s
@@ -271,7 +323,25 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         spawn_loadgen_best_effort(loadgen_bin, &nodes[0]).await;
     }
 
-    let load_results = drive_load_all(&nodes, &cli).await;
+    // §8.4/issue #203: whichever `--fault-*` faults were armed run
+    // CONCURRENTLY with the drive-load/settle passes below — a fault fired
+    // only after the smoke loop already finished would prove nothing about
+    // the system under load. `fault_log` and `running` are separate
+    // bindings from `nodes` (module docs of `run_armed_faults`), so this
+    // borrows nothing the drive-load/settle futures also touch.
+    let fault_log = faultlog::FaultLog::create(&work_dir.join("faults.ndjson"))
+        .with_context(|| format!("creating {}", work_dir.join("faults.ndjson").display()))?;
+    let (fault_result, load_results, drain_confirmed) = tokio::join!(
+        run_armed_faults(&cli, &mut running, &fault_log),
+        drive_load_all(&nodes, &cli),
+        wait_for_any_watermark(&nodes, Duration::from_secs(cli.settle_timeout_secs)),
+    );
+    if let Err(error) = fault_result {
+        tracing::error!(%error, "fault injection failed");
+        shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
+        report_work_dir(&work_dir);
+        return Err(error);
+    }
     let all_accepted = load_results.iter().all(load::LoadResult::fully_accepted);
     for (node, result) in nodes.iter().zip(&load_results) {
         tracing::info!(
@@ -282,9 +352,6 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             "drive-load pass complete"
         );
     }
-
-    let drain_confirmed =
-        wait_for_any_watermark(&nodes, Duration::from_secs(cli.settle_timeout_secs)).await;
 
     shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
 
@@ -356,6 +423,13 @@ fn build_plan(cli: &Cli, work_dir: &std::path::Path) -> anyhow::Result<FleetPlan
 /// Spawns every node and waits for all of them to report ready, leaving
 /// whatever subset already started in `running` even on failure — the
 /// caller is responsible for shutting those down.
+///
+/// The node named by `--fault-kill-node`, when `--fault-kill-mid-drain` is
+/// also set, is booted with `--fault-drain-commit-delay-ms` set to
+/// `--fault-kill-drain-stall-ms` (`fault`'s module docs on why: it is what
+/// makes that node's `PutPart`→`LakeCommit` window wide enough for a
+/// scheduled kill to land inside it deterministically) — every other node
+/// boots exactly as it did before this issue.
 async fn boot_fleet(
     daemon_bin: &std::path::Path,
     nodes: &[NodeSpec],
@@ -363,12 +437,62 @@ async fn boot_fleet(
     running: &mut Vec<process::RunningNode>,
 ) -> anyhow::Result<()> {
     for node in nodes {
-        running.push(process::spawn_node(daemon_bin, node)?);
+        let fault_drain_commit_delay_ms = (cli.fault_kill_mid_drain
+            && cli.fault_kill_node == Some(node.index))
+        .then_some(cli.fault_kill_drain_stall_ms);
+        running.push(process::spawn_node(
+            daemon_bin,
+            node,
+            fault_drain_commit_delay_ms,
+        )?);
     }
     let timeout = Duration::from_secs(cli.boot_timeout_secs);
     for node in running.iter_mut() {
         process::wait_until_ready(node, timeout).await?;
         tracing::info!(node = %node.spec.name, "node ready");
+    }
+    Ok(())
+}
+
+/// Runs whichever faults `cli` armed (§8.4, issue #203), sequentially
+/// against `running` (module docs of [`fault`] for why this need not be
+/// concurrent-safe across faults: at most one of each kind runs per fleet
+/// invocation today, and both take `&mut running[..]` by index, which
+/// `tokio::join!`ing this future alongside the unrelated drive-load/settle
+/// futures in [`run`] already runs them concurrent with the REST of the
+/// smoke loop). A fault whose target index is out of range is a plain
+/// `--fault-*-node` misconfiguration, reported as an error rather than
+/// silently skipped (R-3).
+async fn run_armed_faults(
+    cli: &Cli,
+    running: &mut [process::RunningNode],
+    log: &faultlog::FaultLog,
+) -> anyhow::Result<()> {
+    if let Some(index) = cli.fault_kill_node {
+        let target = running
+            .get_mut(index as usize)
+            .ok_or_else(|| anyhow::anyhow!("--fault-kill-node {index}: no such node"))?;
+        let timing = if cli.fault_kill_mid_drain {
+            fault::KillTiming::MidDrainCommit {
+                journal_poll_timeout: Duration::from_secs(cli.fault_kill_mid_drain_timeout_secs),
+            }
+        } else {
+            fault::KillTiming::AfterDelay(Duration::from_secs(cli.fault_kill_delay_secs))
+        };
+        fault::run_node_kill("node-kill-0", target, timing, log).await?;
+    }
+    if let Some(index) = cli.fault_sigstop_node {
+        let target = running
+            .get_mut(index as usize)
+            .ok_or_else(|| anyhow::anyhow!("--fault-sigstop-node {index}: no such node"))?;
+        fault::run_sigstop_pause(
+            "sigstop-pause-0",
+            target,
+            Duration::from_secs(cli.fault_sigstop_delay_secs),
+            Duration::from_secs(cli.fault_sigstop_duration_secs),
+            log,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -485,6 +609,10 @@ fn print_summary(
         if drain_confirmed { "yes" } else { "NO" }
     );
     println!("  work dir: {}", work_dir.display());
+    println!(
+        "  fault-window journal: {} (§8.4, issue #203)",
+        work_dir.join("faults.ndjson").display()
+    );
 }
 
 fn report_work_dir(work_dir: &std::path::Path) {
@@ -575,6 +703,14 @@ mod tests {
             load_interval_ms: 200,
             settle_timeout_secs: 60,
             shutdown_grace_secs: 10,
+            fault_kill_node: None,
+            fault_kill_mid_drain: false,
+            fault_kill_delay_secs: 5,
+            fault_kill_drain_stall_ms: 3_000,
+            fault_kill_mid_drain_timeout_secs: 60,
+            fault_sigstop_node: None,
+            fault_sigstop_delay_secs: 5,
+            fault_sigstop_duration_secs: duckspout_daemon::constants::HEARTBEAT_TTL_SECS + 5,
         }
     }
 

@@ -47,6 +47,18 @@ struct Cli {
     /// nothing, unchanged from before this flag existed.
     #[arg(long)]
     trace_out: Option<PathBuf>,
+
+    /// Fault-injection-only (§8.4, issue #203): stalls this many
+    /// milliseconds between `PutPart` and `LakeCommit` on every drain,
+    /// through [`duckspout_daemon::fault::StallingLakeCommitter`] — widens
+    /// the real §8.4 "partition owner mid-drain" window wide enough for
+    /// `duckspout-fleet`'s node-kill injector to land a real `SIGKILL`
+    /// inside it deterministically. Not a §9.6 setting (same convention as
+    /// `--status-listen`/`--trace-out`): a real deployment never passes
+    /// this, and `0` (the default) is a measured, tested exact
+    /// pass-through — `crate::fault`'s own module docs and tests.
+    #[arg(long, default_value_t = 0)]
+    fault_drain_commit_delay_ms: u64,
 }
 
 #[tokio::main]
@@ -73,7 +85,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let trace_sink = build_trace_sink(cli.trace_out.as_deref())?;
-    let daemon = wiring::Daemon::boot(&loaded, cli.status_listen, trace_sink).await?;
+    let fault_drain_commit_delay =
+        std::time::Duration::from_millis(cli.fault_drain_commit_delay_ms);
+    let daemon = wiring::Daemon::boot(
+        &loaded,
+        cli.status_listen,
+        trace_sink,
+        fault_drain_commit_delay,
+    )
+    .await?;
     tracing::info!(
         otlp_addr = %daemon.otlp_addr(),
         status_addr = %daemon.status_addr(),

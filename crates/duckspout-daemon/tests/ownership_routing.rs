@@ -142,7 +142,9 @@ async fn single_node_deployment_always_routes_locally() {
     let config_path = write_config(root.path(), 2, "[]");
     let config = duckspout_daemon::config::load(Some(&config_path)).unwrap();
 
-    let daemon = Daemon::boot(&config, 0, None).await.expect("daemon boots");
+    let daemon = Daemon::boot(&config, 0, None, std::time::Duration::ZERO)
+        .await
+        .expect("daemon boots");
     let handle = daemon.handle();
 
     for partition in partitions() {
@@ -194,7 +196,9 @@ async fn multi_node_membership_matches_an_independently_computed_routing_plan() 
     );
     let config = duckspout_daemon::config::load(Some(&config_path)).unwrap();
 
-    let daemon = Daemon::boot(&config, 0, None).await.expect("daemon boots");
+    let daemon = Daemon::boot(&config, 0, None, std::time::Duration::ZERO)
+        .await
+        .expect("daemon boots");
     let handle = daemon.handle();
     assert_eq!(
         handle.node_id(),
@@ -274,7 +278,9 @@ async fn a_non_default_rf_is_actually_read_from_config() {
     );
     let config = duckspout_daemon::config::load(Some(&config_path)).unwrap();
 
-    let daemon = Daemon::boot(&config, 0, None).await.expect("daemon boots");
+    let daemon = Daemon::boot(&config, 0, None, std::time::Duration::ZERO)
+        .await
+        .expect("daemon boots");
     let handle = daemon.handle();
     let self_node = handle.node_id().clone();
 
