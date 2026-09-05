@@ -26,11 +26,37 @@
 //! silently drops or ignores an unparseable line could certify a run that
 //! never happened as recorded. One bad line anywhere fails the entire
 //! ingestion — never a partial, silently-truncated result.
+//!
+//! # The three payload shapes (#205, #206)
+//!
+//! The frozen envelope carries no payload (`duckspout_types::trace`:
+//! "variants are payload-free at bootstrap; per-variant payloads land with
+//! the implementations that journal them"), so every payload this module
+//! knows is decoded by FIELD PRESENCE off the line's extra fields, never by
+//! which file or which event it rode on:
+//!
+//! | Keyed on | Decodes to | Written by | Read by |
+//! |---|---|---|---|
+//! | `request_id` | [`RequestIdentity`] | `duckspout-loadgen` (`ClientAck`/`ClientTimeout`) | `zero_acked_lost`, `watermark_honesty` |
+//! | `complete_through_ms` | [`WatermarkClaim`] | the node advancing (`LakeCommitOk`, §6.4) or advertising (`ClaimAdvertise`, §7.3) a watermark | `watermark_honesty` |
+//! | `changelog_key` | [`ChangelogEntry`] | the changelog write client, on the line resolving its request | `latest_view` |
+//!
+//! **Producer status, stated plainly** (the same honesty
+//! `crate::final_state`'s scope note keeps for the read-back side): the
+//! `RequestIdentity` shape is written for real today by
+//! `duckspout_loadgen::journal`; its two #206 additions
+//! (`partition`/`max_event_time_ms`) and both new payload shapes are
+//! formats this judge DEFINES and decodes, and no producer in this
+//! workspace emits them yet — the fleet's node-side watermark disclosure
+//! and its changelog write client land with the distributed tier's own
+//! wiring (#204, #208). A run whose journals carry none of them is not
+//! quietly passed: each predicate's vacuity rule turns absent evidence into
+//! `NoVerdict` (§8.4), never `Pass`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use duckspout_types::{NodeId, TraceEvent};
+use duckspout_types::{DatasetId, NodeId, PartitionId, TenantId, TraceEvent};
 use serde::Deserialize;
 
 /// The loadgen's payload identity, decoded structurally off a journal
@@ -61,6 +87,126 @@ pub struct RequestIdentity {
     /// `duckspout_loadgen::client::synthetic_batch` embeds in the record's
     /// own `loadgen.index` attribute.
     pub source_incarnation: String,
+    /// The partition the accept side placed this batch's records in
+    /// (§5's unit of ownership), as disclosed back to the client on the
+    /// ack. `None` when the ack line does not carry it — the shape every
+    /// journal written before #206 has, and the shape
+    /// `duckspout-loadgen` still writes today (module docs' producer-status
+    /// note). Without it a watermark, which is per-partition (§7.3), cannot
+    /// be related to this ack at all, so `watermark_honesty` treats such an
+    /// ack as no evidence rather than as evidence about some guessed
+    /// partition.
+    #[serde(default)]
+    pub partition: Option<PartitionId>,
+    /// The greatest event timestamp (Unix milliseconds) among the records
+    /// this ack covers — the batch's own upper edge, which is what decides
+    /// whether the whole batch sits at or below a `complete_through`
+    /// (`crate::predicates::watermark_honesty`'s coverage rule). `None`
+    /// carries the same meaning as `partition`'s `None`: no evidence.
+    ///
+    /// **Producer requirement (ACPR finding LOW-2).** This field is only
+    /// half of the precedence rule: the OTHER half is the
+    /// [`WatermarkClaim`] a producer flattens onto the same ack line, and
+    /// which value it reads there is not a free choice. It must be the
+    /// OWNER'S OWN AUTHORITATIVE LEDGER VALUE for that partition —
+    /// `duckspout.watermarks`, which `docs/design/query.md` calls
+    /// "transactional, authoritative" and which only `LakeCommit` writes,
+    /// i.e. `duckspout-watermark`'s `WatermarkLedger` state the accepting
+    /// owner holds — and NEVER a cached or registry-sourced copy of it. The
+    /// registry's watermark row is explicitly advisory soft state
+    /// (`docs/trace-mapping.md`: `ClaimAdvertise` — "Advisory registry row,
+    /// Keep Rule 8"), so it may legitimately lag the real watermark; a
+    /// producer that disclosed a LAGGING value here would make a genuine
+    /// post-watermark straggler (already below the real watermark when it
+    /// was acked, and therefore outside every `complete` read's contract per
+    /// `docs/design/drain.md` §3) look like a record acked ahead of the
+    /// watermark — and `watermark_honesty` would falsely convict a correct
+    /// fleet for omitting it.
+    #[serde(default)]
+    pub max_event_time_ms: Option<i64>,
+}
+
+/// A watermark value a node either ADVANCED or ADVERTISED, decoded
+/// structurally off a journal line carrying `complete_through_ms` (module
+/// docs).
+///
+/// Which of the two it is, is decided by the line's EVENT, not by this
+/// shape — `crate::predicates::watermark_honesty` owns that classification
+/// (§6.4: the advance rides the `LakeCommit` outcome atomically and has no
+/// event of its own; §7.3: the registry rows a node advertises are soft
+/// state). Field-for-field the wire shape of
+/// `duckspout_types::WatermarkRow`, which is what a node advancing or
+/// advertising one holds.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WatermarkClaim {
+    /// The partition this watermark value is about.
+    pub partition: PartitionId,
+    /// The instant (Unix milliseconds, inclusive) claimed complete
+    /// (`duckspout_types::WatermarkRow::complete_through_ms`).
+    pub complete_through_ms: i64,
+}
+
+/// One changelog record's identity and content, decoded structurally off a
+/// journal line carrying `changelog_key` (module docs).
+///
+/// `(origin, changelog_seq)` is the §3 fold order's key —
+/// `DuckSpoutCore.tla`'s `OrdLt` — and `changelog_seq` is spelled with its
+/// prefix deliberately: the frozen envelope already owns the top-level
+/// `seq` field (the journaling node's own dense trace sequence, D-6), which
+/// is a DIFFERENT number from the origin-assigned record sequence, and
+/// flattening two `seq` fields onto one line would collapse them.
+///
+/// # Why `partition` and `tenant` are both here (ACPR finding HIGH-1)
+///
+/// Neither is decoration; each fixes one direction of a real
+/// misidentification:
+///
+/// - `changelog_seq` is dense per-**`(partition, origin)`**
+///   (`docs/design/ingest.md`: "`seq` (dense per-(partition, origin)
+///   sequence)"; `docs/design/replication.md`: "stamped with
+///   `(origin_node, partition, seq)`"), NOT per origin. Two records one
+///   origin wrote in two different partitions legitimately carry the SAME
+///   `changelog_seq`, so `(dataset, origin, changelog_seq)` does not name a
+///   record — `(dataset, partition, origin, changelog_seq)` does.
+/// - `changelog_key` is unique only WITHIN a tenant: the partition key is
+///   `(tenant_id, shard)` and `<dataset>_latest` is a shared,
+///   `tenant_id`-leading table (`docs/design/data-model.md`), so two
+///   tenants' rows for one key string are two different rows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ChangelogEntry {
+    /// The changelog dataset this record belongs to — the dataset whose
+    /// `<dataset>_latest` view (§7.7) the fold is compared against.
+    pub dataset: DatasetId,
+    /// The partition this record was placed in — `(tenant_id, shard)`, with
+    /// `shard = hash(key_cols)` for a changelog dataset (mandatory,
+    /// `docs/design/data-model.md`). Required, and spelled exactly as
+    /// [`WatermarkClaim::partition`] is: both decode from the one top-level
+    /// `partition` field of the same flat journal line, so the two payload
+    /// shapes this PR introduces stay one wire convention rather than two.
+    pub partition: PartitionId,
+    /// The tenant this record belongs to (the leading half of `partition`'s
+    /// own `(tenant_id, shard)` key), and the scope in which
+    /// `changelog_key` below is unique.
+    pub tenant: TenantId,
+    /// The declared key this record is a version of (§7.7's "latest row per
+    /// declared key"), unique within `tenant` — not globally.
+    pub changelog_key: String,
+    /// The origin node that assigned `changelog_seq` (§4.2.4).
+    pub origin: NodeId,
+    /// The origin-assigned sequence number of this record, dense per
+    /// `(partition, origin)` — see this type's own docs for why it is not a
+    /// per-origin identity.
+    pub changelog_seq: u64,
+    /// True iff this record is a tombstone (`_op = 'delete'`, §7.7):
+    /// tombstones delete, so the key is absent from the served view.
+    #[serde(default)]
+    pub tombstone: bool,
+    /// The record's value, as the served view would return it. Exactly one
+    /// of `tombstone`/`value` is meaningful, enforced at decode
+    /// (`changelog_from_rest`): a tombstone carries no value, and a
+    /// non-tombstone with no value is not a fold input, it is corruption.
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 /// One decoded journal line: the frozen envelope plus, when present, the
@@ -82,6 +228,12 @@ pub struct JournalLine {
     /// practice the loadgen's own `ClientAck`/`ClientTimeout` lines (module
     /// docs).
     pub identity: Option<RequestIdentity>,
+    /// Present exactly on lines carrying a `complete_through_ms` field
+    /// (module docs' payload table).
+    pub watermark: Option<WatermarkClaim>,
+    /// Present exactly on lines carrying a `changelog_key` field (module
+    /// docs' payload table).
+    pub changelog: Option<ChangelogEntry>,
 }
 
 /// A parsed, queryable set of journal lines from every ingested file
@@ -106,6 +258,36 @@ impl JournalSet {
         self.lines.iter().filter_map(move |line| {
             if line.event == event {
                 line.identity.as_ref().map(|identity| (line, identity))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Every watermark-claim-bearing line, of ANY event, in ingestion order
+    /// — `crate::predicates::watermark_honesty` classifies each one by its
+    /// event (advance vs. advertisement) itself, so this accessor
+    /// deliberately does not pre-filter: a claim riding an event this
+    /// module did not anticipate must still reach the predicate rather than
+    /// be silently dropped here.
+    pub fn watermark_claims(&self) -> impl Iterator<Item = (&JournalLine, &WatermarkClaim)> {
+        self.lines
+            .iter()
+            .filter_map(|line| line.watermark.as_ref().map(|claim| (line, claim)))
+    }
+
+    /// Every changelog-entry-bearing line for `event`, in ingestion order —
+    /// the mirror of [`JournalSet::identity_events`], and the accessor
+    /// `latest_view` uses with [`TraceEvent::ClientAck`] to get exactly the
+    /// ACKED changelog (a `ClientTimeout`-borne entry was never promised,
+    /// so it is not a fold input).
+    pub fn changelog_events(
+        &self,
+        event: TraceEvent,
+    ) -> impl Iterator<Item = (&JournalLine, &ChangelogEntry)> {
+        self.lines.iter().filter_map(move |line| {
+            if line.event == event {
+                line.changelog.as_ref().map(|entry| (line, entry))
             } else {
                 None
             }
@@ -217,6 +399,59 @@ fn identity_from_rest(
     }
 }
 
+/// Decodes `rest` into a [`WatermarkClaim`] when it carries a
+/// `complete_through_ms` field, under exactly the rules
+/// [`identity_from_rest`] applies to its own key field: presence decides
+/// that a claim is being made, and a claim that does not fully decode is
+/// corruption, not "no claim here".
+fn watermark_from_rest(
+    rest: &serde_json::Value,
+) -> Result<Option<WatermarkClaim>, serde_json::Error> {
+    match rest {
+        serde_json::Value::Object(map) if map.contains_key("complete_through_ms") => {
+            Ok(Some(serde_json::from_value(rest.clone())?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Decodes `rest` into a [`ChangelogEntry`] when it carries a
+/// `changelog_key` field ([`identity_from_rest`]'s rules again), and
+/// additionally rejects the two self-contradictory content shapes at decode
+/// time so no predicate has to re-derive what a well-formed entry is:
+///
+/// - `tombstone: true` WITH a `value`: a delete that also carries content
+///   folds to two different answers depending on which field a reader
+///   believes.
+/// - `tombstone: false` with NO `value`: an upsert of nothing. Folding it
+///   would either resurrect a key with an unknown value or silently behave
+///   like a delete — the fold's own definition (§7.7: tombstones delete,
+///   everything else is the row) has no third case.
+fn changelog_from_rest(
+    rest: &serde_json::Value,
+) -> Result<Option<ChangelogEntry>, serde_json::Error> {
+    match rest {
+        serde_json::Value::Object(map) if map.contains_key("changelog_key") => {
+            let entry: ChangelogEntry = serde_json::from_value(rest.clone())?;
+            match (entry.tombstone, entry.value.is_some()) {
+                (true, true) => Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                    "changelog entry for key {:?} is a tombstone AND carries a value — \
+                     ambiguity fails closed rather than folding to whichever field is read \
+                     first",
+                    entry.changelog_key
+                ))),
+                (false, false) => Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                    "changelog entry for key {:?} is neither a tombstone nor carries a value — \
+                     the §7.7 fold has no third case, so this is corruption, not an input",
+                    entry.changelog_key
+                ))),
+                _ => Ok(Some(entry)),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// A structural check for a duplicate JSON object key at the TOP LEVEL of
 /// one line (ACPR finding MEDIUM-HIGH-3(d)): `serde_json`'s own `Map` (the
 /// `preserve_order` feature included) silently keeps "last value wins" on a
@@ -274,6 +509,20 @@ impl<'de> serde::de::Deserialize<'de> for RejectDuplicateKeys {
     }
 }
 
+/// Rejects one NDJSON line that repeats a top-level JSON key
+/// ([`RejectDuplicateKeys`]'s reasoning). Shared with `crate::read_log`,
+/// whose lines are the same flat one-object-per-line shape and carry the
+/// same hazard (a repeated `concern` key silently downgrading a `complete`
+/// read to `available`, or vice versa).
+///
+/// # Errors
+///
+/// The `serde_json` error naming the duplicated key, or any parse error the
+/// line has on its own.
+pub(crate) fn reject_duplicate_keys(raw: &str) -> Result<(), serde_json::Error> {
+    serde_json::from_str::<RejectDuplicateKeys>(raw).map(|_| ())
+}
+
 /// Parses one journal file's lines, fully — the first malformed line fails
 /// the whole file (module docs).
 ///
@@ -299,12 +548,10 @@ pub fn parse_journal_file(path: &Path) -> Result<Vec<JournalLine>, JournalError>
         // (an empty string is not a JSON object), failing this line closed
         // exactly like any other malformed one rather than needing a
         // separate branch.
-        serde_json::from_str::<RejectDuplicateKeys>(raw).map_err(|source| {
-            JournalError::Decode {
-                path: path.to_owned(),
-                line_no,
-                source,
-            }
+        reject_duplicate_keys(raw).map_err(|source| JournalError::Decode {
+            path: path.to_owned(),
+            line_no,
+            source,
         })?;
         let envelope: Envelope =
             serde_json::from_str(raw).map_err(|source| JournalError::Decode {
@@ -323,12 +570,14 @@ pub fn parse_journal_file(path: &Path) -> Result<Vec<JournalLine>, JournalError>
             });
         }
         next_seq.insert(envelope.node.clone(), expected + 1);
-        let identity =
-            identity_from_rest(&envelope.rest).map_err(|source| JournalError::Decode {
-                path: path.to_owned(),
-                line_no,
-                source,
-            })?;
+        let decode_error = |source| JournalError::Decode {
+            path: path.to_owned(),
+            line_no,
+            source,
+        };
+        let identity = identity_from_rest(&envelope.rest).map_err(decode_error)?;
+        let watermark = watermark_from_rest(&envelope.rest).map_err(decode_error)?;
+        let changelog = changelog_from_rest(&envelope.rest).map_err(decode_error)?;
         lines.push(JournalLine {
             source: path.to_owned(),
             line_no,
@@ -336,6 +585,8 @@ pub fn parse_journal_file(path: &Path) -> Result<Vec<JournalLine>, JournalError>
             seq: envelope.seq,
             event: envelope.event,
             identity,
+            watermark,
+            changelog,
         });
     }
     Ok(lines)
@@ -589,6 +840,192 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn extracts_a_watermark_claim_from_a_lake_commit_line() {
+        let file = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"LakeCommitOk\",\
+             \"partition\":\"t0-s0\",\"complete_through_ms\":1700}\n",
+        );
+        let lines = parse_journal_file(file.path()).expect("parses");
+        let claim = lines[0].watermark.as_ref().expect("claim present");
+        assert_eq!(claim.partition, PartitionId::new("t0-s0"));
+        assert_eq!(claim.complete_through_ms, 1700);
+        assert!(lines[0].changelog.is_none());
+        assert!(lines[0].identity.is_none());
+    }
+
+    #[test]
+    fn a_half_formed_watermark_claim_is_a_decode_error_not_a_silent_downgrade() {
+        // Would catch a line that CLAIMS coverage (`complete_through_ms`
+        // present) but names no partition being read as "no watermark
+        // here" — silently dropping the one claim the Q-shaped judge exists
+        // to replay.
+        let file = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"ClaimAdvertise\",\"complete_through_ms\":1700}\n",
+        );
+        let err = parse_journal_file(file.path()).expect_err("must fail closed");
+        assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn extracts_a_changelog_entry_from_a_client_ack_line() {
+        let file = write_journal(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"dim_users\",\"partition\":\"tenant-a.3\",\"tenant\":\"tenant-a\",\
+             \"changelog_key\":\"u1\",\"origin\":\"n1\",\
+             \"changelog_seq\":7,\"value\":\"alice\"}\n",
+        );
+        let lines = parse_journal_file(file.path()).expect("parses");
+        let entry = lines[0].changelog.as_ref().expect("entry present");
+        assert_eq!(entry.dataset, DatasetId::new("dim_users"));
+        assert_eq!(entry.partition, PartitionId::new("tenant-a.3"));
+        assert_eq!(entry.tenant, TenantId::new("tenant-a"));
+        assert_eq!(entry.changelog_key, "u1");
+        assert_eq!(entry.origin, NodeId::new("n1"));
+        assert_eq!(entry.changelog_seq, 7);
+        assert!(!entry.tombstone);
+        assert_eq!(entry.value.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_changelog_entry_naming_no_partition_or_no_tenant_fails_closed() {
+        // ACPR finding HIGH-1: `changelog_seq` is dense per
+        // `(partition, origin)` and `changelog_key` is unique only within a
+        // tenant, so an entry missing either field cannot be placed in the
+        // fold at all. Accepting it — by defaulting the missing dimension —
+        // is exactly what collided two partitions' records onto one dedup
+        // slot and two tenants' rows onto one fold key; a half-formed entry
+        // must fail closed like every other half-formed payload here.
+        for line in [
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"tenant\":\"t\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":1,\"value\":\"v\"}\n",
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":1,\"value\":\"v\"}\n",
+        ] {
+            let file = write_journal(line);
+            let err = parse_journal_file(file.path()).expect_err("must fail closed");
+            assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+        }
+    }
+
+    #[test]
+    fn a_changelog_record_sequence_is_not_confused_with_the_envelopes_own_seq() {
+        // D-6's per-node trace seq and the origin-assigned record seq are
+        // different numbers that would collide if the payload spelled its
+        // field `seq`: this pins that the fold reads `changelog_seq`, not
+        // the envelope's line counter.
+        let file = write_journal(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":42,\"value\":\"v\"}\n",
+        );
+        let lines = parse_journal_file(file.path()).expect("parses");
+        assert_eq!(lines[0].seq, 0);
+        assert_eq!(
+            lines[0].changelog.as_ref().expect("entry").changelog_seq,
+            42
+        );
+    }
+
+    #[test]
+    fn a_tombstone_carrying_a_value_fails_closed() {
+        // The fold would answer "key deleted" or "key = v" depending on
+        // which field it read first — exactly the ambiguity that must never
+        // reach a predicate.
+        let file = write_journal(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":1,\"tombstone\":true,\"value\":\"v\"}\n",
+        );
+        let err = parse_journal_file(file.path()).expect_err("must fail closed");
+        assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn a_non_tombstone_with_no_value_fails_closed() {
+        let file = write_journal(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":1}\n",
+        );
+        let err = parse_journal_file(file.path()).expect_err("must fail closed");
+        assert!(matches!(err, JournalError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn a_tombstone_with_no_value_decodes_as_a_delete() {
+        let file = write_journal(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":1,\"tombstone\":true}\n",
+        );
+        let lines = parse_journal_file(file.path()).expect("parses");
+        let entry = lines[0].changelog.as_ref().expect("entry present");
+        assert!(entry.tombstone);
+        assert!(entry.value.is_none());
+    }
+
+    #[test]
+    fn an_ack_identity_carries_its_optional_coverage_fields_when_present() {
+        let file = write_journal(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"request_id\":\"req-1\",\"tenant\":\"t\",\"record_count\":2,\"first_index\":0,\
+             \"source_incarnation\":\"loadgen-0-1000\",\"partition\":\"t0-s0\",\
+             \"max_event_time_ms\":1500}\n",
+        );
+        let lines = parse_journal_file(file.path()).expect("parses");
+        let identity = lines[0].identity.as_ref().expect("identity present");
+        assert_eq!(identity.partition, Some(PartitionId::new("t0-s0")));
+        assert_eq!(identity.max_event_time_ms, Some(1500));
+    }
+
+    #[test]
+    fn an_ack_identity_without_the_optional_coverage_fields_still_decodes() {
+        // Non-regression for every journal written before #206 (and for
+        // what `duckspout-loadgen` writes today): the new fields are
+        // absent, which is "no coverage evidence", never a decode failure.
+        let file = write_journal(
+            "{\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"request_id\":\"req-1\",\"tenant\":\"t\",\"record_count\":2,\"first_index\":0,\
+             \"source_incarnation\":\"loadgen-0-1000\"}\n",
+        );
+        let lines = parse_journal_file(file.path()).expect("parses");
+        let identity = lines[0].identity.as_ref().expect("identity present");
+        assert_eq!(identity.partition, None);
+        assert_eq!(identity.max_event_time_ms, None);
+    }
+
+    #[test]
+    fn the_accessors_select_only_their_own_payload_and_event() {
+        let file = write_journal(
+            "{\"node\":\"n1\",\"seq\":0,\"event\":\"LakeCommitOk\",\
+             \"partition\":\"p\",\"complete_through_ms\":10}\n\
+             {\"node\":\"n1\",\"seq\":1,\"event\":\"ClaimAdvertise\",\
+             \"partition\":\"p\",\"complete_through_ms\":10}\n\
+             {\"node\":\"loadgen-0\",\"seq\":0,\"event\":\"ClientAck\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k\",\"origin\":\"n1\",\
+             \"changelog_seq\":1,\"value\":\"v\"}\n\
+             {\"node\":\"loadgen-0\",\"seq\":1,\"event\":\"ClientTimeout\",\
+             \"dataset\":\"d\",\"partition\":\"t.0\",\"tenant\":\"t\",\
+             \"changelog_key\":\"k2\",\"origin\":\"n1\",\
+             \"changelog_seq\":2,\"value\":\"v2\"}\n",
+        );
+        let set = JournalSet {
+            lines: parse_journal_file(file.path()).expect("parses"),
+        };
+        assert_eq!(set.watermark_claims().count(), 2);
+        assert_eq!(set.changelog_events(TraceEvent::ClientAck).count(), 1);
+        assert_eq!(set.changelog_events(TraceEvent::ClientTimeout).count(), 1);
+        assert_eq!(set.identity_events(TraceEvent::ClientAck).count(), 0);
     }
 
     #[test]
