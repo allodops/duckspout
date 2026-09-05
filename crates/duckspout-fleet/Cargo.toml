@@ -11,7 +11,18 @@ repository.workspace = true
 # Bin-crate error ergonomics (s§3.3: anyhow in the four bin crates only —
 # ctl, fleet, judge, loadgen).
 anyhow = { workspace = true }
+# The real Arrow Flight CLIENT half of §8.4's "Flight-server kill
+# mid-stream" fault (issue #204, `fault::run_flight_kill_mid_stream`): the
+# same generated client `duckspout-daemon/tests/flight_e2e.rs` drives the
+# real server with, reused rather than hand-rolling a gRPC/Flight client.
+arrow-flight = { workspace = true }
 clap = { workspace = true }
+# `server::TENANT_METADATA_KEY` — the real `X-Scope-OrgID` admission header
+# name (§2.2), used by the drive-load driver's `--tenant` flag rather than
+# hand-copying the string literal into this crate (DRY). A bin crate may
+# depend on a protocol crate; only protocol×protocol edges are banned
+# (ADR-0008, invariants.toml).
+duckspout-accept = { workspace = true }
 # Reused, not reimplemented (issue #201's own scoping note): the real node
 # binary's config surface (`config::defaults`, the golden-manifest-pinned
 # `LakeConfig`/`ClusterConfig`/… shapes) and its `detect_node_id` hostname

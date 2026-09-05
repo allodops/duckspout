@@ -999,7 +999,9 @@ name = "duckspout-fleet"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "arrow-flight",
  "clap",
+ "duckspout-accept",
  "duckspout-daemon",
  "futures",
  "opentelemetry-proto",

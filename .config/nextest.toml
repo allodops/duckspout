@@ -1,0 +1,27 @@
+# cargo-nextest configuration (`just test` runs `cargo nextest run
+# --workspace --retries 0`).
+#
+# The one thing configured here is a serialization group for
+# `crates/duckspout-fleet/tests/fault_injection.rs` (§8.4, issues #203 and
+# #204). Every scenario in that file boots a REAL `duckspout-daemon` fleet
+# against the ONE real Postgres catalog `DUCKSPOUT_FLEET_TEST_POSTGRES_DSN`
+# names, on the fleet's own default ports, in one shared work directory
+# whose path the `DuckLake` catalog pins as its `DATA_PATH` for the
+# catalog's whole lifetime. Two of those running at once would collide on
+# all three.
+#
+# That file already holds a process-local `Mutex` for the same purpose, and
+# it is not enough on its own: nextest runs every test in its OWN PROCESS,
+# so a process-local lock serializes nothing there (it is still the right
+# guard under a plain `cargo test`, where the tests do share a process).
+# This group is the nextest half of the same requirement.
+#
+# Note the tests skip themselves entirely when the DSN env var is unset —
+# which is every ordinary CI run — so this group costs nothing there.
+
+[test-groups]
+fleet-fault-injection = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(fault_injection)'
+test-group = 'fleet-fault-injection'
