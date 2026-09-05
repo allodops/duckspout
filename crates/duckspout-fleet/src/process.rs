@@ -162,3 +162,95 @@ fn stderr_tail(path: &std::path::Path) -> String {
         Err(e) => format!("(could not read {}: {e})", path.display()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stderr_tail_reports_a_placeholder_for_a_missing_file() {
+        let missing = std::env::temp_dir().join("duckspout-fleet-process-test-missing-file");
+        let tail = stderr_tail(&missing);
+        assert!(
+            tail.starts_with("(could not read"),
+            "expected a could-not-read placeholder, got {tail:?}"
+        );
+    }
+
+    #[test]
+    fn stderr_tail_returns_the_whole_file_when_short() {
+        let dir = std::env::temp_dir().join(format!(
+            "duckspout-fleet-process-test-{}-short",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stderr.log");
+        std::fs::write(&path, "boot failed: connection refused").unwrap();
+        assert_eq!(stderr_tail(&path), "boot failed: connection refused");
+    }
+
+    #[test]
+    fn stderr_tail_truncates_to_the_last_4096_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "duckspout-fleet-process-test-{}-long",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stderr.log");
+        // 5000 'a's followed by a distinct tail marker so truncation is
+        // unambiguous to detect.
+        let contents = format!("{}TAIL_MARKER", "a".repeat(5000));
+        std::fs::write(&path, &contents).unwrap();
+        let tail = stderr_tail(&path);
+        assert_eq!(tail.len(), 4096);
+        assert!(tail.ends_with("TAIL_MARKER"));
+    }
+
+    /// `fetch_status`'s own doc comment claims it speaks the same
+    /// no-keep-alive HTTP/1.1 wire shape `duckspout-daemon`'s `/status`
+    /// serves, so no HTTP client dependency is needed — this proves that
+    /// claim against a plain hand-rolled listener, not the real daemon.
+    #[tokio::test]
+    async fn fetch_status_parses_a_real_http_response_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                      {\"ready\":true,\"watermarks\":[]}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let status = fetch_status(addr).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            status.get("ready").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    /// A response with no `\r\n\r\n` header/body separator is exactly the
+    /// "not ready yet" shape `wait_until_ready` must tolerate, not a panic.
+    #[tokio::test]
+    async fn fetch_status_errors_on_a_malformed_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream.write_all(b"not even close to HTTP").await.unwrap();
+        });
+
+        let result = fetch_status(addr).await;
+        server.await.unwrap();
+        assert!(result.is_err());
+    }
+}

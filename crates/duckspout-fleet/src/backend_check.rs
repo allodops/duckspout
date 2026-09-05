@@ -134,4 +134,42 @@ mod tests {
         .await;
         assert!(result.is_err(), "expected an unreachable-port failure");
     }
+
+    /// The success arm: a real listener answers the bare TCP connect —
+    /// the case a working `deploy/compose/` actually produces, not just the
+    /// closed-port failure path above.
+    #[tokio::test]
+    async fn check_reachable_succeeds_against_a_real_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The probe only needs the TCP handshake to complete, not an actual
+        // accept()/response — same as the real Postgres/MinIO probes, which
+        // never send or read application bytes.
+        let result = check_reachable("test", "127.0.0.1", port, Duration::from_secs(1)).await;
+        assert!(
+            result.is_ok(),
+            "expected success against a real listener: {result:?}"
+        );
+    }
+
+    /// `postgres_host_port` fails closed on a DSN with no `scheme://`
+    /// separator instead of silently misparsing it as a bare host.
+    #[test]
+    fn postgres_dsn_host_port_rejects_a_dsn_with_no_scheme() {
+        assert!(postgres_host_port("127.0.0.1:5432/duckspout_catalog").is_err());
+    }
+
+    /// `s3_host_port` fails closed on an endpoint missing the `:port`
+    /// suffix the compose convention requires.
+    #[test]
+    fn s3_endpoint_host_port_rejects_a_missing_port() {
+        assert!(s3_host_port("127.0.0.1").is_err());
+    }
+
+    /// `s3_host_port` fails closed on a non-numeric port rather than
+    /// panicking on the `.parse()` inside it.
+    #[test]
+    fn s3_endpoint_host_port_rejects_a_non_numeric_port() {
+        assert!(s3_host_port("127.0.0.1:minio").is_err());
+    }
 }

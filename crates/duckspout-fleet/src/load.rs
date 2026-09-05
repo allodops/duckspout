@@ -131,3 +131,82 @@ fn synthetic_request(node_label: &str, batch_index: u32, count: u32) -> ExportLo
         }],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fully_accepted_is_true_only_when_every_attempted_batch_landed() {
+        let none_attempted = LoadResult::default();
+        assert!(
+            !none_attempted.fully_accepted(),
+            "zero attempted batches is not the same as full acceptance"
+        );
+
+        let all_accepted = LoadResult {
+            batches_attempted: 3,
+            batches_accepted: 3,
+            records_accepted: 75,
+        };
+        assert!(all_accepted.fully_accepted());
+
+        let partial = LoadResult {
+            batches_attempted: 3,
+            batches_accepted: 2,
+            records_accepted: 50,
+        };
+        assert!(!partial.fully_accepted());
+    }
+
+    /// `synthetic_request`'s own doc comment claims "enough distinct
+    /// content per record to exercise real ... dedup-key derivation" — this
+    /// is what would catch a regression collapsing every record onto the
+    /// same body/timestamp (silently defeating that claim).
+    #[test]
+    fn synthetic_request_produces_the_requested_record_count_with_distinct_content() {
+        let request = synthetic_request("fleet-0-0", 2, 4);
+        let resource_logs = &request.resource_logs[0];
+        assert_eq!(
+            resource_logs.resource.as_ref().unwrap().attributes[0]
+                .value
+                .as_ref()
+                .unwrap()
+                .value,
+            Some(PbValue::StringValue("duckspout-fleet-smoke".to_owned()))
+        );
+
+        let records = &resource_logs.scope_logs[0].log_records;
+        assert_eq!(records.len(), 4);
+
+        let bodies: std::collections::HashSet<String> = records
+            .iter()
+            .map(|record| match &record.body.as_ref().unwrap().value {
+                Some(PbValue::StringValue(s)) => s.clone(),
+                other => panic!("expected a string body, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(bodies.len(), 4, "every record in a batch must be distinct");
+
+        let timestamps: std::collections::HashSet<u64> =
+            records.iter().map(|r| r.time_unix_nano).collect();
+        assert_eq!(
+            timestamps.len(),
+            4,
+            "every record in a batch must carry a distinct timestamp"
+        );
+
+        // A different batch_index must not collide with batch 2's records.
+        let other_batch = synthetic_request("fleet-0-0", 3, 4);
+        let other_timestamps: std::collections::HashSet<u64> = other_batch.resource_logs[0]
+            .scope_logs[0]
+            .log_records
+            .iter()
+            .map(|r| r.time_unix_nano)
+            .collect();
+        assert!(
+            timestamps.is_disjoint(&other_timestamps),
+            "different batches must not share timestamps"
+        );
+    }
+}

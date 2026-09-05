@@ -7,9 +7,12 @@
 //! `Deserialize` only (the daemon never serializes its own config), and
 //! adding a `Serialize` derive purely for this crate's convenience would be
 //! a wider, less-obviously-safe change to the config surface than rendering
-//! the handful of fields a fleet member actually needs. [`tests::rendered_config_round_trips_through_the_real_loader`]
-//! below is what keeps this text in lockstep with the real parser instead:
-//! it feeds the rendered string through
+//! the handful of fields a fleet member actually needs.
+//! `tests::rendered_config_round_trips_through_the_real_loader` below is
+//! what keeps this text in lockstep with the real parser instead (a plain
+//! code span, not a doc link: `#[cfg(test)]` items don't exist in a
+//! `cargo doc` build, so an intra-doc link to one never resolves) — it
+//! feeds the rendered string through
 //! [`duckspout_daemon::config::load`] and asserts the loaded struct, so a
 //! future config-surface change that this file's hand-rolled TOML silently
 //! drifted from fails a fleet test, not just a production boot.
@@ -19,8 +22,8 @@ use std::path::PathBuf;
 
 use duckspout_daemon::system::DUCKSPOUT_NODE_HOSTNAME_OVERRIDE;
 
-/// Where a fleet member's lake storage lands (module docs of
-/// [`Fleet::lake_storage`]).
+/// Where a fleet member's lake storage lands, chosen from `--local-lake`
+/// by [`crate::build_plan`].
 #[derive(Debug, Clone)]
 pub enum LakeStorage {
     /// `lake.uri` is a local filesystem directory shared by every node in
@@ -131,9 +134,9 @@ pub fn provision_nodes(
 }
 
 /// This fleet run's deterministic node-name scheme: `fleet-{seed}-{index}`.
-/// A bare hostname (no colons, no dots) so [`strip_seed_peer_port`]-shaped
-/// parsing in `wiring.rs` never has to distinguish it from a port suffix —
-/// same reasoning as `system::detect_node_id`'s real kernel-hostname case.
+/// A bare hostname (no colons, no dots) so `wiring.rs::strip_seed_peer_port`
+/// -shaped parsing never has to distinguish it from a port suffix — same
+/// reasoning as `system::detect_node_id`'s real kernel-hostname case.
 #[must_use]
 pub fn node_name(seed: u64, index: u16) -> String {
     format!("fleet-{seed}-{index}")

@@ -536,3 +536,115 @@ fn resolve_daemon_bin(explicit: Option<&std::path::Path>) -> anyhow::Result<Path
          build it first (`cargo build -p duckspout-daemon`) or pass --daemon-bin explicitly"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal `Cli` with every field explicit — `Cli::parse_from` isn't
+    /// used here since these tests exercise `build_plan`/`resolve_daemon_bin`
+    /// directly, not argument parsing itself.
+    fn base_cli(work_dir_seed: &str) -> Cli {
+        Cli {
+            seed: 0,
+            nodes: 3,
+            work_dir: None,
+            daemon_bin: None,
+            loadgen_bin: None,
+            rf: 2,
+            otlp_base_port: 14317,
+            flight_base_port: 18815,
+            peer_base_port: 17946,
+            status_base_port: 19095,
+            postgres_dsn: "postgres://duckspout@127.0.0.1:5432/duckspout_catalog".to_owned(),
+            postgres_password: "duckspout-dev".to_owned(),
+            local_lake: true,
+            s3_endpoint: "127.0.0.1:9000".to_owned(),
+            s3_bucket: "duckspout-fleet".to_owned(),
+            s3_prefix: format!("duckspout-fleet-{work_dir_seed}"),
+            s3_region: "us-east-1".to_owned(),
+            s3_access_key_id: "duckspout".to_owned(),
+            s3_secret_access_key: "duckspout-dev".to_owned(),
+            skip_backend_check: true,
+            backend_check_timeout_secs: 5,
+            hot_window: "5s".to_owned(),
+            allowed_lateness: "1s".to_owned(),
+            boot_timeout_secs: 30,
+            load_batches: 20,
+            load_batch_size: 25,
+            load_interval_ms: 200,
+            settle_timeout_secs: 60,
+            shutdown_grace_secs: 10,
+        }
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "duckspout-fleet-main-test-{}-{label}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_plan_writes_the_postgres_password_file_and_picks_local_lake() {
+        let work_dir = scratch_dir("local-lake");
+        let cli = base_cli("local");
+        let plan = build_plan(&cli, &work_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&plan.postgres_password_file).unwrap(),
+            "duckspout-dev"
+        );
+        match plan.lake {
+            LakeStorage::Local { dir } => assert_eq!(dir, work_dir.join("lake")),
+            LakeStorage::S3 { .. } => panic!("--local-lake must select LakeStorage::Local"),
+        }
+        assert_eq!(plan.rf, cli.rf);
+        assert_eq!(plan.hot_window, cli.hot_window);
+        assert_eq!(plan.allowed_lateness, cli.allowed_lateness);
+    }
+
+    #[test]
+    fn build_plan_writes_the_s3_secret_file_and_picks_s3_lake_when_not_local() {
+        let work_dir = scratch_dir("s3-lake");
+        let mut cli = base_cli("s3");
+        cli.local_lake = false;
+        let plan = build_plan(&cli, &work_dir).unwrap();
+
+        match plan.lake {
+            LakeStorage::S3 {
+                endpoint,
+                bucket,
+                prefix,
+                secret_access_key_file,
+                ..
+            } => {
+                assert_eq!(endpoint, cli.s3_endpoint);
+                assert_eq!(bucket, cli.s3_bucket);
+                assert_eq!(prefix, cli.s3_prefix);
+                assert_eq!(
+                    std::fs::read_to_string(&secret_access_key_file).unwrap(),
+                    cli.s3_secret_access_key
+                );
+            }
+            LakeStorage::Local { .. } => panic!("non---local-lake must select LakeStorage::S3"),
+        }
+    }
+
+    #[test]
+    fn resolve_daemon_bin_accepts_an_existing_explicit_path() {
+        let dir = scratch_dir("daemon-bin-explicit");
+        let bin = dir.join("duckspout-daemon");
+        std::fs::write(&bin, b"").unwrap();
+        assert_eq!(resolve_daemon_bin(Some(&bin)).unwrap(), bin);
+    }
+
+    #[test]
+    fn resolve_daemon_bin_rejects_a_missing_explicit_path() {
+        let dir = scratch_dir("daemon-bin-missing");
+        let bin = dir.join("does-not-exist");
+        assert!(resolve_daemon_bin(Some(&bin)).is_err());
+    }
+}
