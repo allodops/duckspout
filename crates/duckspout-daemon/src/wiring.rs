@@ -58,14 +58,15 @@
 //!
 //! # What is explicitly deferred, and why
 //!
-//! - **The CTK trace sink** (issue #42, PR #152 — merged after this branch
-//!   was cut, then rebased in): every trace-capable port
-//!   (`OtlpLogsService`, `EngineStager`, `DrainCoordinator`) now carries an
-//!   optional `.with_trace_sink(...)` builder method, defaulting to `None`
-//!   — this composition deliberately never calls it (SCOPE confirms the
-//!   default: "still optional/None by default"). Journaling turns on only
-//!   once the `conformance` ledger row arms (issue #44), which is a CI/CTK
-//!   concern, not a boot-wiring one.
+//! - **The CTK trace sink** (issue #42, PR #152; wired optionally by issue
+//!   #201): every trace-capable port (`OtlpLogsService`, `EngineStager`,
+//!   `DrainCoordinator`) carries an optional `.with_trace_sink(...)` builder
+//!   method. [`Daemon::boot`] now accepts a `trace_sink` parameter and
+//!   applies it to all three when given, so a fleet-managed node can
+//!   produce its real NDJSON journal (§8.4) — but the *default* stays
+//!   `None`: `duckspout-daemon`'s own CLI only builds one when an operator
+//!   passes `--trace-out` (`main.rs`), so a plain `duckspout-daemon --config
+//!   …` still journals nothing, unchanged from before this issue.
 //! - **Multi-tenant dataset declarations** (§9.6.2): v0.1 ships exactly one
 //!   built-in dataset, `otlp_logs` (the OTLP adapter's fixed target); its
 //!   drain plan (`otlp_logs_drain_plan`) is hardcoded rather than read
@@ -99,13 +100,13 @@ use duckspout_accept::OtlpLogsService;
 use duckspout_accept::otlp::OTLP_LOGS_DATASET;
 use duckspout_accept::server::AdmissionConfig as OtlpAdmissionConfig;
 use duckspout_drain::{DatasetDrainPlan, DrainConfig as DrainScheduleConfig, DrainCoordinator};
-use duckspout_lake_ducklake::{DuckLakeCommitter, DuckLakeConfig};
+use duckspout_lake_ducklake::{DuckLakeCommitter, DuckLakeConfig, S3Access};
 use duckspout_staging::{
     EngineSealSurface, EngineStager, StagerConfig, StagingConfig, StagingEngine,
 };
 use duckspout_types::{
     BoxFuture, Clock, DatasetDeclaration, DatasetId, DatasetKind, DecodedBatch, LakeCommitter,
-    NodeId, PartitionId, SealSurface, StageCommitter, StageError, StageOutcome, Storage,
+    NodeId, PartitionId, SealSurface, StageCommitter, StageError, StageOutcome, Storage, TraceSink,
 };
 use duckspout_watermark::{SharedLedger, WatermarkLedger};
 use tokio::net::TcpListener;
@@ -176,6 +177,13 @@ pub enum BootError {
     /// an honest lake's own record always reconstructs.
     #[error("reconstructing the watermark ledger from the lake's manifest record: {0}")]
     WatermarkReconstruction(#[from] duckspout_watermark::ReconstructError),
+    /// `lake.s3_endpoint` and `lake.uri`'s `s3://` scheme disagree (one set
+    /// without the other), or `lake.s3_endpoint` is set without both
+    /// `lake.s3_access_key_id` and `lake.s3_secret_access_key_file` (§9.6.1,
+    /// issue #201). Boot fails closed rather than silently falling back to
+    /// local-filesystem storage a real fleet did not ask for (R-3).
+    #[error("lake storage configuration: {0}")]
+    LakeStorageConfig(String),
 }
 
 /// How one background drain tick went — logged, not otherwise consumed
@@ -407,6 +415,12 @@ pub struct Daemon {
     flight_addr: SocketAddr,
     flight_service: FlightServiceServer<HotFlightService<FsStorage>>,
     admission: OtlpAdmissionConfig,
+    /// The §3.7 capture seam (module docs' "What is explicitly deferred"
+    /// bullet on the CTK trace sink, issue #201): applied to the
+    /// [`OtlpLogsService`] built lazily in [`Daemon::serve`] — `EngineStager`
+    /// and `DrainCoordinator` already took their own clone in
+    /// [`Daemon::boot`]. `None` unless the caller passed one.
+    trace_sink: Option<Arc<dyn TraceSink>>,
 }
 
 impl Daemon {
@@ -419,10 +433,21 @@ impl Daemon {
     /// [`crate::constants::OBSERVATION_LISTEN_PORT_DEFAULT`]); pass `0` to
     /// let the OS choose (tests), or the constant in production.
     ///
+    /// `trace_sink`, when given, journals this node's real §3.3 events
+    /// (`Accept`/`StageCommit`/`ClientAck`/`SealPart`/`PutPart`/
+    /// `LakeCommit*`/…) through every trace-capable port (module docs). The
+    /// production default is `None` — `duckspout-daemon`'s own CLI only
+    /// builds one when `--trace-out` is given (`main.rs`).
+    ///
     /// # Errors
     ///
     /// See [`BootError`].
-    pub async fn boot(config: &DaemonConfig, status_port: u16) -> Result<Self, BootError> {
+    #[allow(clippy::too_many_lines)] // one boot sequence, told linearly
+    pub async fn boot(
+        config: &DaemonConfig,
+        status_port: u16,
+        trace_sink: Option<Arc<dyn TraceSink>>,
+    ) -> Result<Self, BootError> {
         let node_id = system::detect_node_id(system::V01_FIXED_INCARNATION);
         let clock = SystemClock::new();
 
@@ -439,7 +464,7 @@ impl Daemon {
             Some(bytes) => bytes,
             None => system::detect_hot_max_bytes(&config.node.data_dir)?,
         };
-        let stager = Arc::new(EngineStager::new(
+        let mut stager_built = EngineStager::new(
             Arc::clone(&engine),
             clock,
             StagerConfig {
@@ -452,7 +477,11 @@ impl Daemon {
                 dedup_max_entries: config.dedup.window_max_entries,
                 hot_max_bytes,
             },
-        ));
+        );
+        if let Some(sink) = &trace_sink {
+            stager_built = stager_built.with_trace_sink(Arc::clone(sink));
+        }
+        let stager = Arc::new(stager_built);
         let seal_surface = Arc::new(EngineSealSurface::new(Arc::clone(&engine)));
 
         let (committer, parts_store) = open_lake(config).await?;
@@ -465,7 +494,7 @@ impl Daemon {
         let scratch_storage: Arc<dyn Storage> =
             Arc::new(FsStorage::create(config.node.data_dir.clone())?);
 
-        let drain = DrainCoordinator::new(
+        let mut drain = DrainCoordinator::new(
             Arc::clone(&seal_surface) as Arc<dyn SealSurface>,
             Arc::clone(&ledger) as Arc<dyn duckspout_types::WatermarkBookkeeping>,
             Arc::clone(&committer) as Arc<dyn LakeCommitter>,
@@ -478,6 +507,9 @@ impl Daemon {
                 )?),
             },
         );
+        if let Some(sink) = &trace_sink {
+            drain = drain.with_trace_sink(Arc::clone(sink));
+        }
 
         // --- Flight serving over the hot store (§7.4, §7.8) ---
         let serving_config = ServingConfig {
@@ -533,6 +565,7 @@ impl Daemon {
             flight_addr,
             flight_service,
             admission,
+            trace_sink,
         })
     }
 
@@ -572,7 +605,11 @@ impl Daemon {
         self.core.ready.store(true, Ordering::Relaxed);
 
         let stager = Arc::new(BlockingStager(Arc::clone(&self.core.stager)));
-        let otlp_service = OtlpLogsService::new(stager, self.admission).into_server();
+        let mut otlp_service_built = OtlpLogsService::new(stager, self.admission);
+        if let Some(sink) = &self.trace_sink {
+            otlp_service_built = otlp_service_built.with_trace_sink(Arc::clone(sink));
+        }
+        let otlp_service = otlp_service_built.into_server();
 
         let (otlp_shutdown_tx, otlp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (status_shutdown_tx, status_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -904,11 +941,14 @@ fn reconstruct_watermark_ledger(
 /// (a `postgres:` DSN, a `sqlite:` path, or a bare path, per
 /// `duckspout-lake-ducklake`'s own kind detection); `lake.uri` is the
 /// `DATA_PATH` the drain PUTs sealed parts into (§9.6.1 — this module's
-/// `lake.*` mapping).
+/// `lake.*` mapping) — a local filesystem path by default, or an `s3://`
+/// URI when `lake.s3_endpoint` is set ([`build_s3_access`], issue #201:
+/// real `MinIO`-backed multi-node fleets need this to be reachable, not only
+/// the ad hoc client `tests/trace_capture_real_backends.rs` builds by hand).
 async fn open_lake(
     config: &DaemonConfig,
 ) -> Result<(Arc<DuckLakeCommitter>, Arc<dyn object_store::ObjectStore>), BootError> {
-    std::fs::create_dir_all(&config.lake.uri)?;
+    let s3 = build_s3_access(&config.lake)?;
     let catalog_uri = catalog_uri_with_secret(&config.catalog.dsn, &config.catalog.password_file)?;
     let committer = Arc::new(DuckLakeCommitter::open(DuckLakeConfig {
         catalog_uri,
@@ -916,17 +956,111 @@ async fn open_lake(
         // v0.1 is single-node (SCOPE, issue #38): exactly one process ever
         // commits through this catalog, so the multi-process guard (issue
         // #119) never needs to reject a DuckDB-file catalog — that
-        // restriction is replication's (v0.2) concern.
+        // restriction is replication's (v0.2) concern. A real fleet (issue
+        // #201) shares ONE Postgres catalog across every node, which the
+        // guard never rejects regardless of this flag (`multi_process` only
+        // trips for a DuckDB-file catalog, `duckspout-lake-ducklake`'s own
+        // `open` — the fence-row/check-before-register mechanism, not this
+        // flag, is what actually serializes concurrent commits, §6.5–§6.6).
         multi_process: false,
-        // v0.1 always drains to local NVMe (§9.1); no daemon config knob
-        // requests S3 yet, so the metadata connection never needs one.
-        s3: None,
+        s3: s3.clone(),
     })?);
     ensure_otlp_logs_table(&(Arc::clone(&committer) as Arc<dyn LakeCommitter>)).await?;
-    let parts_store: Arc<dyn object_store::ObjectStore> = Arc::new(
-        object_store::local::LocalFileSystem::new_with_prefix(&config.lake.uri)?,
-    );
+    let parts_store = build_parts_store(&config.lake.uri, s3.as_ref())?;
     Ok((committer, parts_store))
+}
+
+/// Builds the [`S3Access`] the metadata connection needs when `lake.uri` is
+/// an `s3://` URI, or `None` for the original local-filesystem topology.
+/// Fails closed on a half-configured pair — `lake.s3_endpoint` without both
+/// credential fields, or either scheme without its matching config half —
+/// rather than silently falling back to a topology the operator did not ask
+/// for (R-3; [`BootError::LakeStorageConfig`]'s own doc comment).
+fn build_s3_access(lake: &config::LakeConfig) -> Result<Option<S3Access>, BootError> {
+    let is_s3_uri = lake.uri.starts_with("s3://");
+    let Some(endpoint) = lake.s3_endpoint.clone() else {
+        if is_s3_uri {
+            return Err(BootError::LakeStorageConfig(
+                "lake.uri is an s3:// URI but lake.s3_endpoint is not set".to_owned(),
+            ));
+        }
+        return Ok(None);
+    };
+    if !is_s3_uri {
+        return Err(BootError::LakeStorageConfig(
+            "lake.s3_endpoint is set but lake.uri is not an s3:// URI".to_owned(),
+        ));
+    }
+    let access_key_id = lake.s3_access_key_id.clone().ok_or_else(|| {
+        BootError::LakeStorageConfig(
+            "lake.s3_endpoint is set but lake.s3_access_key_id is missing".to_owned(),
+        )
+    })?;
+    let secret_file = lake.s3_secret_access_key_file.as_deref().ok_or_else(|| {
+        BootError::LakeStorageConfig(
+            "lake.s3_endpoint is set but lake.s3_secret_access_key_file is missing".to_owned(),
+        )
+    })?;
+    let secret_access_key = std::fs::read_to_string(secret_file)?.trim().to_owned();
+    Ok(Some(S3Access {
+        endpoint,
+        region: lake.s3_region.clone(),
+        access_key_id,
+        secret_access_key,
+        // Not their own settings yet (`LakeConfig::s3_endpoint`'s own doc
+        // comment): `MinIO`-dev path-style, no TLS, mirroring
+        // `tests/trace_capture_real_backends.rs`'s own hardcode.
+        url_style_path: true,
+        use_ssl: false,
+    }))
+}
+
+/// Splits an `s3://bucket/prefix` URI into its bucket and prefix
+/// (`prefix` may be empty). Only called once [`build_s3_access`] has
+/// already confirmed the `s3://` scheme.
+fn parse_s3_uri(uri: &str) -> Result<(&str, &str), BootError> {
+    let rest = uri.strip_prefix("s3://").ok_or_else(|| {
+        BootError::LakeStorageConfig(format!("lake.uri {uri:?} is not an s3:// URI"))
+    })?;
+    match rest.split_once('/') {
+        Some((bucket, prefix)) => Ok((bucket, prefix)),
+        None => Ok((rest, "")),
+    }
+}
+
+/// The drain's parts-`PUT` destination (§6.1): a real `MinIO`/S3-compatible
+/// bucket rooted at `lake.uri`'s prefix when `s3` is given, or the original
+/// local-filesystem directory otherwise — creating that directory first,
+/// exactly as v0.1 always did (a local `data_path` still needs to exist
+/// before `LocalFileSystem` roots into it; an `s3://` bucket does not).
+fn build_parts_store(
+    lake_uri: &str,
+    s3: Option<&S3Access>,
+) -> Result<Arc<dyn object_store::ObjectStore>, BootError> {
+    let Some(s3) = s3 else {
+        std::fs::create_dir_all(lake_uri)?;
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(lake_uri)?,
+        );
+        return Ok(store);
+    };
+    let (bucket, prefix) = parse_s3_uri(lake_uri)?;
+    let s3_store = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint(format!(
+            "{}://{}",
+            if s3.use_ssl { "https" } else { "http" },
+            s3.endpoint
+        ))
+        .with_bucket_name(bucket)
+        .with_access_key_id(&s3.access_key_id)
+        .with_secret_access_key(&s3.secret_access_key)
+        .with_region(&s3.region)
+        .with_allow_http(!s3.use_ssl)
+        .with_virtual_hosted_style_request(!s3.url_style_path)
+        .build()?;
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::prefix::PrefixStore::new(s3_store, prefix));
+    Ok(store)
 }
 
 /// Binds one TCP listener, wrapping a bind failure with which listener it

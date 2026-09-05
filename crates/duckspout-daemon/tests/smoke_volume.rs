@@ -175,7 +175,7 @@ async fn one_million_records_ingest_and_drain() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // --- Boot through the public API (never the binary) ---
-    let daemon = Daemon::boot(&config, 0).await.expect("daemon boots");
+    let daemon = Daemon::boot(&config, 0, None).await.expect("daemon boots");
     let handle = daemon.handle();
     let otlp_addr = daemon.otlp_addr();
 

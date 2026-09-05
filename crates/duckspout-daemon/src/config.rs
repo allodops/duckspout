@@ -1,6 +1,9 @@
-//! The node configuration surface (§9.6.1): 27 rows, **32 settings** — the
-//! §9.6.4 ratchet baseline. This module IS the config surface; everything
-//! not here is a fixed constant in [`crate::constants`] (§9.6.3).
+//! The node configuration surface (§9.6.1): 28 rows, **36 settings** — the
+//! §9.6.4 ratchet baseline (raised from 27/32 by issue #201's `lake.s3_*`
+//! row: the fleet runner's divergent-workload justification is real
+//! `MinIO`-backed multi-node runs, which the v0.1 local-filesystem-only
+//! `lake.uri` could not reach). This module IS the config surface;
+//! everything not here is a fixed constant in [`crate::constants`] (§9.6.3).
 //!
 //! One TOML file, environment-variable overrides (`DUCKSPOUT__…`), secrets
 //! by file path. Any new setting requires a divergent-workload justification
@@ -117,14 +120,41 @@ pub struct TlsConfig {
     pub ca: PathBuf,
 }
 
-/// `lake.*` — 2 settings (§6: Iceberg-by-contract).
+/// `lake.*` — 6 settings (§6: Iceberg-by-contract; §6.1's MinIO/S3-compatible
+/// parts store, issue #201).
 #[derive(Debug, Clone, Deserialize)]
 pub struct LakeConfig {
     /// `lake.committer` — default `ducklake`.
     #[serde(default = "defaults::lake_committer")]
     pub committer: String,
-    /// `lake.uri` — required; deployment-specific.
+    /// `lake.uri` — required; deployment-specific. A local filesystem path
+    /// (v0.1's original, and still the default, topology) or an `s3://`
+    /// URI when `lake.s3_endpoint` is set (below).
     pub uri: String,
+    /// `lake.s3_endpoint` — `host:port`, no scheme (the `DuckDB` `httpfs`
+    /// `ENDPOINT` secret convention, e.g. `MinIO`'s `127.0.0.1:9000`).
+    /// `None` (default): `lake.uri` is read as a local filesystem path,
+    /// unchanged from v0.1. `Some`: `lake.uri` must be an `s3://` URI and
+    /// both the drain's parts `PUT` and the `DuckLake` metadata connection's
+    /// `ducklake_add_data_files` read-back go through this endpoint
+    /// (`wiring::open_lake`'s module docs). `url_style_path` and `use_ssl`
+    /// are not their own settings yet — they mirror
+    /// `tests/trace_capture_real_backends.rs`'s own hardcoded `MinIO`-dev
+    /// values (path-style, no TLS) rather than becoming knobs before a
+    /// second real target exists to diverge against (R-12).
+    #[serde(default)]
+    pub s3_endpoint: Option<String>,
+    /// `lake.s3_region` — default `us-east-1`; `MinIO` accepts any
+    /// non-empty region string.
+    #[serde(default = "defaults::lake_s3_region")]
+    pub s3_region: String,
+    /// `lake.s3_access_key_id` — required when `lake.s3_endpoint` is set.
+    #[serde(default)]
+    pub s3_access_key_id: Option<String>,
+    /// `lake.s3_secret_access_key_file` — secrets by file path (§9.5);
+    /// required when `lake.s3_endpoint` is set.
+    #[serde(default)]
+    pub s3_secret_access_key_file: Option<PathBuf>,
 }
 
 /// `hot.*` — the hot tier's two knobs.
@@ -246,7 +276,7 @@ impl Default for QueryConfig {
     }
 }
 
-/// The complete node configuration: §9.6.1's 27 rows, 32 settings.
+/// The complete node configuration: §9.6.1's 28 rows, 36 settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonConfig {
     /// `node.*`.
@@ -315,6 +345,13 @@ pub mod defaults {
     #[must_use]
     pub fn lake_committer() -> String {
         "ducklake".to_owned()
+    }
+    /// `"us-east-1"` — `MinIO` accepts any non-empty region string; this is
+    /// the documented convention (also `tests/trace_capture_real_backends.rs`'s
+    /// own hardcode).
+    #[must_use]
+    pub fn lake_s3_region() -> String {
+        "us-east-1".to_owned()
     }
     /// `"60s"`.
     #[must_use]

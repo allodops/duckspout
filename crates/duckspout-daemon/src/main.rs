@@ -10,9 +10,11 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
-use duckspout_daemon::{config, constants, manifest, wiring};
+use duckspout_daemon::{config, constants, manifest, system, wiring};
+use duckspout_types::TraceSink;
 
 /// The `DuckSpout` node daemon (§9).
 #[derive(Debug, Parser)]
@@ -29,6 +31,22 @@ struct Cli {
     /// unless `--dump-config-manifest` is given.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// The observation listener's port (§9.3.2). Not a §9.6.1 setting
+    /// (`constants::OBSERVATION_LISTEN_PORT_DEFAULT`'s own doc comment) —
+    /// this CLI-only override exists so co-located node processes on one
+    /// host (`duckspout-fleet`, issue #201) can each bind a distinct port;
+    /// a single-node deployment never needs it.
+    #[arg(long, default_value_t = constants::OBSERVATION_LISTEN_PORT_DEFAULT)]
+    status_listen: u16,
+
+    /// When given, journals this node's real §3.3 events as NDJSON to this
+    /// path through [`duckspout_ctk::NdjsonTraceWriter`] (§3.7, §8.4, issue
+    /// #201) — every trace-capable port wired via [`wiring::Daemon::boot`].
+    /// Absent by default: a plain `duckspout-daemon --config …` journals
+    /// nothing, unchanged from before this flag existed.
+    #[arg(long)]
+    trace_out: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -54,7 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "configuration loaded"
     );
 
-    let daemon = wiring::Daemon::boot(&loaded, constants::OBSERVATION_LISTEN_PORT_DEFAULT).await?;
+    let trace_sink = build_trace_sink(cli.trace_out.as_deref())?;
+    let daemon = wiring::Daemon::boot(&loaded, cli.status_listen, trace_sink).await?;
     tracing::info!(
         otlp_addr = %daemon.otlp_addr(),
         status_addr = %daemon.status_addr(),
@@ -65,6 +84,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     daemon.serve(shutdown_signal()).await;
     Ok(())
+}
+
+/// Builds the §3.7 capture-side [`TraceSink`] `--trace-out` requests, or
+/// `None` when the flag is absent (`Cli::trace_out`'s own doc comment).
+/// Journals as this process's own [`system::detect_node_id`] — computed a
+/// second time here (boot computes it again inside [`wiring::Daemon::boot`])
+/// rather than threading the id back out of boot: both calls are pure and
+/// deterministic (the same `/proc/sys/kernel/hostname` or
+/// [`system::DUCKSPOUT_NODE_HOSTNAME_OVERRIDE`] read), so they always agree.
+///
+/// # Errors
+///
+/// If `path` cannot be created (a bad `duckspout-fleet`-supplied journal
+/// directory, most likely) — fails closed rather than booting silently
+/// unjournaled when the operator explicitly asked for a journal (R-3).
+fn build_trace_sink(path: Option<&std::path::Path>) -> Result<Option<Arc<dyn TraceSink>>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("opening --trace-out {}: {e}", path.display()))?;
+    let node_id = system::detect_node_id(system::V01_FIXED_INCARNATION);
+    Ok(Some(
+        Arc::new(duckspout_ctk::NdjsonTraceWriter::new(node_id, file)) as Arc<dyn TraceSink>,
+    ))
 }
 
 /// Resolves once the process receives SIGTERM (§9.1.2's shallow-drain
