@@ -5,10 +5,14 @@
 //! Reads the per-node (plus loadgen) NDJSON journals of a fleet run and
 //! delivers exactly one verdict via its exit code — see [`EXIT_CONTRACT`].
 //! Seeded-violation replays must convict, and a run whose armed injectors
-//! never fired is vacuous — `NoVerdict`, never `Pass` (§8.3).
+//! never fired is vacuous — `NoVerdict`, never `Pass` (§8.4's vacuity teeth;
+//! the citation read §8.3 before #208 implemented the paragraph it names).
+//! Both are real and enforced as of #208: `duckspout_judge::vacuity` carries
+//! the four run-level `NoVerdict` rules, and
+//! `tests/seeded_violation_replay.rs` is the must-convict self-test.
 //!
-//! This binary is a thin `clap` wrapper: the actual pipeline
-//! (ingest → loadgen run-summary vacuity check → every predicate) lives in
+//! This binary is a thin `clap` wrapper: the actual pipeline (ingest → every
+//! predicate → every run-level vacuity rule) lives in
 //! `duckspout_judge::runner`, split out specifically so it is directly
 //! testable (ACPR finding MEDIUM-HIGH-4) without spawning a subprocess.
 //!

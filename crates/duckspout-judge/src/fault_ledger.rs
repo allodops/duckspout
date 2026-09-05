@@ -59,21 +59,22 @@ use serde::Deserialize;
 ///
 /// # Why the classification matters, and which way an unknown kind falls
 ///
-/// It is used for exactly one thing: excusing a node whose journal stopped
-/// (`crate::vacuity`'s node-continuity rule). A `node_kill` ends its window
-/// as soon as the process is confirmed dead — an `Ended` line early in the
-/// run — yet the target stays silent from then to the end of the run, and
-/// that silence is entirely explained. A `network_partition`, by contrast,
-/// ends when the link is restored, and a target that never journals again
-/// afterwards is a genuinely vanished machine that the fault does NOT
-/// explain.
+/// It is used for exactly one thing: deciding how long a node is expected to
+/// keep journaling (`crate::vacuity::check_node_continuity`'s horizon). A
+/// `node_kill` ends its own window as soon as the process is confirmed dead —
+/// an `Ended` line early in the run — yet the target is legitimately silent
+/// from then to the end of the run, so the run stops expecting anything of it
+/// at the kill. A `network_partition`, by contrast, ends when the link is
+/// restored: the node is still in the run afterwards, and if it never journals
+/// again it is a genuinely vanished machine the fault does NOT account for.
 ///
-/// An unrecognised kind is therefore treated as TRANSIENT: it earns its
-/// target the overlap-scoped excuse any fault window grants, but never a
-/// blanket excuse for the whole rest of the run. That is the fail-closed
-/// direction — a judge must not hand a permanent alibi to a fault it does
-/// not understand.
-const TERMINAL_FAULT_KINDS: &[&str] = &["node_kill", "membership_leave", "flight_kill_mid_stream"];
+/// An unrecognised kind is therefore treated as TRANSIENT: its target still
+/// gets the ordinary alibi any fault window grants over the interval it
+/// actually covers ([`FaultWindow::covers`]), but never a blanket one for the
+/// whole rest of the run. That is the fail-closed direction — a judge must not
+/// hand a permanent alibi to a fault it does not understand.
+pub const TERMINAL_FAULT_KINDS: &[&str] =
+    &["node_kill", "membership_leave", "flight_kill_mid_stream"];
 
 /// One phase of a fault window (`duckspout_fleet::faultlog::FaultPhase`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]

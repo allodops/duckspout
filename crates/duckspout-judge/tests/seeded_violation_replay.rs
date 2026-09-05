@@ -42,6 +42,17 @@
 //! cannot be "caught" by a predicate that happens to overlap it, and a
 //! predicate cannot borrow another's conviction to look alive.
 //!
+//! # A detail worth stating: the manifest's paths are deliberately wrong
+//!
+//! `base/run.json` names `journal_path`s that do not exist on any machine.
+//! That is not sloppiness — it is a standing check that the judge joins the
+//! manifest to the journals on the NODE IDENTITY inside the evidence and never
+//! on where the files happen to live
+//! (`duckspout_judge::run_manifest::NodeRun::name`'s own reasoning: archived
+//! artifacts are routinely read back from a different directory than they were
+//! written in). A join that started using `journal_path` would fail
+//! [`the_clean_base_exits_pass`] immediately.
+//!
 //! # Why not one seed per §3 invariant
 //!
 //! §8.4 asks for one seeded violation per JUDGE, and that is what this is:

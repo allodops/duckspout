@@ -333,39 +333,9 @@ pub fn check_fault_schedule(ledger: Option<&FaultLedger>) -> Result<usize, Vec<V
     }
 }
 
-/// One observed interaction between two distinct roster nodes.
-///
-/// # What counts as cross-node contention, and why exactly this
-///
-/// §8.4's distributed tier exists to certify a REAL MULTI-NODE FLEET; a run
-/// whose nodes never touched each other has exercised a co-located
-/// single-node system with extra processes. The evidence for "they touched"
-/// has to come from the journals themselves (the manifest only says how many
-/// nodes there were), and the frozen §3.3 vocabulary has exactly two
-/// inter-node relations in it:
-///
-/// - **Replication.** `Forward` is journaled by the owner sending a batch to
-///   its peers; `PeerApply` by the peer that applied it
-///   (`duckspout_replication::forward` / `::peer_apply`, and
-///   `docs/trace-mapping.md`). One of each, on two different roster nodes, is
-///   the write path actually crossing a machine boundary.
-/// - **Ownership.** `TakeoverDrain` is journaled by a replica taking over a
-///   dead owner's partitions, and `ClaimAdvertise`/`LakeCommitOk` by a node
-///   that held or advanced one. A takeover on one node while another node
-///   held claims is ownership genuinely changing hands.
-///
-/// # The honest limit
-///
-/// `Forward`, `PeerApply` and `Receipt` lines carry no correlation payload
-/// today (`crate::journal`'s payload table: only `request_id`,
-/// `complete_through_ms`, `changelog_key` and `part` are decoded, and none of
-/// them ride these events), so this cannot prove that node B's `PeerApply`
-/// applied node A's `Forward` — only that both happened, on two different
-/// machines, in one run. That makes this rule a FLOOR and not a matcher, and
-/// the floor is deliberately the direction that cannot produce a false
-/// `NoVerdict`: it fires only when there is no inter-node evidence
-/// whatsoever. Sharpening it into a real pairing is a change to the wire
-/// shape (a forwarded batch's identity on both lines), not to this rule.
+/// One observed interaction between two distinct roster nodes
+/// ([`check_cross_node_contention`]'s docs for what the relations are and
+/// what this evidence can and cannot prove).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ContentionPair {
     relation: &'static str,
@@ -409,8 +379,43 @@ fn cross_pairs(
     pairs
 }
 
-/// §8.4 rule 2: a multi-node run must show two nodes actually meeting
-/// ([`ContentionPair`]'s docs for what counts).
+/// §8.4 rule 2: a multi-node run must show two nodes actually meeting.
+///
+/// # What counts as cross-node contention, and why exactly this
+///
+/// §8.4's distributed tier exists to certify a REAL MULTI-NODE FLEET; a run
+/// whose nodes never touched each other has exercised a co-located
+/// single-node system with extra processes. The evidence for "they touched"
+/// has to come from the journals themselves (the manifest only says how many
+/// nodes there were), and the frozen §3.3 vocabulary has exactly two
+/// inter-node relations in it:
+///
+/// - **Replication.** `Forward` is journaled by the owner sending a batch to
+///   its peers; `PeerApply` by the peer that applied it
+///   (`duckspout_replication::forward` / `::peer_apply`, and
+///   `docs/trace-mapping.md`). One of each, on two different roster nodes, is
+///   the write path actually crossing a machine boundary.
+/// - **Ownership.** `TakeoverDrain` is journaled by a replica taking over a
+///   dead owner's partitions, and `ClaimAdvertise`/`LakeCommitOk` by a node
+///   that held or advanced one. A takeover on one node while another node
+///   held claims is ownership genuinely changing hands.
+///
+/// Both halves must come from nodes on the manifest's ROSTER, so a journal
+/// attributed to a node the runner never provisioned cannot supply the
+/// evidence.
+///
+/// # The honest limit
+///
+/// `Forward`, `PeerApply` and `Receipt` lines carry no correlation payload
+/// today (`crate::journal`'s payload table: only `request_id`,
+/// `complete_through_ms`, `changelog_key` and `part` are decoded, and none of
+/// them ride these events), so this cannot prove that node B's `PeerApply`
+/// applied node A's `Forward` — only that both happened, on two different
+/// machines, in one run. That makes this rule a FLOOR and not a matcher, and
+/// the floor is deliberately the direction that cannot produce a false
+/// `NoVerdict`: it fires only when there is no inter-node evidence
+/// whatsoever. Sharpening it into a real pairing is a change to the wire
+/// shape (a forwarded batch's identity on both lines), not to this rule.
 ///
 /// # Errors
 ///
