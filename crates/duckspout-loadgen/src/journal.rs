@@ -178,7 +178,11 @@ mod tests {
         let out = String::from_utf8(journal.into_inner()).expect("utf8");
         let seqs: Vec<u64> = out
             .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"].as_u64().unwrap())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"]
+                    .as_u64()
+                    .unwrap()
+            })
             .collect();
         assert_eq!(seqs, vec![0, 1, 2]);
     }
