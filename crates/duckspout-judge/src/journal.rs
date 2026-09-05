@@ -217,18 +217,25 @@ fn identity_from_rest(
     }
 }
 
-/// A structural check for a duplicate JSON object key anywhere in one line
-/// (ACPR finding MEDIUM-HIGH-3(d)): `serde_json`'s own `Map` (the
+/// A structural check for a duplicate JSON object key at the TOP LEVEL of
+/// one line (ACPR finding MEDIUM-HIGH-3(d)): `serde_json`'s own `Map` (the
 /// `preserve_order` feature included) silently keeps "last value wins" on a
 /// repeated key, with no built-in opt-in to reject it instead. That is
 /// dangerous here specifically: a line with `tenant` duplicated could
 /// silently reclassify a real tenant's ack as the system tenant `_self` (or
-/// vice versa) and have it wrongly excluded or included. Reasonable-effort
-/// fix, not a general JSON-validation library: walk the raw token stream
-/// with a `serde::de::Visitor` that never *builds* a map (so duplicate keys
-/// are never lost to the same collapsing a normal deserialize would do) and
-/// fail as soon as one repeats, at any nesting level a journal line could
-/// plausibly have.
+/// vice versa) and have it wrongly excluded or included.
+///
+/// Reasonable-effort fix, not a general JSON-validation library: every
+/// journal line this crate ever decodes is one FLAT object (`node`/`seq`/
+/// `event` plus, at most, the identity fields alongside them — module
+/// docs' wire shape) — none of them nest a key one level deeper — so this
+/// only walks the top-level object's keys (via a `serde::de::Visitor` that
+/// never *builds* a map, so a duplicate key is never lost to the same
+/// collapsing a normal deserialize would do) and discards each value with
+/// [`serde::de::IgnoredAny`] rather than recursing into it. If the wire
+/// shape ever grows a nested object, a duplicate key one level down would
+/// not be caught by this check — an intentionally narrow scope matching
+/// what this format actually is today, not a claim of full generality.
 struct RejectDuplicateKeys;
 
 impl<'de> serde::de::Deserialize<'de> for RejectDuplicateKeys {
@@ -242,7 +249,7 @@ impl<'de> serde::de::Deserialize<'de> for RejectDuplicateKeys {
             type Value = ();
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("any JSON value")
+                f.write_str("a JSON object")
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -257,84 +264,13 @@ impl<'de> serde::de::Deserialize<'de> for RejectDuplicateKeys {
                              last-value-wins could silently reclassify identity fields)"
                         )));
                     }
-                    map.next_value::<RejectDuplicateKeys>()?;
+                    map.next_value::<serde::de::IgnoredAny>()?;
                 }
                 Ok(())
             }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                while seq.next_element::<RejectDuplicateKeys>()?.is_some() {}
-                Ok(())
-            }
-
-            fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_string<E>(self, _v: String) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_none<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: serde::de::Deserializer<'de>,
-            {
-                deserializer.deserialize_any(DupKeyVisitor)
-            }
         }
 
-        deserializer.deserialize_any(DupKeyVisitor).map(|()| Self)
+        deserializer.deserialize_map(DupKeyVisitor).map(|()| Self)
     }
 }
 
