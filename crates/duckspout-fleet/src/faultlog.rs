@@ -18,7 +18,7 @@
 //! type is itself scoped to the CTK **in-memory** tier's schedule stream,
 //! module docs there, not this crate's real-process fault injection).
 //! Amending the frozen D-6 vocabulary to fit fault windows in would be a
-//! settled-decision amendment (`AGENTS.md`: "never re-litigate[d] in PRs"),
+//! settled-decision amendment (`AGENTS.md`: "never re-litigate\[d\] in PRs"),
 //! not a mechanical fix available inside this issue's scope — so this
 //! module is deliberately its own small, informal, fleet-runner-owned NDJSON
 //! channel (`faults.ndjson`, one file per fleet run, shared across every
@@ -26,7 +26,7 @@
 //!
 //! # Shape
 //!
-//! Every fault the fleet runs is one logical [`FaultWindow`] identified by a
+//! Every fault the fleet runs is one logical `FaultWindow` identified by a
 //! `fault_id`, journaled as up to three lines as it progresses through
 //! [`FaultPhase`]s: `Armed` (scheduled, before anything happens — the
 //! "start" of the fault's *lifecycle*, not yet the fault itself), `Started`
