@@ -235,6 +235,7 @@ mod tests {
             }),
             watermark: None,
             changelog: None,
+            part: None,
         }
     }
 
@@ -451,6 +452,7 @@ mod tests {
                 }),
                 watermark: None,
                 changelog: None,
+                part: None,
             }],
         };
         let final_state = InMemoryFinalState::new(); // nothing present

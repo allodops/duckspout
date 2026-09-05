@@ -16,15 +16,16 @@
 //!
 //! Journal and read-log ingestion (`duckspout_judge::journal`,
 //! `duckspout_judge::read_log`) are real: malformed input fails closed,
-//! exactly as the checking logic relies on. All three predicates
-//! (`zero_acked_lost`, `watermark_honesty`, `latest_view`) are real and
-//! unit-tested. What is NOT wired is a REAL backend behind either read-back
-//! surface (`FinalSystemState`, `LatestView`): `duckspout-fleet` has no real
-//! multi-node run to judge yet (§8.4's distributed tier lands at v0.2;
-//! #204/#208's work is where a real fleet run and a real query client
-//! appear), so there is nothing to query for real. The `--*-fixture` flags
-//! run the real predicates against JSON test doubles
-//! (`duckspout_judge::final_state`'s own module docs) — a DEV/TEST
+//! exactly as the checking logic relies on. All five predicates
+//! (`zero_acked_lost`, `watermark_honesty`, `latest_view`,
+//! `retention_honesty`, `cache_transparency`) are real and unit-tested.
+//! What is NOT wired is a REAL backend behind any of the three read-back
+//! surfaces (`FinalSystemState`, `LatestView`, `CommittedParts`):
+//! `duckspout-fleet` has no real multi-node run to judge yet (§8.4's
+//! distributed tier lands at v0.2; #204/#208's work is where a real fleet
+//! run and a real query client appear), so there is nothing to query for
+//! real. The `--*-fixture` flags run the real predicates against JSON test
+//! doubles (`duckspout_judge::final_state`'s own module docs) — a DEV/TEST
 //! convenience that exercises the real Pass/Violation/NoVerdict contract end
 //! to end; omitting one reports `NoVerdict` for that predicate honestly,
 //! since a judge with no backend to check against has proven nothing.
@@ -34,6 +35,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use duckspout_judge::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS;
 use duckspout_judge::runner::{RunArgs, RunOutcome, run};
 use duckspout_judge::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION;
 use duckspout_judge::verdict::Verdict;
@@ -75,6 +77,23 @@ struct Cli {
     #[arg(long)]
     latest_view_fixture: Option<PathBuf>,
 
+    /// DEV/TEST ONLY: a `CommittedParts` fixture JSON
+    /// (`duckspout_judge::final_state`) standing in for the lake's own
+    /// read-back of which snapshot parts it holds. Omitted: retention
+    /// honesty reports `NoVerdict` rather than deciding Keep Rule 10 with
+    /// no covering set to decide it against.
+    #[arg(long)]
+    committed_parts_fixture: Option<PathBuf>,
+
+    /// Absolute latency ceiling, in milliseconds, above which a read that
+    /// raced a `Demote`/`Evict`/`DropWindow` is a candidate for §2.4's
+    /// obligation (c) — exceeding it is necessary but never sufficient
+    /// (reasoning:
+    /// `duckspout_judge::predicates::cache_transparency::DEFAULT_MAX_RACING_READ_MS`
+    /// docs).
+    #[arg(long, default_value_t = DEFAULT_MAX_RACING_READ_MS)]
+    max_racing_read_ms: u64,
+
     /// Ceiling on the fraction of a loadgen's resolved requests that came
     /// back `Ambiguous` before its run summary is treated as unreliable
     /// evidence (ACPR finding HIGH-1; reasoning:
@@ -90,7 +109,9 @@ fn main() {
         final_state_fixture: cli.final_state_fixture,
         read_log: cli.read_log,
         latest_view_fixture: cli.latest_view_fixture,
+        committed_parts_fixture: cli.committed_parts_fixture,
         max_ambiguous_fraction: cli.max_ambiguous_fraction,
+        max_racing_read_ms: cli.max_racing_read_ms,
     });
     report(&outcome);
     std::process::exit(outcome.exit_code());

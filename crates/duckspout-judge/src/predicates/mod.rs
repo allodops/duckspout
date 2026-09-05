@@ -1,16 +1,20 @@
 //! Judge predicates built on `crate::journal` (§8.4). #205 shipped
-//! [`zero_acked_lost`]; #206 adds [`watermark_honesty`] (the Q-shaped judge)
-//! and [`latest_view`] (the §3 invariant `LatestViewCorrect`, judged
-//! end-to-end). `docs/verification.md` §8.4 names two more — retention
-//! honesty and cache transparency under eviction storms — which are #207's
-//! and #208's territory, not implemented here.
+//! [`zero_acked_lost`]; #206 added [`watermark_honesty`] (the Q-shaped
+//! judge) and [`latest_view`] (the §3 invariant `LatestViewCorrect`, judged
+//! end-to-end); #207 completes `docs/verification.md` §8.4's list with
+//! [`retention_honesty`] (Keep Rule 10 — `SnapshotCovered`) and
+//! [`cache_transparency`] (the eviction-storm judge, which is the mechanical
+//! discharge of §2.4's read-answer equivalence — the half the §3 lemma
+//! deliberately does not carry, §3.4).
 //!
 //! Every predicate is a pure function of its evidence returning
 //! `crate::verdict::Verdict` over its own typed findings, so
 //! `crate::runner` can run them all and combine their verdicts under one
 //! exit contract.
 
+pub mod cache_transparency;
 pub mod latest_view;
+pub mod retention_honesty;
 pub mod watermark_honesty;
 pub mod zero_acked_lost;
 

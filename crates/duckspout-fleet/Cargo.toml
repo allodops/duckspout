@@ -32,6 +32,15 @@ duckspout-accept = { workspace = true }
 # this crate depends on the daemon library to stay in lockstep with it
 # rather than hand-duplicating the config surface and risking drift (DRY).
 duckspout-daemon = { workspace = true }
+# The frozen §3.3 action vocabulary (`TraceEvent`), for #207's cache-churn
+# injector: the three post-drain residency actions it watches for in a
+# node's own D-6 journal are named by their enum VARIANTS rather than by
+# string literals, so this crate's watch list cannot drift from the
+# vocabulary the nodes actually journal (`crate::fault`'s `RESIDENCY_EVENTS`
+# doc comment). Depending on the types crate is what makes that a compile
+# error instead of a silent mismatch — the same DRY reasoning as the
+# `duckspout-accept` dependency above.
+duckspout-types = { workspace = true }
 # Concurrent per-node boot/load/shutdown fan-out (`join_all`) — the
 # ecosystem-standard combinator, no in-house candidate (R-third-party-first).
 futures = { workspace = true }
@@ -59,6 +68,14 @@ tokio = { workspace = true, features = [
 tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The REAL Arrow Flight server fixture the cache-churn injector's read-loop
+# tests run against (`fault::run_cache_churn`, #207): `TcpListenerStream` is
+# the same `serve_with_incoming` construction `duckspout-daemon`'s own Flight
+# tests use, so the injector's client half is exercised against a real
+# gRPC/Flight wire in-process, with no backend.
+tokio-stream = { workspace = true }
 
 [lints]
 workspace = true

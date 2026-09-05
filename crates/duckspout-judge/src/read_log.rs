@@ -20,14 +20,6 @@
 //! `complete` read — the only kind this judge grades — as an `available`
 //! one, or the reverse).
 //!
-//! # Producer status
-//!
-//! Nothing in this workspace writes this file yet: the fleet's query client
-//! lands with the distributed tier's own wiring (#204/#208), exactly as
-//! `crate::final_state`'s read-back does. A judge run given no read log
-//! reports `NoVerdict` for the served half of watermark honesty rather than
-//! a vacuous pass (§8.4's vacuity teeth).
-//!
 //! # Honest limits of this shape
 //!
 //! A served entry lists the record identity of every row the answer
@@ -59,6 +51,56 @@
 //! over. Note the asymmetry: ADVERTISEMENTS do ride journal lines and so do
 //! carry D-6's ordering, which that predicate exploits for same-node claims.
 //!
+//! # The cache probe (#207)
+//!
+//! §8.4's eviction-storm judge needs one thing this shape did not carry:
+//! **which cache state served this answer.** Without it, "any two cache
+//! states yield the identical row set" (§2.4) is not a statement about
+//! anything a judge can see. [`CacheProbe`] is that observation, decoded by
+//! FIELD PRESENCE off the same flat line (`crate::journal`'s rule, applied
+//! here), and it is deliberately an OUTSIDE-THE-NODE measurement: the
+//! residency-op counter is the number of `Demote`/`Evict`/`DropWindow` lines
+//! in the serving node's own D-6 journal at the moment the read was issued
+//! and again when it finished. A node self-reporting "my cache did not
+//! affect your answer" would be the subject grading itself; counting the
+//! §3 actions it journaled is the fleet runner reading the same public
+//! evidence the judge does.
+//!
+//! Two consequences worth stating plainly:
+//!
+//! - The counter is **monotone per node**, so probed reads against one node
+//!   ARE mutually ordered — which is the ordering handle this module's
+//!   MEDIUM-3 note above says a bare [`ReadRecord`] lacks. That order is
+//!   still not comparable against the journals' per-node seqs, so the
+//!   MEDIUM-3 weakening stands for watermark honesty; it is only within the
+//!   probed reads themselves that `crate::predicates::cache_transparency`
+//!   can say "before" and "after".
+//! - A read whose `residency_ops_after` exceeds its `residency_ops_before`
+//!   genuinely **raced** a residency action, which is what makes obligation
+//!   (c) — "Evict takes no locks the read path depends on" (§2.4) —
+//!   checkable at all.
+//!
+//! # Producer status
+//!
+//! Nothing in this workspace writes this file yet: the fleet's query client
+//! lands with the distributed tier's own wiring (#208), exactly as
+//! `crate::final_state`'s read-back does. A judge run given no read log
+//! reports `NoVerdict` for the served half of watermark honesty, and for all
+//! of cache transparency, rather than a vacuous pass (§8.4's vacuity teeth).
+//!
+//! `duckspout-fleet`'s `--fault-cache-churn-node` injector (#207) forces
+//! real, confirmed residency churn against a real node while driving real
+//! Arrow Flight reads through it. It does NOT write this file: the daemon's
+//! read surface is hot-only with no read concern and no coverage pinning
+//! (`duckspout_daemon::serving`'s own #113 gap note), so no `complete` read
+//! exists for it to log, and stamping a `complete_through_ms` sampled from
+//! the advisory `/status` row would be exactly the lagging-watermark
+//! disclosure hazard `crate::journal::RequestIdentity::max_event_time_ms`
+//! already warns makes a judge convict a correct fleet. The injector
+//! therefore journals its racing reads' real observed outcomes into the
+//! fleet's own `faults.ndjson` window, and this format waits for the real
+//! query client (#208, and the Airport read vocabulary behind it).
+//!
 //! # Wire shape
 //!
 //! ```json
@@ -66,12 +108,16 @@
 //!  "complete_through_ms":1700,"record_keys":["loadgen-0-1000-0"]}
 //! {"tenant":"t","partition":"t0-s0","concern":"complete","outcome":"refused",
 //!  "reason":"holder unreachable"}
+//! {"tenant":"t","partition":"t0-s0","concern":"complete","outcome":"served",
+//!  "complete_through_ms":1700,"record_keys":["loadgen-0-1000-0"],
+//!  "query":"SELECT ...","serving_node":"fleet-0-1/1",
+//!  "residency_ops_before":12,"residency_ops_after":13,"latency_ms":4}
 //! ```
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use duckspout_types::PartitionId;
+use duckspout_types::{NodeId, PartitionId};
 use serde::Deserialize;
 
 /// The read concern a read was issued under (§7.6). `complete` is the
@@ -79,7 +125,13 @@ use serde::Deserialize;
 /// the judge grades only `complete` reads (a narrowed `available` answer is
 /// correct by definition, so treating it as evidence of completeness would
 /// manufacture violations out of documented behaviour).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+///
+/// `Ord` is derived because the concern is part of the key
+/// `crate::predicates::cache_transparency` groups its obligation-(c)
+/// evidence by: an `available` read's silent narrowing means a served
+/// `available` read can never stand in for a `complete` one, so the two
+/// concerns must not share a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadConcern {
     /// `duckspout_read_concern = 'complete'` — the default (§7.6).
@@ -116,6 +168,46 @@ pub enum ReadOutcome {
     },
 }
 
+/// What cache state served one read, observed from outside the serving node
+/// (module docs' "the cache probe").
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CacheProbe {
+    /// The exact question this read asked. Two answers are only required to
+    /// agree when they are answers to the SAME question: without this,
+    /// `crate::predicates::cache_transparency` would compare a `SELECT *`
+    /// against a `SELECT count(*)` and convict a correct fleet.
+    pub query: String,
+    /// The node that served the answer, spelled as that node's own D-6
+    /// journal spells it (`node/incarnation`) — the residency counters below
+    /// are counts within THAT node's journal, so a probe naming a different
+    /// node's counter would be comparing two unrelated clocks.
+    ///
+    /// `crate::predicates::cache_transparency` therefore keys obligation
+    /// (c)'s evidence on this field: a busy node's high residency count says
+    /// nothing about a quiet node's, and a bracket or a baseline built across
+    /// two nodes would be exactly the unrelated-clocks comparison this doc
+    /// comment warns about (ACPR finding HIGH-2).
+    pub serving_node: NodeId,
+    /// `Demote` + `Evict` + `DropWindow` lines in `serving_node`'s journal
+    /// when the read was ISSUED — the cache-state label (module docs).
+    pub residency_ops_before: u64,
+    /// The same count when the answer was complete. Strictly greater than
+    /// `residency_ops_before` exactly when the read RACED a residency
+    /// action, which is obligation (c)'s subject.
+    pub residency_ops_after: u64,
+    /// End-to-end latency of the read, milliseconds — the observable a held
+    /// lock would show up in (§2.4 obligation (c)).
+    pub latency_ms: u64,
+}
+
+impl CacheProbe {
+    /// Whether this read overlapped at least one residency action.
+    #[must_use]
+    pub fn raced_residency_action(&self) -> bool {
+        self.residency_ops_after > self.residency_ops_before
+    }
+}
+
 /// One read the query client issued and the answer it got.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ReadRecord {
@@ -130,6 +222,20 @@ pub struct ReadRecord {
     /// The answer.
     #[serde(flatten)]
     pub outcome: ReadOutcome,
+    /// The cache state that served this read, when the client sampled one
+    /// (module docs). Absent on every line written before #207 and on every
+    /// read whose client did not probe — which is "no cache evidence," and
+    /// `crate::predicates::cache_transparency` treats it as such rather than
+    /// guessing a state.
+    ///
+    /// Not `#[serde(flatten)]`: [`ReadOutcome`] already owns this struct's
+    /// one flatten slot, and a second flattened field would have to be a
+    /// catch-all that swallowed the outcome's own tag. `parse_read_log`
+    /// decodes it by field presence off the line's JSON instead — the same
+    /// mechanism, and the exact one `crate::journal` uses for its four
+    /// payload shapes.
+    #[serde(skip)]
+    pub cache: Option<CacheProbe>,
 }
 
 /// Read-log ingestion failure — fails the run closed, never skipping a bad
@@ -178,9 +284,43 @@ pub fn parse_read_log(path: &Path) -> Result<Vec<ReadRecord>, ReadLogError> {
             source,
         };
         crate::journal::reject_duplicate_keys(raw).map_err(decode_error)?;
-        records.push(serde_json::from_str(raw).map_err(decode_error)?);
+        let mut record: ReadRecord = serde_json::from_str(raw).map_err(decode_error)?;
+        let line: serde_json::Value = serde_json::from_str(raw).map_err(decode_error)?;
+        record.cache = probe_from_line(&line).map_err(decode_error)?;
+        records.push(record);
     }
     Ok(records)
+}
+
+/// Decodes a [`CacheProbe`] off one read-log line when it carries a
+/// `residency_ops_before` field, under exactly the rules
+/// `crate::journal::identity_from_rest` applies to its own key field:
+/// presence decides that a probe is being made, and a probe that does not
+/// fully decode is corruption, not "no probe here" — a half-formed probe
+/// silently read as "unprobed" would drop the one read that actually raced
+/// an eviction out of obligation (c)'s evidence.
+///
+/// Also rejects a probe whose `residency_ops_after` is BELOW its
+/// `residency_ops_before`: the counter is a count of journaled lines and is
+/// monotone by construction, so a decreasing pair means the two samples came
+/// from different journals (or a truncated one) and the read cannot be
+/// placed in any cache state at all.
+fn probe_from_line(line: &serde_json::Value) -> Result<Option<CacheProbe>, serde_json::Error> {
+    match line {
+        serde_json::Value::Object(map) if map.contains_key("residency_ops_before") => {
+            let probe: CacheProbe = serde_json::from_value(line.clone())?;
+            if probe.residency_ops_after < probe.residency_ops_before {
+                return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                    "cache probe on node {} went BACKWARDS ({} → {}) — the residency-op counter \
+                     is a monotone line count, so this pair cannot label one cache state and \
+                     fails closed",
+                    probe.serving_node, probe.residency_ops_before, probe.residency_ops_after
+                )));
+            }
+            Ok(Some(probe))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +427,81 @@ mod tests {
         );
         let err = parse_read_log(file.path()).expect_err("must fail closed");
         assert!(matches!(err, ReadLogError::Decode { line_no: 2, .. }));
+    }
+
+    #[test]
+    fn a_probed_read_carries_its_cache_state_and_its_race() {
+        let file = write_log(
+            "{\"tenant\":\"t\",\"partition\":\"p\",\"concern\":\"complete\",\
+             \"outcome\":\"served\",\"complete_through_ms\":1700,\"record_keys\":[],\
+             \"query\":\"SELECT 1\",\"serving_node\":\"fleet-0-1/1\",\
+             \"residency_ops_before\":12,\"residency_ops_after\":13,\"latency_ms\":4}\n",
+        );
+        let records = parse_read_log(file.path()).expect("parses");
+        let probe = records[0].cache.as_ref().expect("probe present");
+        assert_eq!(probe.serving_node.as_str(), "fleet-0-1/1");
+        assert_eq!(probe.latency_ms, 4);
+        assert!(probe.raced_residency_action());
+    }
+
+    #[test]
+    fn an_unprobed_read_still_parses_and_carries_no_cache_state() {
+        // Non-regression for every read-log line written before #207: the
+        // probe fields are absent, which is "no cache evidence", never a
+        // decode failure.
+        let file = write_log(
+            "{\"tenant\":\"t\",\"partition\":\"p\",\"concern\":\"complete\",\
+             \"outcome\":\"refused\",\"reason\":\"x\"}\n",
+        );
+        let records = parse_read_log(file.path()).expect("parses");
+        assert!(records[0].cache.is_none());
+    }
+
+    #[test]
+    fn a_read_that_did_not_race_a_residency_action_says_so() {
+        let file = write_log(
+            "{\"tenant\":\"t\",\"partition\":\"p\",\"concern\":\"complete\",\
+             \"outcome\":\"served\",\"complete_through_ms\":1,\"record_keys\":[],\
+             \"query\":\"SELECT 1\",\"serving_node\":\"n/1\",\
+             \"residency_ops_before\":7,\"residency_ops_after\":7,\"latency_ms\":1}\n",
+        );
+        let records = parse_read_log(file.path()).expect("parses");
+        assert!(
+            !records[0]
+                .cache
+                .as_ref()
+                .expect("probe")
+                .raced_residency_action()
+        );
+    }
+
+    #[test]
+    fn a_half_formed_cache_probe_fails_closed() {
+        // Would catch a probe that names a cache state but no query being
+        // read as "unprobed" — silently dropping exactly the read that
+        // raced an eviction out of obligation (c)'s evidence.
+        let file = write_log(
+            "{\"tenant\":\"t\",\"partition\":\"p\",\"concern\":\"complete\",\
+             \"outcome\":\"refused\",\"reason\":\"x\",\
+             \"residency_ops_before\":1,\"residency_ops_after\":2}\n",
+        );
+        let err = parse_read_log(file.path()).expect_err("must fail closed");
+        assert!(matches!(err, ReadLogError::Decode { line_no: 1, .. }));
+    }
+
+    #[test]
+    fn a_backwards_cache_probe_fails_closed() {
+        // The counter is a monotone line count: a decreasing pair means the
+        // two samples were not taken from one journal, so the read belongs
+        // to no single cache state and must not be graded as if it did.
+        let file = write_log(
+            "{\"tenant\":\"t\",\"partition\":\"p\",\"concern\":\"complete\",\
+             \"outcome\":\"served\",\"complete_through_ms\":1,\"record_keys\":[],\
+             \"query\":\"SELECT 1\",\"serving_node\":\"n/1\",\
+             \"residency_ops_before\":9,\"residency_ops_after\":3,\"latency_ms\":1}\n",
+        );
+        let err = parse_read_log(file.path()).expect_err("must fail closed");
+        assert!(matches!(err, ReadLogError::Decode { line_no: 1, .. }));
     }
 
     #[test]

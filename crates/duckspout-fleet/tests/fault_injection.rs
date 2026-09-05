@@ -218,6 +218,12 @@ fn phases(lines: &[serde_json::Value]) -> Vec<&str> {
 }
 
 /// Node 0's own real D-6 NDJSON journal, as parsed lines.
+///
+/// Unparseable lines are dropped (`read_ndjson_lines`), so this is for
+/// CONTENT assertions only. An assertion that indexes by physical line
+/// number — one against a fault window's `node_journal_lines` anchors, say —
+/// must read the raw lines itself, or a single dropped line shifts every
+/// index after it.
 fn node0_journal(work_dir: &Path) -> Vec<serde_json::Value> {
     read_ndjson_lines(&work_dir.join("node-0").join("journal.ndjson"))
 }
@@ -979,5 +985,148 @@ fn a_network_partition_cuts_the_real_ingest_the_load_driver_is_sending() {
         disrupted > 0,
         "the load driver's own real traffic must have been cut or refused during the window — \
          zero would mean the load never traversed the link at all: {lines:#?}"
+    );
+}
+
+/// The real §8.4 cache/residency-churn fault (issue #207): a real node,
+/// booted with a shortened `hot.window`, must actually journal real
+/// `DropWindow` lines under sustained load while real Arrow Flight reads run
+/// through it — and the fault window must record both, per event.
+///
+/// # What this proves, and what it deliberately does not
+///
+/// It proves the forcing mechanism is real end to end: the per-node
+/// `hot.window` override reaches the real daemon, the real drain loop
+/// produces real residency actions inside the window, real Flight reads are
+/// served through the same engine while they do, and the fault log carries
+/// the counts a judge would grade. It does NOT assert that `Demote`/`Evict`
+/// fired — nothing in this workspace emits them (`crate::fault`'s
+/// `run_cache_churn` disclosure: v1's cache class is empty by construction,
+/// `docs/design/data-model.md` §2.4) — and asserting a zero there would pin
+/// today's absence as a requirement, so the assertion below is on the
+/// residency TOTAL, which starts biting harder the day the cache class
+/// activates.
+///
+/// Nor does it assert on the reads' latencies: whether a read that raced a
+/// residency action was blocked is `duckspout-judge`'s call over the
+/// evidence (§2.4 obligation (c),
+/// `duckspout_judge::predicates::cache_transparency`), never this runner's
+/// (`crate::main`'s own module docs — this binary is not the judge).
+#[test]
+fn cache_churn_produces_real_residency_actions_while_real_reads_run_through_the_node() {
+    const LOAD_BATCHES: u32 = 60;
+    const LOAD_INTERVAL_MS: u32 = 200;
+
+    let Some(postgres_dsn) = postgres_dsn_from_env() else {
+        eprintln!("fault_injection: DUCKSPOUT_FLEET_TEST_POSTGRES_DSN unset — skipping");
+        return;
+    };
+    let _guard = POSTGRES_CATALOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let work_dir = shared_work_dir();
+
+    // (60 - 1) * 200ms ≈ 11.8s of load wall clock, so the 3s..13s churn
+    // window overlaps the load pass for its whole length — a residency storm
+    // on an idle node would churn nothing.
+    let status = fleet_command(
+        &work_dir,
+        &postgres_dsn,
+        "cache-churn",
+        &[
+            "--allowed-lateness",
+            "1s",
+            "--load-batches",
+            &LOAD_BATCHES.to_string(),
+            "--load-batch-size",
+            "10",
+            "--load-interval-ms",
+            &LOAD_INTERVAL_MS.to_string(),
+            "--settle-timeout-secs",
+            "20",
+            "--fault-cache-churn-node",
+            "0",
+            "--fault-cache-churn-delay-secs",
+            "3",
+            "--fault-cache-churn-duration-secs",
+            "10",
+            "--fault-cache-churn-hot-window",
+            "1s",
+        ],
+    )
+    .status()
+    .expect("spawning duckspout-fleet");
+    eprintln!("duckspout-fleet exited with {status} (not asserted on — see module docs)");
+
+    let lines = window_lines(&work_dir, "cache-churn-0");
+    assert_eq!(
+        phases(&lines),
+        vec!["armed", "started", "ended"],
+        "the cache-churn fault must journal its full lifecycle: {lines:#?}"
+    );
+
+    let observed = &lines[2]["detail"]["residency_actions_during_window"];
+    let total = observed["total"].as_u64().unwrap();
+    assert!(
+        total > 0,
+        "the churn window must have observed at least one real post-drain residency action — \
+         zero means the shortened hot.window never produced a drain inside the window, and the \
+         fault fired vacuously: {lines:#?}"
+    );
+
+    let reads = &lines[2]["detail"]["reads_during_window"];
+    let issued = reads["issued"].as_u64().unwrap();
+    let served = reads["served"].as_u64().unwrap();
+    assert!(
+        issued > 1,
+        "the window must have issued many real Flight reads (got {issued}) — one would mean the \
+         Flight endpoint was never reachable, so nothing ever raced the churn: {lines:#?}"
+    );
+    assert!(
+        served > 0,
+        "at least one real read must have been served through the churning node — zero served of \
+         {issued} issued would mean the reads never reached the read path at all, and the window \
+         proved nothing about §2.4's obligation (c): {lines:#?}"
+    );
+
+    // The node's OWN journal is the ground truth the window's counts are
+    // read from: a count that did not correspond to a real journaled line
+    // would be this runner grading itself. Recount the window's OWN slice of
+    // that journal — the lines between the `Started` line's anchor and the
+    // `Ended` line's — and require exact equality. Comparing the window's
+    // count against the whole file instead can never fail for any defect:
+    // the file is a superset of every window's slice by construction, so
+    // `whole_file >= window` holds even for a count that is pure invention.
+    // RAW lines, not `node0_journal`'s parsed ones: the anchors are counts
+    // of physical lines, and that helper silently drops any line that fails
+    // to parse, which would shift every index after it.
+    let journal_text =
+        std::fs::read_to_string(work_dir.join("node-0").join("journal.ndjson")).unwrap();
+    let journal: Vec<&str> = journal_text.lines().collect();
+    let window_start = lines[1]["detail"]["node_journal_lines"].as_u64().unwrap();
+    let window_end = lines[2]["detail"]["node_journal_lines"].as_u64().unwrap();
+    assert!(
+        window_end >= window_start && window_end <= u64::try_from(journal.len()).unwrap(),
+        "the window's own anchors must bracket a real slice of node 0's journal ({window_start} \
+         → {window_end}, {} lines): {lines:#?}",
+        journal.len()
+    );
+    let residency_in_window = journal
+        .iter()
+        .skip(usize::try_from(window_start).unwrap())
+        .take(usize::try_from(window_end - window_start).unwrap())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| {
+            matches!(
+                line["event"].as_str(),
+                Some("Demote" | "Evict" | "DropWindow")
+            )
+        })
+        .count();
+    assert_eq!(
+        u64::try_from(residency_in_window).unwrap(),
+        total,
+        "the window counted {total} residency action(s), but its own slice of node 0's journal \
+         (lines {window_start}..{window_end}) holds {residency_in_window}"
     );
 }

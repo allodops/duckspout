@@ -692,6 +692,7 @@ mod tests {
                 complete_through_ms: ms,
             }),
             changelog: None,
+            part: None,
         }
     }
 
@@ -726,6 +727,7 @@ mod tests {
                 complete_through_ms: ms,
             }),
             changelog: None,
+            part: None,
         }
     }
 
@@ -738,6 +740,7 @@ mod tests {
                 complete_through_ms,
                 record_keys: keys.iter().map(|k| (*k).to_owned()).collect(),
             },
+            cache: None,
         }
     }
 
@@ -749,6 +752,7 @@ mod tests {
             outcome: ReadOutcome::Refused {
                 reason: "holder unreachable".to_owned(),
             },
+            cache: None,
         }
     }
 
@@ -1010,6 +1014,7 @@ mod tests {
                 complete_through_ms: 2000,
                 record_keys: BTreeSet::new(),
             },
+            cache: None,
         }];
         assert_eq!(check(&journals, &reads), Verdict::Pass { checked: 2 });
     }
@@ -1068,6 +1073,7 @@ mod tests {
             identity: None,
             watermark: None,
             changelog: None,
+            part: None,
         }
     }
 
@@ -1144,6 +1150,7 @@ mod tests {
                 complete_through_ms: 9_999_999,
                 record_keys: BTreeSet::new(),
             },
+            cache: None,
         }];
         // The `available` answer claims an absurd watermark and contains
         // none of the acked records, and neither fact produces a finding —

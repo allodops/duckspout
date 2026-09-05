@@ -1,4 +1,4 @@
-//! Fault-window journaling (§8.4, issues #203 and #204): "each window
+//! Fault-window journaling (§8.4, issues #203, #204 and #207): "each window
 //! journaled with start/end."
 //!
 //! # Why this is a separate channel, not a `TraceEvent` (D-6)
@@ -63,7 +63,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 /// Every fault class §8.4's own fault-window list names — the first two
-/// from issue #203, the rest from #204. Each is a real fault against a real
+/// from issue #203, the next six from #204, and [`FaultKind::CacheChurn`]
+/// from #207. Each is a real fault against a real
 /// process or a real network link, never a simulated one (`crate::fault`'s
 /// and `crate::link`'s module docs for each mechanism).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -106,6 +107,14 @@ pub enum FaultKind {
     /// oscillation is real today and which is blocked on the registry that
     /// does not exist yet).
     DiscoveryFlap,
+    /// A node's post-drain hot residency is churned — real `DropWindow`s
+    /// (and, when the cache class ever activates, real `Demote`/`Evict`s)
+    /// firing under load while real Arrow Flight reads run through the same
+    /// engine (§8.4's "forced Evict/Demote churn and `DropWindow` racing
+    /// queries"; `crate::fault::run_cache_churn`'s module docs for the
+    /// mechanism and for exactly which third of that vocabulary is
+    /// journalable at v0.2).
+    CacheChurn,
 }
 
 /// Where in its lifecycle one fault window is, at the moment a line is
