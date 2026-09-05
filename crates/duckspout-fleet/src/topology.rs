@@ -142,12 +142,35 @@ pub fn node_name(seed: u64, index: u16) -> String {
     format!("fleet-{seed}-{index}")
 }
 
+/// Per-node backend-address overrides: where THIS node reaches the shared
+/// catalog and lake, when the fleet has put a [`crate::link::FaultLink`] in
+/// front of one of them (§8.4, issue #204). `None` means "dial the real
+/// backend directly," which is every node in a run with no network fault
+/// armed against it — the links are created only where a fault needs one,
+/// so an unfaulted run's byte path is exactly what it was before #204.
+#[derive(Debug, Clone, Default)]
+pub struct BackendOverrides {
+    /// Replaces [`FleetPlan::postgres_dsn`]'s host/port for this node
+    /// (`crate::main`'s `rewrite_postgres_dsn_host_port`).
+    pub postgres_dsn: Option<String>,
+    /// Replaces the `lake.s3_endpoint` this node dials — irrelevant under
+    /// [`LakeStorage::Local`], which has no network at all.
+    pub s3_endpoint: Option<String>,
+}
+
 /// Renders `node`'s complete `duckspout-daemon` TOML config against `plan`
 /// and the fleet's other members (for `cluster.seed_peers`) — module docs
 /// on why this is hand-rolled text rather than a `Serialize`d struct.
+/// `overrides` redirects this one node's catalog/lake addresses through the
+/// fleet's fault links where it has any ([`BackendOverrides`]).
 #[must_use]
 #[allow(clippy::unnecessary_debug_formatting)] // `{:?}` quotes/escapes paths for TOML string literals — `.display()` would emit them unquoted and invalid
-pub fn render_node_config(plan: &FleetPlan, node: &NodeSpec, all_nodes: &[NodeSpec]) -> String {
+pub fn render_node_config(
+    plan: &FleetPlan,
+    node: &NodeSpec,
+    all_nodes: &[NodeSpec],
+    overrides: &BackendOverrides,
+) -> String {
     let seed_peers: Vec<String> = all_nodes
         .iter()
         .filter(|peer| peer.index != node.index)
@@ -193,7 +216,10 @@ pub fn render_node_config(plan: &FleetPlan, node: &NodeSpec, all_nodes: &[NodeSp
         peer = node.peer_port,
         rf = plan.rf,
         seed_peers = seed_peers.join(", "),
-        dsn = plan.postgres_dsn,
+        dsn = overrides
+            .postgres_dsn
+            .as_deref()
+            .unwrap_or(&plan.postgres_dsn),
         password_file = plan.postgres_password_file,
         tls = tls_placeholder,
         hot_window = plan.hot_window,
@@ -216,6 +242,7 @@ pub fn render_node_config(plan: &FleetPlan, node: &NodeSpec, all_nodes: &[NodeSp
             secret_access_key_file,
         } => {
             let uri = format!("s3://{bucket}/{prefix}");
+            let endpoint = overrides.s3_endpoint.as_deref().unwrap_or(endpoint);
             let _ = writeln!(
                 out,
                 "uri = {uri:?}\n\
@@ -264,7 +291,7 @@ mod tests {
         let plan = plan_with_local_lake(tmp.join("lake"), password_file);
 
         for node in &nodes {
-            let rendered = render_node_config(&plan, node, &nodes);
+            let rendered = render_node_config(&plan, node, &nodes, &BackendOverrides::default());
             std::fs::write(&node.config_path, &rendered).unwrap();
             let loaded = duckspout_daemon::config::load(Some(&node.config_path))
                 .unwrap_or_else(|e| panic!("node {}: {e}\n---\n{rendered}", node.index));
@@ -314,7 +341,7 @@ mod tests {
             },
             ..plan_with_local_lake(tmp.join("unused"), password_file)
         };
-        let rendered = render_node_config(&plan, &nodes[0], &nodes);
+        let rendered = render_node_config(&plan, &nodes[0], &nodes, &BackendOverrides::default());
         std::fs::write(&nodes[0].config_path, &rendered).unwrap();
         let loaded = duckspout_daemon::config::load(Some(&nodes[0].config_path))
             .unwrap_or_else(|e| panic!("{e}\n---\n{rendered}"));
@@ -322,6 +349,47 @@ mod tests {
         assert_eq!(loaded.lake.s3_endpoint.as_deref(), Some("127.0.0.1:9000"));
         assert_eq!(loaded.lake.s3_access_key_id.as_deref(), Some("duckspout"));
         assert!(loaded.lake.s3_secret_access_key_file.is_some());
+    }
+
+    /// The whole point of [`BackendOverrides`] (issue #204): a node whose
+    /// catalog and lake are reached through fault links must have THOSE
+    /// addresses in its real config — proven through the real loader, so a
+    /// rendering that silently kept the direct address (leaving every
+    /// network fault a no-op against a node that never traverses the link)
+    /// fails here rather than in a fleet run's post-mortem.
+    #[test]
+    fn backend_overrides_redirect_the_catalog_and_lake_through_the_fault_links() {
+        let tmp = tempfile_dir();
+        let password_file = tmp.join("pg-password");
+        std::fs::write(&password_file, "duckspout-dev").unwrap();
+        let secret_file = tmp.join("s3-secret");
+        std::fs::write(&secret_file, "duckspout-dev").unwrap();
+        let nodes = provision_nodes(&tmp, 11, 1, 14317, 18815, 17946, 19095).unwrap();
+        let plan = FleetPlan {
+            lake: LakeStorage::S3 {
+                endpoint: "127.0.0.1:9000".to_owned(),
+                bucket: "duckspout-fleet".to_owned(),
+                prefix: "duckspout-fleet".to_owned(),
+                region: "us-east-1".to_owned(),
+                access_key_id: "duckspout".to_owned(),
+                secret_access_key_file: secret_file,
+            },
+            ..plan_with_local_lake(tmp.join("unused"), password_file)
+        };
+        let overrides = BackendOverrides {
+            postgres_dsn: Some("postgres://duckspout@127.0.0.1:34567/duckspout_catalog".to_owned()),
+            s3_endpoint: Some("127.0.0.1:34568".to_owned()),
+        };
+
+        let rendered = render_node_config(&plan, &nodes[0], &nodes, &overrides);
+        std::fs::write(&nodes[0].config_path, &rendered).unwrap();
+        let loaded = duckspout_daemon::config::load(Some(&nodes[0].config_path))
+            .unwrap_or_else(|e| panic!("{e}\n---\n{rendered}"));
+        assert_eq!(
+            loaded.catalog.dsn,
+            "postgres://duckspout@127.0.0.1:34567/duckspout_catalog"
+        );
+        assert_eq!(loaded.lake.s3_endpoint.as_deref(), Some("127.0.0.1:34568"));
     }
 
     #[test]

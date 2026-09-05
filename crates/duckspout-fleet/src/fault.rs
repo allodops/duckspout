@@ -1,10 +1,38 @@
-//! Fault injectors (§8.4, issue #203): real node kills — including timed to
-//! land inside the real `PutPart`→`LakeCommit` window — and real
-//! `SIGSTOP`/`SIGCONT` pauses (the `FencedZombie` fault). Each injector runs
-//! against a real `duckspout-daemon` process spawned by [`crate::process`],
+//! Fault injectors (§8.4) — every fault class §8.4's own fault-window list
+//! names, across two batches:
+//!
+//! | Fault | §8.4 wording | Injector | Issue |
+//! |---|---|---|---|
+//! | Node kill (incl. mid-drain) | "node kills, including the sharpest one" | [`run_node_kill`] | #203 |
+//! | Process pause | "SIGSTOP long enough to expire claims, then resume" | [`run_sigstop_pause`] | #203 |
+//! | Network partition | "network partitions" | [`run_network_partition`] | #204 |
+//! | Asymmetric degradation | "drops, delay, bandwidth caps" | [`run_network_degradation`] | #204 |
+//! | Membership churn | "join and leave under load, not only crash" | [`run_membership_join`] / [`run_membership_leave`] | #204 |
+//! | Flight-server kill mid-stream | "a hot query's stream dies" | [`run_flight_kill_mid_stream`] | #204 |
+//! | Catalog outage | "ingest must continue undegraded; drains stall and disclose" | [`run_catalog_outage`] | #204 |
+//! | Discovery flapping | "`ClaimAdvertise`/`Heartbeat` oscillation" | [`run_discovery_flap`] | #204 |
+//!
+//! Each injector runs against a real `duckspout-daemon` process spawned by
+//! [`crate::process`] and/or a real network link owned by [`crate::link`],
 //! and journals its own Armed/Started/Ended lifecycle through
 //! [`crate::faultlog::FaultLog`] (§8.4: "each injector keeps its own
 //! armed/fired ledger").
+//!
+//! # The network faults' mechanism
+//!
+//! [`crate::link`]'s module docs carry the whole argument for the userspace
+//! TCP proxy — why not `iptables`/`tc netem`, why a drop resets rather than
+//! silently blackholes, and what a proxy cannot reproduce. The injectors
+//! here are the schedule and the journal on top of it.
+//!
+//! # Two disclosed gaps, both pre-existing composition gaps rather than
+//! anything these injectors chose to skip
+//!
+//! `FencedZombie` (the SIGSTOP pause, below) and the routing-convergence
+//! half of discovery flapping ([`run_discovery_flap`]) both need daemon
+//! composition that does not exist yet — a real `FenceBoot` draw and a
+//! concrete `duckspout_types::Registry` respectively. Each injector's own
+//! docs spell out exactly which half is real today and which is blocked.
 //!
 //! # The mid-drain kill's timing (`KillTiming::MidDrainCommit`)
 //!
@@ -59,7 +87,12 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
+use arrow_flight::Ticket;
+use arrow_flight::flight_service_client::FlightServiceClient;
+
 use crate::faultlog::{FaultKind, FaultLog};
+use crate::link::{FaultLink, LinkConditions, LinkStats};
 use crate::process::{self, RunningNode};
 use crate::topology::NodeSpec;
 
@@ -266,6 +299,686 @@ pub async fn run_sigstop_pause(
     Ok(())
 }
 
+/// Runs one real network-partition fault (§8.4, issue #204): every link in
+/// `links` — a node's real ingest, catalog and lake links, whichever the
+/// fleet created for it — is cut for `duration`, then restored.
+/// [`crate::link`]'s module docs carry the mechanism and its honest
+/// boundary; this function is the schedule and the journal.
+///
+/// The `Ended` line journals each link's own traffic delta ACROSS the
+/// window: `bytes_client_to_server`/`bytes_server_to_client` of zero is the
+/// partition's own proof it really cut traffic, and
+/// `conns_refused`/`conns_cut` above zero is the proof something really
+/// tried to cross it (the raw material #208's vacuity teeth need — a fault
+/// that armed against a link nothing ever used fired vacuously, and this is
+/// what makes that visible after the run).
+///
+/// # Errors
+///
+/// Never — a link condition is set through an in-process handle, with no
+/// signal to fail to deliver and no OS confirmation to fail closed on
+/// (unlike [`run_node_kill`]/[`run_sigstop_pause`]). The `Result` is kept
+/// for signature symmetry with the other injectors, which
+/// `crate::run_armed_faults` composes uniformly.
+pub async fn run_network_partition(
+    fault_id: &str,
+    target: &NodeSpec,
+    links: &[&FaultLink],
+    delay: Duration,
+    duration: Duration,
+    log: &FaultLog,
+) -> anyhow::Result<()> {
+    let target_node = rendered_node_id(target);
+    log.armed(
+        fault_id,
+        FaultKind::NetworkPartition,
+        &target_node,
+        Some(serde_json::json!({
+            "links": link_descriptions(links),
+            "planned_duration_ms": duration.as_millis(),
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(delay).await;
+
+    let before: Vec<LinkStats> = links.iter().map(|link| link.stats()).collect();
+    for link in links {
+        link.set(LinkConditions::dropped());
+    }
+    log.started(
+        fault_id,
+        FaultKind::NetworkPartition,
+        &target_node,
+        Some(serde_json::json!({
+            "links": link_descriptions(links),
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(duration).await;
+
+    let during = link_deltas(links, &before);
+    for link in links {
+        link.restore();
+    }
+    log.ended(
+        fault_id,
+        FaultKind::NetworkPartition,
+        &target_node,
+        Some(serde_json::json!({
+            "link_traffic_during_window": during,
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+    Ok(())
+}
+
+/// Runs one real asymmetric-degradation fault (§8.4, issue #204):
+/// `conditions` (a per-direction delay and/or bandwidth cap — the asymmetry
+/// is the two directions differing) is applied to `link` for `duration`,
+/// then lifted.
+///
+/// # Errors
+///
+/// Never — same reasoning as [`run_network_partition`]'s own `Errors`
+/// section.
+pub async fn run_network_degradation(
+    fault_id: &str,
+    target: &NodeSpec,
+    link: &FaultLink,
+    conditions: LinkConditions,
+    delay: Duration,
+    duration: Duration,
+    log: &FaultLog,
+) -> anyhow::Result<()> {
+    let target_node = rendered_node_id(target);
+    log.armed(
+        fault_id,
+        FaultKind::NetworkDegradation,
+        &target_node,
+        Some(serde_json::json!({
+            "link": link.label(),
+            "conditions": conditions,
+            "planned_duration_ms": duration.as_millis(),
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(delay).await;
+
+    let before = link.stats();
+    link.set(conditions);
+    log.started(
+        fault_id,
+        FaultKind::NetworkDegradation,
+        &target_node,
+        Some(serde_json::json!({
+            "link": link.label(),
+            "conditions": conditions,
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(duration).await;
+
+    let during = link.stats().since(before);
+    link.restore();
+    log.ended(
+        fault_id,
+        FaultKind::NetworkDegradation,
+        &target_node,
+        Some(serde_json::json!({
+            "link": link.label(),
+            "link_traffic_during_window": during,
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+    Ok(())
+}
+
+/// Runs one real catalog-outage fault (§8.4, issue #204): `catalog_link` —
+/// the node's own real link to the shared Postgres catalog — is cut for
+/// `duration`, then restored.
+///
+/// §8.4's own predicate for this fault class is "ingest must continue
+/// undegraded; drains stall and disclose (§4, §9)", so this injector
+/// samples the target's own `/status` disclosure (§9.3.2) at both ends of
+/// the window and journals `drain_stalled` from each sample. That is
+/// evidence for a judge (#208), NOT a verdict: this injector never fails
+/// the fleet run over what it observed there (§8.4: the fleet misbehaves
+/// freely during the run and is convicted afterward from journals).
+///
+/// # The `Ended` phase is the end of the INJECTED CONDITION, not of the
+/// system's degradation
+///
+/// A cut TCP connection to Postgres does not repair itself when the link
+/// comes back: `libpq` (under `DuckLake`'s real `ATTACH`) does not silently
+/// reconnect a broken session, so a drain that stalled inside this window
+/// may well still be stalled after it. That is a real, disclosable property
+/// of the system under test — precisely the kind of thing the post-pass
+/// judge exists to rule on — and this injector deliberately does not paper
+/// over it by, say, restarting the node to make the window "look" closed.
+/// `Ended` means "this injector stopped imposing the condition."
+///
+/// # Errors
+///
+/// Never — same reasoning as [`run_network_partition`]'s own `Errors`
+/// section. A `/status` sample that cannot be fetched is journaled as
+/// `null`, never an error: an unreachable node is itself a finding for the
+/// judge, not a reason for the injector to abort the run.
+pub async fn run_catalog_outage(
+    fault_id: &str,
+    target: &NodeSpec,
+    catalog_link: &FaultLink,
+    delay: Duration,
+    duration: Duration,
+    log: &FaultLog,
+) -> anyhow::Result<()> {
+    let target_node = rendered_node_id(target);
+    log.armed(
+        fault_id,
+        FaultKind::CatalogOutage,
+        &target_node,
+        Some(serde_json::json!({
+            "link": catalog_link.label(),
+            "catalog_upstream": catalog_link.upstream(),
+            "planned_duration_ms": duration.as_millis(),
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(delay).await;
+
+    let before = catalog_link.stats();
+    catalog_link.set(LinkConditions::dropped());
+    log.started(
+        fault_id,
+        FaultKind::CatalogOutage,
+        &target_node,
+        Some(serde_json::json!({
+            "link": catalog_link.label(),
+            "drain_stalled": observed_drain_stalled(target).await,
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(duration).await;
+
+    let during = catalog_link.stats().since(before);
+    let drain_stalled = observed_drain_stalled(target).await;
+    catalog_link.restore();
+    log.ended(
+        fault_id,
+        FaultKind::CatalogOutage,
+        &target_node,
+        Some(serde_json::json!({
+            "link": catalog_link.label(),
+            "link_traffic_during_window": during,
+            "drain_stalled": drain_stalled,
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+    Ok(())
+}
+
+/// One discovery-flapping fault's oscillation schedule.
+#[derive(Debug, Clone, Copy)]
+pub struct FlapSchedule {
+    /// How many down/up cycles to run. Zero is a vacuous flap, journaled
+    /// honestly as `cycles_completed: 0` (§8.4's vacuity teeth), never an
+    /// error.
+    pub cycles: u32,
+    /// How long each cycle holds the link down.
+    pub down: Duration,
+    /// How long each cycle leaves it up again before the next one.
+    pub up: Duration,
+}
+
+/// Runs one real discovery-flapping fault (§8.4, issue #204):
+/// `catalog_link` — the node's link to the catalog DB that holds the
+/// `nodes`/`claims` rows §5.5/§5.7 define — is oscillated down/up for
+/// `cycles` cycles.
+///
+/// # What is real here, and what is blocked (disclosed, not papered over)
+///
+/// §8.4 words this fault class as "discovery flapping
+/// (`ClaimAdvertise`/`Heartbeat` oscillation; routing must converge without
+/// ever serving a `complete` answer it cannot prove)". The catalog link IS
+/// the right link to oscillate: `duckspout_types::Registry` — the port
+/// `ClaimAdvertise` and `FenceBoot`'s incarnation draw both go through — is
+/// defined against "the catalog DB's `nodes`/`claims` tables" (its own
+/// module docs), so a node whose catalog reachability oscillates is exactly
+/// a node whose advertisements and heartbeats land, then don't, then do.
+///
+/// What is NOT observable in today's fleet is the second half of that
+/// sentence, and it is blocked on composition that does not exist yet
+/// rather than on anything this issue could implement:
+/// `duckspout_types::Registry` has **no concrete implementation at all**
+/// (its own module docs: "Home crate: none yet"), so no node writes a claim
+/// row or a heartbeat to the catalog today; membership comes entirely from
+/// static `cluster.seed_peers` config
+/// (`duckspout_daemon::wiring::build_membership_view`), so no routing view
+/// can converge or diverge in response to this oscillation at all. What
+/// this injector therefore delivers today is the REAL oscillation of the
+/// real link — real TCP connections really cut and really restored, on the
+/// real byte path a real registry would use, journaled with real per-cycle
+/// evidence — against a system that does not yet have the registry
+/// behaviour to observe on the other end. Exactly the same shape of gap
+/// #203 disclosed for `FencedZombie` (this module's own docs above), and
+/// the same conclusion: the fault is real now, the predicate becomes
+/// checkable when #53 lands.
+///
+/// # Errors
+///
+/// Never — same reasoning as [`run_network_partition`]'s own `Errors`
+/// section.
+pub async fn run_discovery_flap(
+    fault_id: &str,
+    target: &NodeSpec,
+    catalog_link: &FaultLink,
+    delay: Duration,
+    schedule: FlapSchedule,
+    log: &FaultLog,
+) -> anyhow::Result<()> {
+    let FlapSchedule { cycles, down, up } = schedule;
+    let target_node = rendered_node_id(target);
+    log.armed(
+        fault_id,
+        FaultKind::DiscoveryFlap,
+        &target_node,
+        Some(serde_json::json!({
+            "link": catalog_link.label(),
+            "planned_cycles": cycles,
+            "down_ms": down.as_millis(),
+            "up_ms": up.as_millis(),
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(delay).await;
+
+    let before = catalog_link.stats();
+    log.started(
+        fault_id,
+        FaultKind::DiscoveryFlap,
+        &target_node,
+        Some(serde_json::json!({
+            "link": catalog_link.label(),
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+
+    let mut cycles_completed = 0_u32;
+    for _ in 0..cycles {
+        catalog_link.set(LinkConditions::dropped());
+        tokio::time::sleep(down).await;
+        catalog_link.restore();
+        tokio::time::sleep(up).await;
+        cycles_completed += 1;
+    }
+
+    let during = catalog_link.stats().since(before);
+    // Belt and braces: the loop above always ends on a restore, but a
+    // `cycles` of 0 never entered it at all — the link must be left passing
+    // either way, or every later fault in the schedule would run against a
+    // link this one silently left broken.
+    catalog_link.restore();
+    log.ended(
+        fault_id,
+        FaultKind::DiscoveryFlap,
+        &target_node,
+        Some(serde_json::json!({
+            "link": catalog_link.label(),
+            "cycles_completed": cycles_completed,
+            "link_traffic_during_window": during,
+            "node_journal_lines": node_journal_line_count(&target.journal_path),
+        })),
+    );
+    Ok(())
+}
+
+/// Runs one real membership-LEAVE fault (§8.4, issue #204): `target` is
+/// asked to leave the fleet gracefully under load — a real `SIGTERM`, which
+/// the daemon answers with its own §9.1.2 choreography (readiness flips
+/// false, in-flight gRPC finishes, the drain tick completes), NOT a
+/// `SIGKILL`. §8.4 is explicit that this fault class is "join and leave
+/// under load, **not only crash**": [`run_node_kill`] is the crash;
+/// this is the orderly departure, and the two exercise different code
+/// paths in the node under test.
+///
+/// # Errors
+///
+/// If the `SIGTERM` cannot be sent, or the node does not actually exit
+/// within `grace` — the same fail-closed posture as [`run_node_kill`]'s own
+/// exit confirmation: a "leave" nobody left is not a fault window that
+/// fired.
+pub async fn run_membership_leave(
+    fault_id: &str,
+    target: &mut RunningNode,
+    delay: Duration,
+    grace: Duration,
+    log: &FaultLog,
+) -> anyhow::Result<()> {
+    let target_node = rendered_node_id(&target.spec);
+    log.armed(
+        fault_id,
+        FaultKind::MembershipLeave,
+        &target_node,
+        Some(serde_json::json!({
+            "grace_ms": grace.as_millis(),
+            "node_journal_lines": node_journal_line_count(&target.spec.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(delay).await;
+
+    let pid = process::pid(target);
+    process::send_signal(target, "-TERM").await?;
+    log.started(
+        fault_id,
+        FaultKind::MembershipLeave,
+        &target_node,
+        Some(serde_json::json!({
+            "pid": pid,
+            "signal": "SIGTERM",
+            "node_journal_lines": node_journal_line_count(&target.spec.journal_path),
+        })),
+    );
+
+    let confirmed_exited = process::wait_exited(target, grace).await;
+    log.ended(
+        fault_id,
+        FaultKind::MembershipLeave,
+        &target_node,
+        Some(serde_json::json!({
+            "confirmed_exited": confirmed_exited,
+            "node_journal_lines": node_journal_line_count(&target.spec.journal_path),
+        })),
+    );
+    if !confirmed_exited {
+        anyhow::bail!(
+            "node {target_node} did not complete its graceful shutdown within {grace:?} of \
+             SIGTERM (fault {fault_id})"
+        );
+    }
+    Ok(())
+}
+
+/// Runs one real membership-JOIN fault (§8.4, issue #204): a node process
+/// the fleet provisioned but never booted is really spawned, under load,
+/// and really waited on until its own `/status` reports `ready: true`.
+/// Returns the running node so the caller can fold it into its own
+/// shutdown.
+///
+/// # What "join" means at v0.1 (disclosed)
+///
+/// Membership is static config today — every node's `cluster.seed_peers`
+/// already names every provisioned member, including this one, because
+/// there is no registry to learn membership from (#53;
+/// [`run_discovery_flap`]'s own docs). So what really happens here is the
+/// real half: a real new process appears under load, binds its real ports,
+/// attaches the real shared catalog, boots its real staging engine, and
+/// starts answering. What does NOT happen is a membership VIEW changing in
+/// any already-running node — nothing in today's daemon can observe a join.
+/// The fault is real; the convergence predicate §8.4 pairs with it becomes
+/// checkable when the registry lands.
+///
+/// # Errors
+///
+/// If the node cannot be spawned, or does not become ready within
+/// `boot_timeout` — a join that never joined is not a fault window that
+/// fired (same fail-closed posture as [`run_membership_leave`]).
+pub async fn run_membership_join(
+    fault_id: &str,
+    daemon_bin: &std::path::Path,
+    joiner: &NodeSpec,
+    delay: Duration,
+    boot_timeout: Duration,
+    log: &FaultLog,
+) -> anyhow::Result<RunningNode> {
+    let target_node = rendered_node_id(joiner);
+    log.armed(
+        fault_id,
+        FaultKind::MembershipJoin,
+        &target_node,
+        Some(serde_json::json!({
+            "boot_timeout_ms": boot_timeout.as_millis(),
+            "otlp_port": joiner.otlp_port,
+            "status_port": joiner.status_port,
+        })),
+    );
+
+    tokio::time::sleep(delay).await;
+
+    let mut member = process::spawn_node(daemon_bin, joiner, None)?;
+    log.started(
+        fault_id,
+        FaultKind::MembershipJoin,
+        &target_node,
+        Some(serde_json::json!({ "pid": process::pid(&member) })),
+    );
+
+    let ready = process::wait_until_ready(&mut member, boot_timeout).await;
+    log.ended(
+        fault_id,
+        FaultKind::MembershipJoin,
+        &target_node,
+        Some(serde_json::json!({
+            "confirmed_ready": ready.is_ok(),
+            "node_journal_lines": node_journal_line_count(&joiner.journal_path),
+        })),
+    );
+    match ready {
+        Ok(()) => Ok(member),
+        Err(error) => {
+            // The half-joined process is handed back to nobody, so it must
+            // not be left running: `RunningNode`'s child is `kill_on_drop`,
+            // so dropping it here is the teardown. (`member`, not `joined`
+            // — clippy's `similar_names` against `joiner` above.)
+            drop(member);
+            Err(error.context(format!(
+                "membership-join fault {fault_id}: node {target_node} never became ready"
+            )))
+        }
+    }
+}
+
+/// Runs one real Flight-server-kill-mid-stream fault (§8.4, issue #204):
+/// opens a REAL Arrow Flight `DoGet` against `target`'s real Flight server,
+/// waits until the stream has genuinely started producing data, `SIGKILL`s
+/// the node, and then keeps reading the stream to journal what the client
+/// actually observed.
+///
+/// # Why this lands mid-stream deterministically
+///
+/// `duckspout_daemon::serving`'s `do_get` is collect-then-stream: the whole
+/// result is materialized under the §7.8 guards first, then encoded onto
+/// the wire. So "mid-stream" is a property of the NETWORK phase, and HTTP/2
+/// flow control is what makes it deterministic rather than racy: a server
+/// may only push up to the connection/stream window (64 KiB by default)
+/// ahead of a client that has stopped reading. This injector reads exactly
+/// ONE message, then stops reading while it kills the node — so for any
+/// query whose encoded result comfortably exceeds that window, the server
+/// provably still had unsent data at the moment it died. That is the same
+/// "widen the window instead of racing it" discipline #203's mid-drain kill
+/// used (module docs above), applied to the wire instead of to a commit.
+///
+/// The caller therefore owns the query (`--fault-flight-kill-query`), and
+/// its default is sized for exactly this: see that flag's own doc comment.
+/// A query whose result fits inside the flow-control window is not an
+/// error — it simply produces a `clean_end_of_stream` outcome, journaled
+/// honestly, which a judge reads as "this fault window proved nothing"
+/// rather than as a violation.
+///
+/// # What is journaled, and why the runner never convicts
+///
+/// The `Ended` line carries `terminal_outcome`: `typed_error` (with the
+/// gRPC status code — §7's required shape: "the client's typed error, never
+/// a silently truncated result") or `clean_end_of_stream`, plus how many
+/// Flight messages arrived before and after the kill. Whether a given
+/// outcome is a violation is a judge's call over the journals (#208), not
+/// this injector's: it fails only on things that mean the fault never
+/// fired at all (below).
+///
+/// # Errors
+///
+/// If the Flight server cannot be reached, the `DoGet` itself is refused
+/// (a rejected ticket is a misconfigured query, not a fault window), no
+/// first message arrives within `first_message_timeout`, or the `SIGKILL`
+/// cannot be confirmed — every one of which means the fault did not fire.
+pub async fn run_flight_kill_mid_stream(
+    fault_id: &str,
+    target: &mut RunningNode,
+    query: &str,
+    delay: Duration,
+    first_message_timeout: Duration,
+    log: &FaultLog,
+) -> anyhow::Result<()> {
+    let target_node = rendered_node_id(&target.spec);
+    let endpoint = format!("http://127.0.0.1:{}", target.spec.flight_port);
+    log.armed(
+        fault_id,
+        FaultKind::FlightKillMidStream,
+        &target_node,
+        Some(serde_json::json!({
+            "flight_endpoint": endpoint,
+            "query": query,
+            "node_journal_lines": node_journal_line_count(&target.spec.journal_path),
+        })),
+    );
+
+    tokio::time::sleep(delay).await;
+
+    // `Endpoint::from_shared(...).connect()` + `Client::new(channel)` — the
+    // same construction `duckspout-daemon/tests/flight_e2e.rs` uses against
+    // the real server, rather than the codegen'd `connect` shortcut (which
+    // is gated behind a tonic feature this crate does not enable).
+    let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+        .with_context(|| format!("fault {fault_id}: {endpoint} is not a valid Flight endpoint"))?
+        .connect()
+        .await
+        .with_context(|| format!("fault {fault_id}: connecting to Flight at {endpoint}"))?;
+    let mut client = FlightServiceClient::new(channel);
+    let mut stream = client
+        .do_get(Ticket::new(query.to_owned().into_bytes()))
+        .await
+        .with_context(|| format!("fault {fault_id}: DoGet {query:?} was refused"))?
+        .into_inner();
+
+    // One message, then stop reading: from here the server is blocked on
+    // HTTP/2 flow control with data still to send (module docs).
+    let first = tokio::time::timeout(first_message_timeout, stream.message())
+        .await
+        .with_context(|| {
+            format!(
+                "fault {fault_id}: no Flight message within {first_message_timeout:?} — the \
+                 stream never started, so a kill now would prove nothing"
+            )
+        })?
+        .with_context(|| format!("fault {fault_id}: the Flight stream errored before any data"))?;
+    anyhow::ensure!(
+        first.is_some(),
+        "fault {fault_id}: the Flight stream ended before the kill could land mid-stream \
+         (query {query:?} produced no data at all)"
+    );
+
+    let pid = process::pid(target);
+    process::send_signal(target, "-KILL").await?;
+    log.started(
+        fault_id,
+        FaultKind::FlightKillMidStream,
+        &target_node,
+        Some(serde_json::json!({
+            "pid": pid,
+            "messages_before_kill": 1,
+            "node_journal_lines": node_journal_line_count(&target.spec.journal_path),
+        })),
+    );
+
+    let mut messages_after_kill = 0_u64;
+    let terminal_outcome = loop {
+        match stream.message().await {
+            Ok(Some(_)) => messages_after_kill += 1,
+            Ok(None) => break serde_json::json!({ "terminal_outcome": "clean_end_of_stream" }),
+            Err(status) => {
+                break serde_json::json!({
+                    "terminal_outcome": "typed_error",
+                    "grpc_code": format!("{:?}", status.code()),
+                    "grpc_message": status.message(),
+                });
+            }
+        }
+    };
+
+    let confirmed_exited = process::wait_exited(target, Duration::from_secs(10)).await;
+    log.ended(
+        fault_id,
+        FaultKind::FlightKillMidStream,
+        &target_node,
+        Some(serde_json::json!({
+            "client_outcome": terminal_outcome,
+            "messages_after_kill": messages_after_kill,
+            "confirmed_exited": confirmed_exited,
+            "node_journal_lines": node_journal_line_count(&target.spec.journal_path),
+        })),
+    );
+    if !confirmed_exited {
+        anyhow::bail!(
+            "node {target_node} did not confirm exit within 10s of the Flight-server SIGKILL \
+             (fault {fault_id})"
+        );
+    }
+    Ok(())
+}
+
+/// `(label, upstream)` for every link a fault window covers — the journal's
+/// own record of exactly which real network edges it cut.
+fn link_descriptions(links: &[&FaultLink]) -> Vec<serde_json::Value> {
+    links
+        .iter()
+        .map(|link| serde_json::json!({ "label": link.label(), "upstream": link.upstream() }))
+        .collect()
+}
+
+/// Each link's traffic delta since the matching `before` snapshot, keyed by
+/// label (module docs of [`run_network_partition`] on why this is the
+/// evidence a judge needs).
+fn link_deltas(links: &[&FaultLink], before: &[LinkStats]) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (link, earlier) in links.iter().zip(before) {
+        out.insert(
+            link.label().to_owned(),
+            serde_json::to_value(link.stats().since(*earlier)).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// `drain_stalled` from `target`'s own `/status` (§9.3.2) right now, or
+/// `null` if the node cannot be reached or does not report the field —
+/// best-effort evidence, never an error (module docs of
+/// [`run_catalog_outage`]).
+async fn observed_drain_stalled(target: &NodeSpec) -> serde_json::Value {
+    // Bounded: `process::fetch_status` has no timeout of its own, and a node
+    // that accepts the connection but never answers (a `SIGSTOP`ped one, if
+    // both faults are armed against the same node) would otherwise hang this
+    // fault window open indefinitely — the one thing a start/end-journaled
+    // window must never do.
+    let fetched = tokio::time::timeout(
+        Duration::from_secs(2),
+        process::fetch_status(target.status_addr()),
+    )
+    .await;
+    match fetched {
+        Ok(Ok(snapshot)) => snapshot
+            .get("drain_stalled")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        Ok(Err(_)) | Err(_) => serde_json::Value::Null,
+    }
+}
+
 /// Polls `check(pid)` until it reports `true`, or `timeout` elapses —
 /// best-effort OS-level confirmation that a sent signal actually took
 /// observable effect (module docs above: Linux-only, never a hard error — a
@@ -369,6 +1082,7 @@ mod tests {
 
     use super::*;
     use crate::faultlog::FaultLog;
+    use crate::link;
     use crate::process::test_support;
 
     fn scratch_faultlog(label: &str) -> (std::path::PathBuf, FaultLog) {
@@ -388,6 +1102,441 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    /// Every line of one fault window, in journaled order.
+    fn window_lines(path: &std::path::Path, fault_id: &str) -> Vec<serde_json::Value> {
+        read_ndjson_lines(path)
+            .into_iter()
+            .filter(|line| line["fault_id"] == fault_id)
+            .collect()
+    }
+
+    /// The phases one fault window journaled, in order.
+    fn phases(lines: &[serde_json::Value]) -> Vec<&str> {
+        lines
+            .iter()
+            .map(|line| line["phase"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A [`NodeSpec`] with a chosen `/status` port — the network-fault
+    /// injectors only ever read a target's identity, journal path and
+    /// status address, never its process.
+    fn spec_with_status_port(name: &str, status_port: u16) -> NodeSpec {
+        let mut spec = test_support::dummy_spec();
+        spec.name = name.to_owned();
+        spec.status_port = status_port;
+        // `process::spawn_node` (the join fault) really creates this node's
+        // stdout/stderr files, so the directory holding them must exist —
+        // `dummy_spec` only computes paths.
+        if let Some(parent) = spec.stdout_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        spec
+    }
+
+    /// Binds a real listener answering every request with `body` — the same
+    /// hand-rolled `/status` stand-in `crate::process`'s and `crate::main`'s
+    /// own tests use, so no real daemon is needed to exercise the
+    /// disclosure sampling.
+    async fn spawn_fake_status_server(body: &'static str) -> u16 {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    /// The partition fault, end to end against a REAL link and a REAL
+    /// upstream: traffic crosses before the window, is refused DURING it,
+    /// crosses again after it — and the journal's own per-window traffic
+    /// delta says exactly that (zero bytes forwarded, a refused connection
+    /// counted). Would catch an injector that journaled a window it never
+    /// actually imposed, or one that forgot to restore the link.
+    #[tokio::test]
+    async fn network_partition_really_cuts_the_link_for_exactly_its_window() {
+        let port = link::test_support::spawn_echo_server().await;
+        let link = FaultLink::bind("n0-ingest", "127.0.0.1", port)
+            .await
+            .unwrap();
+        let spec = spec_with_status_port("partition-node", 0);
+        let (path, log) = scratch_faultlog("partition");
+
+        link::test_support::echo_round_trip(&link, b"before")
+            .await
+            .expect("the link must carry traffic before the fault");
+
+        let partitioned = [&link];
+        let during = tokio::join!(
+            run_network_partition(
+                "network-partition-0",
+                &spec,
+                &partitioned,
+                Duration::ZERO,
+                Duration::from_millis(400),
+                &log,
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                link::test_support::echo_round_trip(&link, b"during").await
+            }
+        );
+        during.0.unwrap();
+        assert!(
+            during.1.is_err(),
+            "traffic must not cross a partitioned link"
+        );
+
+        link::test_support::echo_round_trip(&link, b"after")
+            .await
+            .expect("the link must be restored when the window ends");
+
+        let lines = window_lines(&path, "network-partition-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        let traffic = &lines[2]["detail"]["link_traffic_during_window"]["n0-ingest"];
+        assert_eq!(
+            traffic["bytes_client_to_server"], 0,
+            "no byte may cross during the window: {lines:#?}"
+        );
+        assert_eq!(
+            traffic["conns_refused"], 1,
+            "the refused connection is the window's own evidence: {lines:#?}"
+        );
+    }
+
+    /// The asymmetric-degradation fault: the conditions it journals are the
+    /// conditions it actually imposed (a real, measurable delay on the
+    /// configured direction), and the link is left clean afterwards.
+    #[tokio::test]
+    async fn network_degradation_imposes_and_then_lifts_the_journaled_conditions() {
+        let port = link::test_support::spawn_echo_server().await;
+        let link = FaultLink::bind("n0-ingest", "127.0.0.1", port)
+            .await
+            .unwrap();
+        let spec = spec_with_status_port("degrade-node", 0);
+        let (path, log) = scratch_faultlog("degrade");
+        let conditions = LinkConditions {
+            client_to_server: link::LinkCondition::Delay { ms: 300 },
+            server_to_client: link::LinkCondition::Pass,
+        };
+
+        let (fault, probe) = tokio::join!(
+            run_network_degradation(
+                "network-degradation-0",
+                &spec,
+                &link,
+                conditions,
+                Duration::ZERO,
+                Duration::from_millis(600),
+                &log,
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                link::test_support::echo_round_trip(&link, b"slowed").await
+            }
+        );
+        fault.unwrap();
+        let degraded = probe.expect("a degraded link still carries traffic, just slowly");
+        assert!(
+            degraded >= Duration::from_millis(300),
+            "the journaled delay must actually be imposed, took {degraded:?}"
+        );
+
+        let restored = link::test_support::echo_round_trip(&link, b"fast")
+            .await
+            .unwrap();
+        assert!(
+            restored < Duration::from_millis(300),
+            "the condition must be lifted when the window ends, took {restored:?}"
+        );
+
+        let lines = window_lines(&path, "network-degradation-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        assert_eq!(
+            lines[1]["detail"]["conditions"]["client_to_server"]["condition"],
+            "delay"
+        );
+        assert_eq!(
+            lines[1]["detail"]["conditions"]["client_to_server"]["ms"],
+            300
+        );
+        assert_eq!(
+            lines[1]["detail"]["conditions"]["server_to_client"]["condition"], "pass",
+            "the asymmetry must be journaled as asymmetric: {lines:#?}"
+        );
+    }
+
+    /// The catalog outage journals the target's OWN disclosed
+    /// `drain_stalled` (§9.3.2) at both ends of the window — the evidence
+    /// §8.4's "drains stall and disclose" predicate is judged from. Would
+    /// catch an injector that journaled a hardcoded value instead of
+    /// actually reading the node's disclosure.
+    #[tokio::test]
+    async fn catalog_outage_journals_the_targets_own_disclosed_drain_status() {
+        let port = link::test_support::spawn_echo_server().await;
+        let link = FaultLink::bind("n0-catalog", "127.0.0.1", port)
+            .await
+            .unwrap();
+        let status_port =
+            spawn_fake_status_server(r#"{"ready":true,"drain_stalled":true,"watermarks":[]}"#)
+                .await;
+        let spec = spec_with_status_port("catalog-node", status_port);
+        let (path, log) = scratch_faultlog("catalog-outage");
+
+        run_catalog_outage(
+            "catalog-outage-0",
+            &spec,
+            &link,
+            Duration::ZERO,
+            Duration::from_millis(100),
+            &log,
+        )
+        .await
+        .unwrap();
+
+        let lines = window_lines(&path, "catalog-outage-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        assert_eq!(lines[1]["detail"]["drain_stalled"], true);
+        assert_eq!(lines[2]["detail"]["drain_stalled"], true);
+        link::test_support::echo_round_trip(&link, b"after")
+            .await
+            .expect("the catalog link must be restored when the window ends");
+    }
+
+    /// A node that cannot be reached at all journals `null` rather than
+    /// failing the run — an unreachable node is a finding for the judge,
+    /// never a reason for the injector to abort (its own module docs).
+    #[tokio::test]
+    async fn catalog_outage_journals_a_null_drain_status_for_an_unreachable_node() {
+        let port = link::test_support::spawn_echo_server().await;
+        let link = FaultLink::bind("n0-catalog", "127.0.0.1", port)
+            .await
+            .unwrap();
+        // Port 1: privileged, never listening in this sandbox — the same
+        // convention `backend_check`'s own closed-port test uses.
+        let spec = spec_with_status_port("unreachable-node", 1);
+        let (path, log) = scratch_faultlog("catalog-outage-null");
+
+        run_catalog_outage(
+            "catalog-outage-0",
+            &spec,
+            &link,
+            Duration::ZERO,
+            Duration::from_millis(50),
+            &log,
+        )
+        .await
+        .unwrap();
+
+        let lines = window_lines(&path, "catalog-outage-0");
+        assert!(lines[1]["detail"]["drain_stalled"].is_null());
+        assert!(lines[2]["detail"]["drain_stalled"].is_null());
+    }
+
+    /// Discovery flapping really oscillates the link — every configured
+    /// cycle, journaled as completed — and leaves it UP at the end. Would
+    /// catch an off-by-one in the cycle loop, or a flap that left the
+    /// catalog link dropped for every later fault in the schedule.
+    #[tokio::test]
+    async fn discovery_flap_runs_every_cycle_and_leaves_the_link_up() {
+        let port = link::test_support::spawn_echo_server().await;
+        let link = FaultLink::bind("n0-catalog", "127.0.0.1", port)
+            .await
+            .unwrap();
+        let spec = spec_with_status_port("flap-node", 0);
+        let (path, log) = scratch_faultlog("flap");
+
+        run_discovery_flap(
+            "discovery-flap-0",
+            &spec,
+            &link,
+            Duration::ZERO,
+            FlapSchedule {
+                cycles: 3,
+                down: Duration::from_millis(30),
+                up: Duration::from_millis(30),
+            },
+            &log,
+        )
+        .await
+        .unwrap();
+
+        let lines = window_lines(&path, "discovery-flap-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        assert_eq!(lines[2]["detail"]["cycles_completed"], 3);
+        link::test_support::echo_round_trip(&link, b"after")
+            .await
+            .expect("a flap must end with the link up");
+    }
+
+    /// Zero cycles is a vacuous flap — journaled honestly as
+    /// `cycles_completed: 0` (the shape #208's vacuity teeth read) with the
+    /// link untouched, rather than silently dropping it forever.
+    #[tokio::test]
+    async fn a_zero_cycle_flap_journals_its_own_vacuity_and_leaves_the_link_up() {
+        let port = link::test_support::spawn_echo_server().await;
+        let link = FaultLink::bind("n0-catalog", "127.0.0.1", port)
+            .await
+            .unwrap();
+        let spec = spec_with_status_port("flap-node", 0);
+        let (path, log) = scratch_faultlog("flap-zero");
+
+        run_discovery_flap(
+            "discovery-flap-0",
+            &spec,
+            &link,
+            Duration::ZERO,
+            FlapSchedule {
+                cycles: 0,
+                down: Duration::from_millis(30),
+                up: Duration::from_millis(30),
+            },
+            &log,
+        )
+        .await
+        .unwrap();
+
+        let lines = window_lines(&path, "discovery-flap-0");
+        assert_eq!(lines[2]["detail"]["cycles_completed"], 0);
+        link::test_support::echo_round_trip(&link, b"after")
+            .await
+            .expect("a zero-cycle flap must leave the link untouched");
+    }
+
+    /// The membership-leave fault against a REAL process: a real `SIGTERM`
+    /// (not `SIGKILL` — §8.4's own "not only crash" distinction), confirmed
+    /// to have actually ended the process before `Ended` claims it did.
+    #[tokio::test]
+    async fn membership_leave_sends_a_real_sigterm_and_confirms_the_exit() {
+        let mut node = test_support::spawn_sleep(30);
+        let (path, log) = scratch_faultlog("leave");
+
+        run_membership_leave(
+            "membership-leave-0",
+            &mut node,
+            Duration::ZERO,
+            Duration::from_secs(5),
+            &log,
+        )
+        .await
+        .unwrap();
+
+        let lines = window_lines(&path, "membership-leave-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        assert_eq!(lines[1]["detail"]["signal"], "SIGTERM");
+        assert_eq!(lines[2]["detail"]["confirmed_exited"], true);
+    }
+
+    /// The fail-closed half: a node that IGNORES `SIGTERM` must journal
+    /// `confirmed_exited: false` and return an error — a "leave" nobody
+    /// left is not a fault window that fired. Proven against a real
+    /// process that really traps the signal, not a stub.
+    #[tokio::test]
+    async fn membership_leave_fails_closed_when_the_node_ignores_sigterm() {
+        let mut node = test_support::spawn_ignoring_sigterm();
+        let (path, log) = scratch_faultlog("leave-ignored");
+
+        let result = run_membership_leave(
+            "membership-leave-0",
+            &mut node,
+            Duration::ZERO,
+            Duration::from_millis(300),
+            &log,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a node that never left must not report a clean leave window"
+        );
+        let lines = window_lines(&path, "membership-leave-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        assert_eq!(lines[2]["detail"]["confirmed_exited"], false);
+    }
+
+    /// The membership-join fault's fail-closed path: a "node" that never
+    /// reports ready must journal `confirmed_ready: false` and return an
+    /// error, rather than handing back a half-joined process the caller
+    /// would treat as a fleet member. (The success path needs a real
+    /// `duckspout-daemon` binary and a real catalog — it is covered by
+    /// `tests/fault_injection.rs`, which spawns both for real.)
+    #[tokio::test]
+    async fn membership_join_fails_closed_when_the_node_never_becomes_ready() {
+        let joiner = spec_with_status_port("joiner", 1);
+        let (path, log) = scratch_faultlog("join-never-ready");
+
+        // `/bin/true` "boots" and exits immediately, never serving
+        // `/status` — `process::wait_until_ready`'s own early-exit branch.
+        let result = run_membership_join(
+            "membership-join-0",
+            std::path::Path::new("/bin/true"),
+            &joiner,
+            Duration::ZERO,
+            Duration::from_secs(2),
+            &log,
+        )
+        .await;
+
+        assert!(result.is_err(), "a join that never joined must fail closed");
+        let lines = window_lines(&path, "membership-join-0");
+        assert_eq!(phases(&lines), vec!["armed", "started", "ended"]);
+        assert_eq!(lines[2]["detail"]["confirmed_ready"], false);
+    }
+
+    /// The Flight-kill fault must fail closed BEFORE killing anything when
+    /// the stream it is supposed to interrupt never exists — otherwise it
+    /// would kill a node and journal a "mid-stream" window with no stream
+    /// in it at all. Proven by asserting the target is still alive
+    /// afterwards, and that only the `Armed` line was journaled.
+    #[tokio::test]
+    async fn flight_kill_fails_closed_without_killing_when_no_flight_server_answers() {
+        let mut node = test_support::spawn_sleep(30);
+        node.spec.flight_port = 1; // privileged, never listening
+        let pid = process::pid(&node).unwrap();
+        let (path, log) = scratch_faultlog("flight-kill-no-server");
+
+        let result = run_flight_kill_mid_stream(
+            "flight-kill-mid-stream-0",
+            &mut node,
+            "SELECT 1",
+            Duration::ZERO,
+            Duration::from_millis(500),
+            &log,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an unreachable Flight server must fail the fault, not fire it"
+        );
+        assert!(
+            process::is_live_running(pid).unwrap_or(false),
+            "the target must NOT have been killed by a fault that never fired"
+        );
+        assert_eq!(
+            phases(&window_lines(&path, "flight-kill-mid-stream-0")),
+            vec!["armed"]
+        );
+        process::send_signal(&node, "-KILL").await.unwrap();
     }
 
     /// The exact HIGH-severity ACPR finding, reproduced end to end through

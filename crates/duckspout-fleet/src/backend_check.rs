@@ -7,38 +7,14 @@
 //! failing here, once, with a clear pointer at `deploy/compose/`, is cheaper
 //! to diagnose and matches this repo's stated stance that an absent
 //! real-backend endpoint is a red result, not a quietly skipped one.
+//!
+//! DSN parsing itself lives in [`crate::dsn`] — one home shared with #204's
+//! catalog fault links, which must rewrite the same addresses this module
+//! probes.
 
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-
-/// Parses a `postgres://` / `postgresql://` libpq-style DSN's host and port
-/// (default 5432) — just enough to open a bare TCP probe, not a full URI
-/// parser (userinfo, query params, and the database path are all
-/// irrelevant to "is anything listening here").
-///
-/// # Errors
-///
-/// If `dsn` has no recognizable `://` scheme separator.
-pub fn postgres_host_port(dsn: &str) -> anyhow::Result<(String, u16)> {
-    let after_scheme = dsn
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .with_context(|| format!("postgres DSN {dsn:?} has no scheme separator"))?;
-    // Authority ends at the first '/' (database path) or '?' (params);
-    // userinfo (`user[:pass]@`) precedes the host, so take the part after
-    // the LAST '@' (a password is never expected here in practice, but a
-    // literal '@' in one would still resolve to the right host).
-    let authority = after_scheme
-        .split(['/', '?'])
-        .next()
-        .unwrap_or(after_scheme);
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    Ok(match host_port.rsplit_once(':') {
-        Some((host, port)) => (host.to_owned(), port.parse().unwrap_or(5432)),
-        None => (host_port.to_owned(), 5432),
-    })
-}
 
 /// Parses an S3-endpoint `host:port` pair (the same `ENDPOINT` convention
 /// `duckspout-lake-ducklake::S3Access::endpoint` documents — no scheme).
@@ -92,28 +68,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn postgres_dsn_host_port_parses_the_compose_dsn() {
-        let (host, port) =
-            postgres_host_port("postgres://duckspout@127.0.0.1:5432/duckspout_catalog").unwrap();
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 5432);
-    }
-
-    #[test]
-    fn postgres_dsn_host_port_defaults_the_port_when_absent() {
-        let (host, port) = postgres_host_port("postgres://user@dbhost/db").unwrap();
-        assert_eq!(host, "dbhost");
-        assert_eq!(port, 5432);
-    }
-
-    #[test]
-    fn postgres_dsn_host_port_handles_no_userinfo() {
-        let (host, port) = postgres_host_port("postgresql://127.0.0.1:5433/x").unwrap();
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 5433);
-    }
-
-    #[test]
     fn s3_endpoint_host_port_parses_the_compose_endpoint() {
         let (host, port) = s3_host_port("127.0.0.1:9000").unwrap();
         assert_eq!(host, "127.0.0.1");
@@ -150,13 +104,6 @@ mod tests {
             result.is_ok(),
             "expected success against a real listener: {result:?}"
         );
-    }
-
-    /// `postgres_host_port` fails closed on a DSN with no `scheme://`
-    /// separator instead of silently misparsing it as a bare host.
-    #[test]
-    fn postgres_dsn_host_port_rejects_a_dsn_with_no_scheme() {
-        assert!(postgres_host_port("127.0.0.1:5432/duckspout_catalog").is_err());
     }
 
     /// `s3_host_port` fails closed on an endpoint missing the `:port`

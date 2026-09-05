@@ -323,7 +323,7 @@ fn stderr_tail(path: &std::path::Path) -> String {
 /// [`Child`], not a real `duckspout-daemon` boot.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{Command, NodeSpec, RunningNode};
+    use super::{Command, NodeSpec, RunningNode, Stdio};
 
     /// A minimal [`NodeSpec`] for fault-signal tests — its paths are never
     /// actually read/written by a real daemon, only carried for
@@ -361,6 +361,34 @@ pub(crate) mod test_support {
             .kill_on_drop(true)
             .spawn()
             .expect("spawning `sleep` (must be on PATH)");
+        RunningNode {
+            spec: dummy_spec(),
+            child,
+        }
+    }
+
+    /// Spawns a REAL process that really IGNORES `SIGTERM` (`trap '' TERM`)
+    /// and then sleeps — the exact precondition
+    /// `crate::fault::run_membership_leave`'s fail-closed path needs: a
+    /// node asked to leave gracefully that simply does not. Only `SIGTERM`
+    /// is trapped, so `RunningNode`'s own `kill_on_drop` `SIGKILL` still
+    /// reaps it at the end of a test.
+    pub(crate) fn spawn_ignoring_sigterm() -> RunningNode {
+        let child = Command::new("sh")
+            .arg("-c")
+            // `sleep 5`, not 30, and with null stdio: the `sleep` is a
+            // GRANDchild, so `kill_on_drop`'s `SIGKILL` of the shell does
+            // not reap it — inheriting the test harness's stdout pipe would
+            // make `cargo nextest` report the test as leaky until it exited
+            // on its own. 5s is far longer than any grace period this
+            // fault's tests use.
+            .arg("trap '' TERM; sleep 5")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning `sh` (must be on PATH)");
         RunningNode {
             spec: dummy_spec(),
             child,

@@ -1,5 +1,5 @@
-//! Fault-window journaling (§8.4, issue #203): "each window journaled with
-//! start/end."
+//! Fault-window journaling (§8.4, issues #203 and #204): "each window
+//! journaled with start/end."
 //!
 //! # Why this is a separate channel, not a `TraceEvent` (D-6)
 //!
@@ -26,12 +26,17 @@
 //! channel inconsistent depending on which fault kind fired, so this module
 //! is deliberately ONE small, informal, fleet-runner-owned NDJSON channel
 //! (`faults.ndjson`, one file per fleet run, shared across every injector)
-//! for BOTH fault kinds uniformly — not a per-kind mix of "amend D-6 where
+//! for EVERY fault kind uniformly — not a per-kind mix of "amend D-6 where
 //! there is a variant, informal channel where there isn't." Amending the
 //! frozen D-6 vocabulary to add a `SigstopPause` correspondence would be a
 //! settled-decision amendment (`AGENTS.md`: "never re-litigate\[d\] in
 //! PRs"), not a mechanical fix available inside this issue's scope, so this
-//! module does not attempt it for either fault kind.
+//! module does not attempt it for any fault kind. #204's own additions only
+//! sharpen the argument: a network partition, a bandwidth cap and a
+//! catalog outage are conditions imposed on a node's *environment* from
+//! outside, with no §3.3 node action to correspond to at all
+//! (`duckspout_types::EnvironmentEvent` has no variant for any of them
+//! either).
 //!
 //! # Shape
 //!
@@ -57,9 +62,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-/// The two fault classes this issue implements (§8.4's own list has five
-/// total; #204 covers the other three — partitions, membership churn,
-/// catalog outages, discovery flapping, Flight-server kill).
+/// Every fault class §8.4's own fault-window list names — the first two
+/// from issue #203, the rest from #204. Each is a real fault against a real
+/// process or a real network link, never a simulated one (`crate::fault`'s
+/// and `crate::link`'s module docs for each mechanism).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FaultKind {
@@ -70,6 +76,36 @@ pub enum FaultKind {
     /// A real `SIGSTOP`, held for a configured duration, then `SIGCONT`
     /// (the `FencedZombie` fault, `crate::fault`'s module docs).
     SigstopPause,
+    /// Every real network link a node has is cut for the window's duration
+    /// (§8.4's "network partitions"; `crate::link`'s module docs on what a
+    /// userspace proxy can and cannot reproduce).
+    NetworkPartition,
+    /// A node's real link degraded rather than cut — per-direction delay
+    /// and/or bandwidth cap (§8.4's "asymmetric degradation").
+    NetworkDegradation,
+    /// A running node leaves the fleet gracefully under load — a real
+    /// `SIGTERM` and the daemon's own §9.1.2 shallow-drain shutdown, NOT a
+    /// crash (§8.4's "membership churn: join and leave under load, not only
+    /// crash").
+    MembershipLeave,
+    /// A new node process joins the fleet under load: really spawned,
+    /// really booted, really confirmed ready.
+    MembershipJoin,
+    /// A real `SIGKILL` of the node serving a real, in-flight Arrow Flight
+    /// hot query — §8.4's "Flight-server kill mid-stream," with the
+    /// client's own observed outcome journaled (§7: a typed error, never a
+    /// silently truncated result).
+    FlightKillMidStream,
+    /// A node's real link to the Postgres catalog is cut for the window's
+    /// duration (§8.4's "catalog outage windows"; the node's own
+    /// `/status` disclosure is sampled inside the window as evidence).
+    CatalogOutage,
+    /// A node's real catalog link oscillates up/down for a configured
+    /// number of cycles (§8.4's "discovery flapping"; `crate::fault`'s
+    /// module docs for exactly which half of `ClaimAdvertise`/`Heartbeat`
+    /// oscillation is real today and which is blocked on the registry that
+    /// does not exist yet).
+    DiscoveryFlap,
 }
 
 /// Where in its lifecycle one fault window is, at the moment a line is
