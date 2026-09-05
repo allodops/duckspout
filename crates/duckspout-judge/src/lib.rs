@@ -3,6 +3,18 @@
 //! the parsing and checking logic is unit-testable without a real fleet run
 //! (mirroring `duckspout-loadgen`'s own lib/bin split).
 //!
+//! # Evidence in, verdicts out
+//!
+//! | Module | Role |
+//! |---|---|
+//! | [`journal`] | the fleet's + loadgen's NDJSON journals, and the payload shapes decoded off them |
+//! | [`read_log`] | the query client's served-read log — reads have no §3 action, so they cannot ride a journal ([`read_log`]'s own docs) |
+//! | [`summary`] | the loadgen's run-summary sidecar, the vacuity check on the evidence itself |
+//! | [`final_state`] | read-back of the final system: per-record presence, and each changelog dataset's served latest view |
+//! | [`predicates`] | one pure function per §8.4 judge, over that evidence |
+//! | [`verdict`] | the shared three-valued verdict and the 0/2/3 exit contract |
+//! | [`runner`] | the pipeline `main.rs` calls: ingest → vacuity check → every predicate |
+//!
 //! # Crate-placement note (#205)
 //!
 //! This infrastructure lives here, in the judge's own crate, rather than in
@@ -45,5 +57,7 @@
 pub mod final_state;
 pub mod journal;
 pub mod predicates;
+pub mod read_log;
 pub mod runner;
 pub mod summary;
+pub mod verdict;

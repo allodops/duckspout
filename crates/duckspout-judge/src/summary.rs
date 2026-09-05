@@ -289,7 +289,11 @@ mod tests {
                 record_count: 1,
                 first_index: 0,
                 source_incarnation: "loadgen-0-1000".to_owned(),
+                partition: None,
+                max_event_time_ms: None,
             }),
+            watermark: None,
+            changelog: None,
         }
     }
 
@@ -312,6 +316,8 @@ mod tests {
                 seq: 0,
                 event: TraceEvent::Accept,
                 identity: None,
+                watermark: None,
+                changelog: None,
             }],
         };
         assert_eq!(

@@ -44,10 +44,8 @@ use duckspout_types::TraceEvent;
 
 use crate::final_state::FinalSystemState;
 use crate::journal::{JournalSet, RequestIdentity};
-
-/// The reserved system-tenant prefix (§2.2): `_self`/`_canary`, and any
-/// future `_`-prefixed system tenant.
-const SYSTEM_TENANT_PREFIX: char = '_';
+use crate::predicates::SYSTEM_TENANT_PREFIX;
+use crate::verdict::Verdict;
 
 /// One acked request whose record range was not entirely present in the
 /// final system.
@@ -62,32 +60,28 @@ pub struct AckedLostFinding {
     pub missing_indices: BTreeSet<u64>,
 }
 
-/// The predicate's own three-valued verdict (§8.4's vacuity teeth). Kept
-/// local to this predicate rather than folded into one crate-wide `Verdict`
-/// shared by every predicate: how a multi-predicate run's verdicts combine
-/// (must all five pass? reported individually?) is #206/#207/#208's
-/// territory, not decided by this issue. `crate::main` maps this to the
-/// judge binary's own `EXIT_CONTRACT` (0/2/3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ZeroAckedLostVerdict {
-    /// At least one non-system-tenant `ClientAck` was checked, and every
-    /// one's full record range was present.
-    Pass {
-        /// How many acked requests were checked.
-        checked: usize,
-    },
-    /// At least one acked request's record range was not entirely present.
-    Violation(Vec<AckedLostFinding>),
-    /// No non-system-tenant `ClientAck` was journaled by any loadgen member
-    /// — this predicate had nothing to check, so it must not report a
-    /// vacuous `Pass` (§8.4's vacuity teeth: "a judge that never rejects
-    /// anything is indistinguishable from one too weak to reject
-    /// anything") — OR a final-system query itself failed partway through
-    /// (ACPR MEDIUM-5(b)): a query failure is not proof of absence, so the
-    /// whole run's verdict is withheld rather than letting a transient
-    /// infra hiccup masquerade as either a `Pass` or a `Violation`.
-    NoVerdict(String),
+impl std::fmt::Display for AckedLostFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request {} (tenant {}): acked but missing from the final system at indices {:?}",
+            self.request_id, self.tenant, self.missing_indices
+        )
+    }
 }
+
+/// This predicate's three-valued verdict (§8.4's vacuity teeth).
+///
+/// #205 defined this as its own enum, deferring "how a multi-predicate
+/// run's verdicts combine" to #206/#207/#208. #206 answered that in
+/// `crate::verdict`, so this is now an alias of the shared, finding-generic
+/// [`Verdict`] — same three values, same variant names, same exit contract,
+/// one implementation instead of three. Its meanings are unchanged:
+/// `Pass { checked }` counts non-system-tenant acks whose full record range
+/// was present; `NoVerdict` covers both "nothing to check" and a
+/// final-system query that itself failed (ACPR MEDIUM-5(b): a query failure
+/// is not proof of absence).
+pub type ZeroAckedLostVerdict = Verdict<AckedLostFinding>;
 
 /// True iff `identity` is real, checkable evidence: a non-system tenant
 /// (§2.2) whose ack actually covers at least one record. A `record_count:
@@ -192,9 +186,15 @@ pub fn check<S: FinalSystemState>(journals: &JournalSet, final_state: &S) -> Zer
     }
 
     if findings.is_empty() {
-        ZeroAckedLostVerdict::Pass {
-            checked: acks.len(),
-        }
+        // `acks` is non-empty here (the early return above), so this is
+        // always a real `Pass`; going through `Verdict::pass` anyway keeps
+        // the "a pass must have checked something" rule in exactly one
+        // place for every predicate (`crate::verdict`).
+        ZeroAckedLostVerdict::pass(
+            acks.len(),
+            "no checkable ClientAck remained after the §2.2 system-tenant and empty-range \
+             exclusions (§8.4 vacuity teeth)",
+        )
     } else {
         ZeroAckedLostVerdict::Violation(findings)
     }
@@ -230,7 +230,11 @@ mod tests {
                 record_count,
                 first_index,
                 source_incarnation: source_incarnation.to_owned(),
+                partition: None,
+                max_event_time_ms: None,
             }),
+            watermark: None,
+            changelog: None,
         }
     }
 
@@ -442,7 +446,11 @@ mod tests {
                     record_count: 5,
                     first_index: 0,
                     source_incarnation: "loadgen-0-1000".to_owned(),
+                    partition: None,
+                    max_event_time_ms: None,
                 }),
+                watermark: None,
+                changelog: None,
             }],
         };
         let final_state = InMemoryFinalState::new(); // nothing present
