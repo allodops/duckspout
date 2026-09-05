@@ -75,7 +75,7 @@
 //! that expires uncovered changelog parts would only have to journal one
 //! more `Expire` line, for a snapshot that was never in any lake, claiming
 //! whatever coverage it needed (ACPR finding MEDIUM-3, with an executed
-//! repro — now [`tests::a_journaled_snapshot_expiry_does_not_vouch_for_an_expiry`]).
+//! repro — now the `a_journaled_snapshot_expiry_does_not_vouch_for_an_expiry` test).
 //! Read-back is the one piece of evidence the expiring node does not write.
 //!
 //! An earlier draft of this module took the covering set to be
@@ -97,8 +97,8 @@
 //! A partition whose only covering snapshot is gone from the lake with no
 //! successor is not a false positive: it is a partition whose expired
 //! changelog parts really have no committed covering snapshot, which is
-//! precisely Keep Rule 10's charge
-//! ([`tests::a_rolled_over_snapshots_successor_is_what_acquits_the_expiry`]).
+//! precisely Keep Rule 10's charge (the
+//! `a_rolled_over_snapshots_successor_is_what_acquits_the_expiry` test).
 //!
 //! # What this judge deliberately does NOT convict
 //!

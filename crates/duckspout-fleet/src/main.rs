@@ -198,7 +198,7 @@ struct Cli {
     /// an idle fleet, which is worst for the churn fault — "a residency
     /// storm on an idle node churns nothing"
     /// ([`fault::run_cache_churn`]) — but weakens every other one too.
-    /// [`the_default_churn_window_overlaps_the_default_load_pass`] pins the
+    /// `the_default_churn_window_overlaps_the_default_load_pass` pins the
     /// arithmetic (ACPR finding MEDIUM-6).
     #[arg(long, default_value_t = 60)]
     load_batches: u32,

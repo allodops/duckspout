@@ -80,7 +80,7 @@
 //!
 //! # Obligation (c)'s evidence is scoped per serving node AND per concern
 //!
-//! [`LockQuestion`] — what obligation (c) groups its evidence by — is
+//! `LockQuestion` — what obligation (c) groups its evidence by — is
 //! `(serving_node, tenant, partition, query, concern)`. The last two
 //! coordinates were ACPR findings (HIGH-2 and HIGH-1), and each of them was
 //! a real false positive rather than a tidiness point:
@@ -178,7 +178,7 @@ use crate::verdict::Verdict;
 /// the same posture `crate::summary::DEFAULT_MAX_AMBIGUOUS_FRACTION` takes.
 pub const DEFAULT_MAX_RACING_READ_MS: u64 = 1_000;
 
-/// How many unraced SERVED reads of one [`LockQuestion`] are needed before
+/// How many unraced SERVED reads of one `LockQuestion` are needed before
 /// their median is used as obligation (c)'s relative bar (module docs'
 /// self-calibration note for why a median rather than a maximum, and why
 /// three rather than one).
