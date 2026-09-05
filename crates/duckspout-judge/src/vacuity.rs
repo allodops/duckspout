@@ -81,8 +81,17 @@
 //! only ever answer one way is indistinguishable from a broken one until its
 //! producer arrives, and nobody should have to rediscover which of the two
 //! this is. The rule is exercised end-to-end today by the seeded-replay
-//! fixture and its unit tests; the gate it guards arms with `ctk-distributed`
-//! (staged, nightly, v0.2), by which point the producer is in scope.
+//! fixture and its unit tests.
+//!
+//! The `ctk-distributed` gate it guards is now ARMED (nightly, issue #58) —
+//! and armed while this gap is open on purpose, which is worth saying
+//! plainly rather than leaving to be inferred: the nightly run's verdict is
+//! `NoVerdict` until a peer transport lands, so the job is red every night
+//! until then. Waiting for the producer before arming would have meant
+//! shipping a distributed tier whose absence nothing measured; arming it now
+//! means the tier states, every night and in the open, exactly what it
+//! cannot yet certify. That is this rule doing its job, not the gate
+//! failing to do its own.
 
 use std::collections::BTreeSet;
 

@@ -1,10 +1,11 @@
 # nightly.yml — armed nightly gates (SEED s§6.3).
 #
-# Armed: hack-features (bootstrap), tla-sim (#48), mutation-floor (#49).
+# Armed: hack-features (bootstrap), tla-sim (#48), mutation-floor (#49),
+# ctk-distributed (#58).
 # Staged nightly jobs are NOT present here — each is a staged ledger row in
 # docs/arming-ledger.toml and arms by protected-set PR at its milestone:
-#   ctk-distributed (v0.2) / ctk-release-gate (v0.3) · bench-card (v0.4,
-#   docs/bench/methodology.md must exist first).
+#   ctk-release-gate (v0.3) · bench-card (v0.4, docs/bench/methodology.md
+#   must exist first).
 name: Nightly
 
 on:
@@ -155,5 +156,183 @@ jobs:
           EOF
           gh api "repos/${REPO}/issues" \
             -f title="Red nightly mutation-floor run" \
+            -F body=@"${RUNNER_TEMP}/body.md" \
+            -f "labels[]=blocked"
+
+  # §8.4's distributed CTK tier (ledger row ctk-distributed, issue #58): real
+  # multi-node duckspout-fleet runs against real MinIO + Postgres, each with a
+  # journaling duckspout-loadgen member and a fault schedule, each graded
+  # afterwards by the separate duckspout-judge binary. The gate is the JUDGE'S
+  # exit code — 0 Pass / 2 Violation / 3 NoVerdict, and NoVerdict is never a
+  # pass (§8.4's vacuity teeth) — which `just ctk-distributed` forwards, so
+  # this job's own conclusion carries the verdict rather than flattening it.
+  #
+  # Backends: the same images, credentials and start-up dance as ci.yml's
+  # conformance job — MinIO by hand (`docker run`) because it needs a command
+  # override the `services:` block has no field for, Postgres as an ordinary
+  # service container. Nightly, not per-PR, exactly as §8.4 says ("too heavy
+  # for per-PR"): the release build alone is the smoke gate's own 60-minute
+  # allowance, and five multi-node fault profiles run after it.
+  ctk-distributed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      # The judge's own exit code, so the red-issue job below can file
+      # SEPARATE issues for a Violation and for a NoVerdict. That distinction
+      # is load-bearing rather than cosmetic: this tier is expected to report
+      # NoVerdict every night until the producers behind its predicates land
+      # (duckspout_judge::vacuity's disclosed gap), and a filer deduped on
+      # "red" alone would let that standing issue swallow the first real
+      # Violation in silence.
+      verdict_code: ${{ steps.judge.outputs.verdict_code }}
+    services:
+      postgres:
+        image: postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+        env:
+          POSTGRES_USER: duckspout
+          # Dev/CI-only credential for a loopback-bound container; never a
+          # production value (secrets are file paths, §9.5 — the fleet runner
+          # writes this one to a file under its work dir and hands the daemons
+          # that path).
+          POSTGRES_PASSWORD: duckspout-dev
+          POSTGRES_DB: duckspout_catalog
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U duckspout -d duckspout_catalog"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Start MinIO (dev/CI-only lake backend)
+        run: |
+          docker run -d --name duckspout-minio -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=duckspout \
+            -e MINIO_ROOT_PASSWORD=duckspout-dev \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data --console-address ":9001"
+          until docker exec duckspout-minio mc ready local; do sleep 2; done
+      - name: Create the fleet MinIO bucket
+        # The fleet runner does not create buckets (`--s3-bucket`'s own docs)
+        # and neither does scripts/ctk-distributed.mjs, so it is made here.
+        # Same authenticated-alias mechanics as ci.yml's conformance job.
+        run: docker exec -e MC_HOST_local=http://duckspout:duckspout-dev@127.0.0.1:9000 duckspout-minio mc mb --ignore-existing local/duckspout-fleet
+      - name: Run the distributed CTK tier (the judge's exit code IS the gate)
+        id: judge
+        env:
+          # libpq's KEYWORD/VALUE form, carrying no password: DuckLake's real
+          # ATTACH does not parse the postgres:// URI form at all (issue
+          # #212), and the password travels separately as a file path (§9.5).
+          DUCKSPOUT_CTK_POSTGRES_DSN: "postgres:host=127.0.0.1 port=5432 dbname=duckspout_catalog user=duckspout"
+          DUCKSPOUT_CTK_POSTGRES_PASSWORD: duckspout-dev
+          DUCKSPOUT_CTK_S3_ENDPOINT: 127.0.0.1:9000
+          DUCKSPOUT_CTK_S3_BUCKET: duckspout-fleet
+          DUCKSPOUT_CTK_S3_ACCESS_KEY_ID: duckspout
+          DUCKSPOUT_CTK_S3_SECRET_ACCESS_KEY: duckspout-dev
+        # `just ctk-distributed` forwards the judge's own 0/2/3 exit code
+        # (scripts/ctk-distributed.mjs). It is recorded BEFORE this step
+        # re-raises it, so the job still fails on 2 and on 3 while the
+        # red-issue job below can still tell the two apart.
+        run: |
+          code=0
+          just ctk-distributed || code=$?
+          echo "verdict_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      - name: Upload the run artifacts (journals, fault ledgers, manifests)
+        # `if: always()`: the runs worth reading back are exactly the ones that
+        # did not pass. §8.4 grades from journals, so the journals ARE the
+        # report — a red verdict with its evidence discarded is unactionable.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ctk-distributed-runs
+          # The evidence only: journals, the injectors' fault ledgers, the run
+          # manifests, the loadgen run summaries, and each node's stderr. NOT
+          # the whole work dir — that also holds every node's DuckDB staging
+          # store, which is large and which nothing here reads back.
+          path: |
+            target/ctk-distributed/**/*.ndjson
+            target/ctk-distributed/**/run.json
+            target/ctk-distributed/**/*.summary.json
+            target/ctk-distributed/**/stderr.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  # A red nightly must not scroll by unseen: file a `blocked` issue so the
+  # dispatcher surfaces it before assigning new work (s§9.4) — the same
+  # discipline the two filers above apply, with one deliberate difference.
+  # The two above dedupe on a single title, because for them "red" has one
+  # meaning. Here it has two, and the judge's exit code says which: Violation
+  # (2) is a proven defect, NoVerdict (3) is a run that certified nothing.
+  # This tier is EXPECTED to report NoVerdict nightly until the producers
+  # behind its predicates land, so a single-title dedupe would let that
+  # standing issue silently swallow the first real Violation. Each verdict
+  # therefore gets its own title, and each dedupes only against its own kind.
+  ctk-distributed-red-issue:
+    needs: [ctk-distributed]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File the blocking issue for the red ctk-distributed run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERDICT_CODE: ${{ needs.ctk-distributed.outputs.verdict_code }}
+        run: |
+          set -euo pipefail
+          case "${VERDICT_CODE}" in
+            2) verdict="Violation" ;;
+            3) verdict="NoVerdict" ;;
+            # No recorded code means the job died before the judge ever spoke
+            # (a backend that never came up, a build failure, the 180-minute
+            # timeout). That is a broken harness, and calling it a verdict
+            # would be inventing one.
+            *) verdict="harness failure" ;;
+          esac
+          title="Red nightly ctk-distributed run: ${verdict}"
+          # Matched here rather than inside the jq filter so the title stays a
+          # shell variable: `gh --jq` takes no --arg, and interpolating it into
+          # the filter would be building a jq program out of a shell string.
+          open=$(gh api "repos/${REPO}/issues?labels=blocked&state=open" \
+            --jq '.[].title' | grep -Fxc "$title" || true)
+          if [ "$open" -gt 0 ]; then
+            echo "an open '${title}' issue already exists; not filing another"
+            exit 0
+          fi
+          cat > "${RUNNER_TEMP}/body.md" <<EOF
+          The nightly distributed CTK tier (docs/verification.md §8.4; ledger
+          row ctk-distributed, issue #58) reported **${verdict}**: ${RUN_URL}
+
+          The judge's own per-predicate report is in the job log, and it is
+          the thing to read first — it names which predicates and which
+          run-level vacuity rules produced this verdict.
+
+          - **Violation (judge exit 2)** is a proven defect: a journaled
+            ClientAck whose record is missing from the final system, a
+            watermark served over coverage the journals show did not exist,
+            and so on. Fix forward or revert the causing change.
+          - **NoVerdict (judge exit 3)** means the run certified nothing —
+            an armed fault that never fired, no observed cross-node
+            contention, an ambiguous-outcome fraction over the ceiling, a
+            node whose journals simply stopped, or a predicate whose evidence
+            has no producer yet. It accuses nothing and it certifies nothing,
+            and §8.4 is explicit that it is never a pass.
+
+          The evidence set (per-node journals, the loadgen journal,
+          faults.ndjson, run.json) is attached to the run as the
+          \`ctk-distributed-runs\` artifact. Reproduce locally with real
+          backends up: \`just ctk-distributed\` — the job's own env block
+          carries the exact backend settings CI uses.
+          EOF
+          gh api "repos/${REPO}/issues" \
+            -f title="$title" \
             -F body=@"${RUNNER_TEMP}/body.md" \
             -f "labels[]=blocked"

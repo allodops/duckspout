@@ -6,15 +6,22 @@
 //! injectors, [`link`] for the real network faults' mechanism,
 //! [`faultlog`] for the `faults.ndjson` window journal), and #208 added the
 //! run manifest ([`runlog`], `run.json`) the judge's §8.4 run-level vacuity
-//! rules need. Still absent: the real `duckspout-loadgen` internals (#202).
-//! Those follow-ons plug into the seams this binary establishes:
+//! rules need. Issue #58 (the `ctk-distributed` gate's arming) made the
+//! `--loadgen-bin` member real: it is now spawned CONCURRENTLY with the
+//! fault schedule and the drive-load pass, with the journal path
+//! `duckspout-loadgen` requires, and its failure is a fleet failure
+//! ([`run_loadgen`]). Each of those plugged into the seams this binary
+//! establishes:
 //! [`topology`] provisions real
 //! `duckspout-daemon` processes with distinct identities against a shared
 //! real Postgres catalog and (by default) a real `MinIO` bucket;
 //! [`process`] boots and supervises them, journaling each one's real §3.3
 //! events as NDJSON (`duckspout_ctk::trace_writer::NdjsonTraceWriter`, wired
-//! through `duckspout-daemon`'s new `--trace-out`); [`load`] is the
-//! placeholder drive-load driver §8.4's own text licenses until #202 lands.
+//! through `duckspout-daemon`'s new `--trace-out`); [`load`] is the runner's
+//! own non-journaling drive-load driver, which puts every node under load —
+//! deliberately NOT the same thing as the journaling client member
+//! [`run_loadgen`] spawns, which points at one node and is the only source
+//! of the `ClientAck` evidence the judge's zero-acked-lost predicate reads.
 //!
 //! This binary reports its own smoke-loop status (booted / load accepted /
 //! watermarks advanced) — it is explicitly NOT the §8.4 judge: it makes no
@@ -85,10 +92,18 @@ struct Cli {
     daemon_bin: Option<PathBuf>,
 
     /// Optional path to the `duckspout-loadgen` binary (issue #202): when
-    /// given, spawned as an additional fleet member pointed at node 0
-    /// (§8.4: "the load generator is a first-class fleet member"). Its
-    /// stub currently exits 2 immediately ("not yet implemented") — this
-    /// fleet run logs that, but never fails on it.
+    /// given, spawned as an additional fleet member pointed at node 0 and
+    /// run concurrently with the fault schedule (§8.4: "the load generator
+    /// is a first-class fleet member"). It journals to
+    /// `<work_dir>/fleet-loadgen-0.ndjson`, which is the ONLY source of the
+    /// `ClientAck` evidence the judge's zero-acked-lost predicate reads —
+    /// so a loadgen that was asked for and did not run is a fleet failure,
+    /// never a warning ([`run_loadgen`]).
+    ///
+    /// Node 0 is its target, which is why no fault profile should point a
+    /// node-killing `--fault-*` flag at index 0: the write-side witness
+    /// losing its own endpoint is a fault on the test harness, not on
+    /// `DuckSpout`.
     #[arg(long)]
     loadgen_bin: Option<PathBuf>,
 
@@ -511,6 +526,12 @@ const FLIGHT_KILL_DEFAULT_QUERY: &str = "SELECT i FROM range(0, 2000000) t(i)";
 const CACHE_CHURN_DEFAULT_QUERY: &str =
     "SELECT count(*) FROM duckspout_windows WHERE staged_bytes >= 0";
 
+/// The `--loadgen-bin` member's node id, and the stem of its journal file
+/// under `work_dir` ([`run_loadgen`]). Fixed rather than a flag: this runner
+/// spawns exactly one loadgen, and `duckspout-loadgen`'s own `--node-id` docs
+/// require uniqueness only ACROSS instances.
+const LOADGEN_NODE_ID: &str = "fleet-loadgen-0";
+
 /// This runner's own smoke-loop status codes — **not** `duckspout-judge`'s
 /// future Pass(0)/Violation(2)/NoVerdict(3) vocabulary (§8.4's vacuity-teeth
 /// section); deliberately a disjoint scheme so nobody mistakes one for the
@@ -559,37 +580,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         check_backends(&cli).await?;
     }
 
-    let plan = build_plan(&cli, &work_dir)?;
-
-    if cli.nodes == 0 {
-        bail!("--nodes 0: nothing to boot");
-    }
-    // Before any node is rendered or booted: the churn target's config is
-    // written a few lines below, and a no-op override would produce a fleet
-    // that looks right and forces nothing.
-    if cli.fault_cache_churn_node.is_some() {
-        churn_hot_window_forces_something(&cli)?;
-    }
-    // `--fault-churn-join` provisions ONE extra member (§8.4's membership
-    // join): it gets a config, an identity and a slot in every other node's
-    // `cluster.seed_peers` up front, but `boot_fleet` below never starts it
-    // — `fault::run_membership_join` does, mid-run, under load.
-    let nodes = topology::provision_nodes(
-        &work_dir,
-        cli.seed,
-        cli.nodes + u16::from(cli.fault_churn_join),
-        cli.otlp_base_port,
-        cli.flight_base_port,
-        cli.peer_base_port,
-        cli.status_base_port,
-    )?;
-    let links = build_fault_links(&cli, &nodes).await?;
-    for node in &nodes {
-        let overrides = node_overrides(&cli, node.index, links.get(&node.index))?;
-        let rendered = topology::render_node_config(&plan, node, &nodes, &overrides);
-        std::fs::write(&node.config_path, rendered)
-            .with_context(|| format!("writing {}", node.config_path.display()))?;
-    }
+    let (nodes, links) = provision_and_render(&cli, &work_dir).await?;
     let (booted_nodes, joiner_nodes) = nodes.split_at(cli.nodes as usize);
 
     let mut running: Vec<process::RunningNode> = Vec::with_capacity(nodes.len());
@@ -598,10 +589,6 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
         report_work_dir(&work_dir);
         return Err(error);
-    }
-
-    if let Some(loadgen_bin) = cli.loadgen_bin.as_deref() {
-        spawn_loadgen_best_effort(loadgen_bin, &nodes[0]).await;
     }
 
     let progress = std::sync::Arc::new(runlog::JournalProgress::new());
@@ -623,10 +610,11 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         links: &links,
         log: &fault_log,
     };
-    let (fault_result, load_results, drain_confirmed) = tokio::join!(
+    let (fault_result, load_results, drain_confirmed, loadgen_result) = tokio::join!(
         run_armed_faults(&fault_run, &mut running),
         drive_load_all(booted_nodes, &cli, &links),
         wait_for_any_watermark(booted_nodes, Duration::from_secs(cli.settle_timeout_secs)),
+        run_loadgen(&cli, &work_dir, &booted_nodes[0]),
     );
     let joined = match fault_result {
         Ok(joined) => joined,
@@ -636,6 +624,19 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
             report_work_dir(&work_dir);
             return Err(error);
+        }
+    };
+    // Deliberately NOT an early return like the fault arm above: the fleet
+    // itself ran, so the manifest, the summary and the teardown below all
+    // still have to happen — a run whose client witness died is exactly the
+    // run whose artifacts an operator most needs left behind. The failure is
+    // raised after them ([`run_loadgen`]'s own docs for why it is a failure
+    // at all).
+    let (loadgen_journal, loadgen_error) = match loadgen_result {
+        Ok(journal) => (journal, None),
+        Err(error) => {
+            tracing::error!(%error, "the duckspout-loadgen fleet member failed");
+            (None, Some(error))
         }
     };
     // A node that joined mid-run is a fleet member from here on — it must be
@@ -650,9 +651,18 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     shutdown_all(&mut running, Duration::from_secs(cli.shutdown_grace_secs)).await;
     write_run_manifest(&work_dir, &manifest);
 
-    print_summary(booted_nodes, &load_results, drain_confirmed, &work_dir);
+    print_summary(
+        booted_nodes,
+        &load_results,
+        drain_confirmed,
+        &work_dir,
+        loadgen_journal.as_deref(),
+    );
     report_work_dir(&work_dir);
 
+    if let Some(error) = loadgen_error {
+        return Err(error);
+    }
     if !all_accepted {
         bail!(ALL_ACCEPTED_FAILURE);
     }
@@ -665,6 +675,54 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         return Ok(EXIT_DRAIN_UNCONFIRMED);
     }
     Ok(EXIT_OK)
+}
+
+/// Provisions every node's identity, ports and directories, builds the fault
+/// links their configs must point through, and writes each rendered config —
+/// everything [`run`] must have on disk before `boot_fleet` starts a single
+/// process.
+///
+/// # Errors
+///
+/// If `--nodes 0` was given, if a `--fault-cache-churn-node` override would
+/// render a byte-identical config (a fault that forces nothing), or if
+/// provisioning, link setup or writing a config fails.
+async fn provision_and_render(
+    cli: &Cli,
+    work_dir: &std::path::Path,
+) -> anyhow::Result<(Vec<NodeSpec>, FleetLinks)> {
+    let plan = build_plan(cli, work_dir)?;
+
+    if cli.nodes == 0 {
+        bail!("--nodes 0: nothing to boot");
+    }
+    // Before any node is rendered or booted: the churn target's config is
+    // written a few lines below, and a no-op override would produce a fleet
+    // that looks right and forces nothing.
+    if cli.fault_cache_churn_node.is_some() {
+        churn_hot_window_forces_something(cli)?;
+    }
+    // `--fault-churn-join` provisions ONE extra member (§8.4's membership
+    // join): it gets a config, an identity and a slot in every other node's
+    // `cluster.seed_peers` up front, but `boot_fleet` never starts it —
+    // `fault::run_membership_join` does, mid-run, under load.
+    let nodes = topology::provision_nodes(
+        work_dir,
+        cli.seed,
+        cli.nodes + u16::from(cli.fault_churn_join),
+        cli.otlp_base_port,
+        cli.flight_base_port,
+        cli.peer_base_port,
+        cli.status_base_port,
+    )?;
+    let links = build_fault_links(cli, &nodes).await?;
+    for node in &nodes {
+        let overrides = node_overrides(cli, node.index, links.get(&node.index))?;
+        let rendered = topology::render_node_config(&plan, node, &nodes, &overrides);
+        std::fs::write(&node.config_path, rendered)
+            .with_context(|| format!("writing {}", node.config_path.display()))?;
+    }
+    Ok((nodes, links))
 }
 
 /// Starts the run manifest's per-node journal-progress sampler (§8.4/#208,
@@ -1458,35 +1516,98 @@ async fn wait_for_any_watermark(nodes: &[NodeSpec], timeout: Duration) -> bool {
     }
 }
 
-/// Best-effort loadgen spawn (§8.4: "the load generator is a first-class
-/// fleet member" — CLI seam only, module docs of [`main`]). Its current
-/// stub exits 2 immediately; that is logged, never treated as a fleet
-/// failure.
-async fn spawn_loadgen_best_effort(loadgen_bin: &std::path::Path, target_node: &NodeSpec) {
-    let target = target_node.otlp_addr();
-    let output = tokio::process::Command::new(loadgen_bin)
-        .arg("--node-id")
-        .arg("fleet-loadgen-0")
-        .arg("--target")
-        .arg(&target)
-        .output()
-        .await;
-    match output {
-        Ok(output) if output.status.success() => {
-            tracing::info!("duckspout-loadgen ran to completion");
-        }
-        Ok(output) => {
-            tracing::info!(
-                status = %output.status,
-                stderr = %String::from_utf8_lossy(&output.stderr),
-                "duckspout-loadgen exited non-zero — expected while it is still a stub \
-                 (issue #202); not treated as a fleet failure"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(%error, "could not spawn duckspout-loadgen (--loadgen-bin path wrong?)");
-        }
+/// Runs the `--loadgen-bin` fleet member for the length of the drive-load
+/// pass, or returns `Ok(None)` when the flag was not given.
+///
+/// §8.4: "the load generator is a first-class fleet member: it journals every
+/// request sent and every `ClientAck` received, with payload identity — the
+/// verifying client is part of the test, not an afterthought." Three
+/// consequences, each of which this function is the enforcement of:
+///
+/// - **It journals.** `duckspout-loadgen --journal-path` has no default and
+///   refuses an existing path; a run-scoped path under `work_dir` is
+///   therefore not a convenience but the only way the process starts at all.
+///   Before issue #58 this call passed no `--journal-path`, so every
+///   `--loadgen-bin` run died on a `clap` usage error — which the
+///   best-effort arm it replaced then logged as the stub's expected exit.
+/// - **It runs during the faults.** The caller `tokio::join!`s this with
+///   `run_armed_faults` and `drive_load_all`; a client that finished before
+///   the first fault window opened would witness nothing §8.4 cares about.
+/// - **Its absence is loud.** Its journal is the only `ClientAck` evidence
+///   `duckspout_judge`'s zero-acked-lost predicate has. A run that was asked
+///   for a client witness and silently got none still looks like a clean
+///   fleet run, so this returns `Err` instead of warning.
+///
+/// # Errors
+///
+/// If the loadgen cannot be spawned, or exits non-zero.
+async fn run_loadgen(
+    cli: &Cli,
+    work_dir: &std::path::Path,
+    target_node: &NodeSpec,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(loadgen_bin) = cli.loadgen_bin.as_deref() else {
+        return Ok(None);
+    };
+    let journal_path = work_dir.join(format!("{LOADGEN_NODE_ID}.ndjson"));
+    let argv = loadgen_argv(cli, target_node, &journal_path);
+    tracing::info!(
+        target = %target_node.otlp_addr(),
+        journal = %journal_path.display(),
+        argv = ?argv,
+        "starting the duckspout-loadgen fleet member"
+    );
+    let status = tokio::process::Command::new(loadgen_bin)
+        .args(&argv)
+        .status()
+        .await
+        .with_context(|| format!("spawning {}", loadgen_bin.display()))?;
+    if !status.success() {
+        bail!(
+            "duckspout-loadgen ({}) exited {status}: the client witness §8.4 requires did not run, \
+             so this fleet run has no ClientAck evidence to be judged on",
+            loadgen_bin.display()
+        );
     }
+    Ok(Some(journal_path))
+}
+
+/// The argv [`run_loadgen`] spawns `duckspout-loadgen` with — a pure
+/// function so the contract with that binary's CLI is unit-testable without
+/// a child process, which is exactly the contract issue #58 found broken:
+/// `--journal-path` has no default there and the process refuses to start
+/// without one, so the argv that omitted it made every `--loadgen-bin` run
+/// die on a `clap` usage error.
+fn loadgen_argv(cli: &Cli, target_node: &NodeSpec, journal_path: &std::path::Path) -> Vec<String> {
+    let mut argv = vec![
+        "--node-id".to_owned(),
+        LOADGEN_NODE_ID.to_owned(),
+        "--target".to_owned(),
+        target_node.otlp_addr(),
+        "--journal-path".to_owned(),
+        journal_path.display().to_string(),
+        "--duration-secs".to_owned(),
+        loadgen_duration_secs(cli).to_string(),
+    ];
+    // Same tenant as the runner's own drive load when one was chosen: a
+    // tenant is what a partition is keyed by (`Cli::tenant`), so a client
+    // witness sending under a different one would be attesting to acks in a
+    // partition nothing else in the run touches.
+    if let Some(tenant) = cli.tenant.as_deref() {
+        argv.push("--tenant".to_owned());
+        argv.push(tenant.to_owned());
+    }
+    argv
+}
+
+/// How long [`run_loadgen`]'s member sends for: the runner's own drive-load
+/// pass, derived rather than given its own flag so the two client-side passes
+/// cannot drift apart into a run where one has stopped and the other has not.
+/// Rounded up, and never zero — `--duration-secs 0` would send nothing and
+/// journal nothing, which is a vacuous witness.
+fn loadgen_duration_secs(cli: &Cli) -> u64 {
+    let millis = u64::from(cli.load_batches).saturating_mul(cli.load_interval_ms);
+    millis.div_ceil(1_000).max(1)
 }
 
 async fn shutdown_all(running: &mut [process::RunningNode], grace: Duration) {
@@ -1501,6 +1622,7 @@ fn print_summary(
     load_results: &[load::LoadResult],
     drain_confirmed: bool,
     work_dir: &std::path::Path,
+    loadgen_journal: Option<&std::path::Path>,
 ) {
     println!("\nduckspout-fleet smoke-loop summary");
     println!("==================================");
@@ -1516,6 +1638,10 @@ fn print_summary(
             result.records_accepted,
             node.journal_path.display(),
         );
+    }
+    match loadgen_journal {
+        Some(path) => println!("  loadgen member journal: {} (§8.4)", path.display()),
+        None => println!("  loadgen member: none (--loadgen-bin not given)"),
     }
     println!(
         "  drain confirmed (any node's watermark advanced): {}",
@@ -1899,35 +2025,121 @@ mod tests {
         );
     }
 
-    /// `spawn_loadgen_best_effort`'s own contract (module docs): a
-    /// successfully-run loadgen is logged, never propagated as a failure —
-    /// there is nothing to assert on besides "this never panics regardless
-    /// of outcome," which IS the actual behavioral contract for a function
-    /// with no return value whose whole job is best-effort logging.
+    /// No `--loadgen-bin` is not a failure: a fleet run without a client
+    /// witness is a legitimate (and, before issue #58, the only) shape.
     #[tokio::test]
-    async fn spawn_loadgen_best_effort_never_panics_on_a_successful_exit() {
-        let node = test_node_spec("loadgen-ok", 0, 0);
-        spawn_loadgen_best_effort(std::path::Path::new("/bin/true"), &node).await;
+    async fn run_loadgen_is_a_no_op_without_the_flag() {
+        let cli = base_cli("loadgen-absent");
+        let node = test_node_spec("loadgen-absent", 0, 0);
+        let dir = std::env::temp_dir().join("duckspout-fleet-test-loadgen-absent");
+        assert!(
+            run_loadgen(&cli, &dir, &node)
+                .await
+                .expect("no --loadgen-bin is not an error")
+                .is_none(),
+            "no flag must report no journal rather than inventing a path"
+        );
     }
 
-    /// The non-zero-exit arm (the loadgen stub's current documented
-    /// behavior, issue #202) must also be swallowed, not propagated.
+    /// The argv is the actual contract with `duckspout-loadgen`, and the bug
+    /// issue #58 fixed lived entirely in it: the old call passed neither
+    /// `--journal-path` (which has no default there, and without which the
+    /// process refuses to start) nor a bounded `--duration-secs`, so every
+    /// `--loadgen-bin` run died on a `clap` usage error the best-effort arm
+    /// then logged as the stub's expected exit.
+    ///
+    /// This pins the VALUES. That these flag names are the ones
+    /// `duckspout-loadgen`'s `clap` derive actually accepts cannot be pinned
+    /// from this crate — that binary's `Cli` is private to its own `main.rs`,
+    /// and adding a crate edge to reach it would be a real dependency for a
+    /// test — so it is pinned instead by the fact that a usage error is now
+    /// a FLEET failure ([`run_loadgen`]), exercised end to end on every
+    /// `ctk-distributed` nightly run (`scripts/ctk-distributed.mjs`).
+    #[test]
+    fn the_loadgen_argv_carries_the_journal_path_target_duration_and_tenant() {
+        let mut cli = base_cli("loadgen-argv");
+        cli.tenant = Some("ctk-argv".to_owned());
+        let node = test_node_spec("loadgen-argv", 0, 4317);
+        let journal = std::path::Path::new("/tmp/ctk/fleet-loadgen-0.ndjson");
+
+        assert_eq!(
+            loadgen_argv(&cli, &node, journal),
+            vec![
+                "--node-id",
+                "fleet-loadgen-0",
+                "--target",
+                "http://127.0.0.1:4317",
+                "--journal-path",
+                "/tmp/ctk/fleet-loadgen-0.ndjson",
+                // 60 batches * 200 ms: the drive-load pass's own length.
+                "--duration-secs",
+                "12",
+                "--tenant",
+                "ctk-argv",
+            ]
+        );
+    }
+
+    /// No `--tenant` means single-tenant mode's `anonymous` (`Cli::tenant`),
+    /// which is `duckspout-loadgen`'s business to default — this runner must
+    /// not invent a tenant its own drive load is not using.
+    #[test]
+    fn the_loadgen_argv_omits_the_tenant_flag_when_the_run_has_no_tenant() {
+        let cli = base_cli("loadgen-no-tenant");
+        let node = test_node_spec("loadgen-no-tenant", 0, 4317);
+        let argv = loadgen_argv(&cli, &node, std::path::Path::new("/tmp/j.ndjson"));
+        assert!(
+            !argv.iter().any(|a| a == "--tenant"),
+            "argv {argv:?} invented a tenant"
+        );
+    }
+
+    /// A loadgen that exited non-zero means the run has no `ClientAck`
+    /// evidence at all, which §8.4 makes the judge's whole write-side case —
+    /// so it is a fleet failure, not the warning it used to be.
     #[tokio::test]
-    async fn spawn_loadgen_best_effort_never_panics_on_a_nonzero_exit() {
+    async fn run_loadgen_fails_the_run_on_a_nonzero_exit() {
+        let dir = std::env::temp_dir().join("duckspout-fleet-test-loadgen-nonzero");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cli = base_cli("loadgen-nonzero");
+        cli.loadgen_bin = Some(PathBuf::from("/bin/false"));
         let node = test_node_spec("loadgen-nonzero", 0, 0);
-        spawn_loadgen_best_effort(std::path::Path::new("/bin/false"), &node).await;
+        let error = run_loadgen(&cli, &dir, &node)
+            .await
+            .expect_err("a non-zero loadgen must fail the fleet run");
+        assert!(
+            format!("{error:#}").contains("ClientAck evidence"),
+            "the error must name what was lost, got: {error:#}"
+        );
     }
 
-    /// The spawn-itself-failed arm (a wrong `--loadgen-bin` path) must also
-    /// be swallowed, not propagated or panicked on.
+    /// A wrong `--loadgen-bin` path is the same loss of evidence as a
+    /// non-zero exit, and must not be quietly logged either.
     #[tokio::test]
-    async fn spawn_loadgen_best_effort_never_panics_when_the_binary_does_not_exist() {
+    async fn run_loadgen_fails_the_run_when_the_binary_does_not_exist() {
+        let dir = std::env::temp_dir().join("duckspout-fleet-test-loadgen-missing");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cli = base_cli("loadgen-missing");
+        cli.loadgen_bin = Some(PathBuf::from("/no/such/duckspout-loadgen-binary"));
         let node = test_node_spec("loadgen-missing", 0, 0);
-        spawn_loadgen_best_effort(
-            std::path::Path::new("/no/such/duckspout-loadgen-binary"),
-            &node,
-        )
-        .await;
+        run_loadgen(&cli, &dir, &node)
+            .await
+            .expect_err("an unspawnable loadgen must fail the fleet run");
+    }
+
+    /// The derived send window is the drive-load pass's own length, never
+    /// zero — a `--duration-secs 0` witness journals nothing.
+    #[test]
+    fn the_loadgen_send_window_is_the_drive_load_pass_rounded_up() {
+        let mut cli = base_cli("loadgen-duration");
+        cli.load_batches = 300;
+        cli.load_interval_ms = 200;
+        assert_eq!(loadgen_duration_secs(&cli), 60);
+        cli.load_batches = 1;
+        cli.load_interval_ms = 1;
+        assert_eq!(loadgen_duration_secs(&cli), 1, "rounded up, never zero");
+        cli.load_batches = 0;
+        assert_eq!(loadgen_duration_secs(&cli), 1, "floored at one second");
     }
 
     /// `check_backends` succeeds once both a real Postgres-shaped listener
@@ -2309,8 +2521,11 @@ mod tests {
         ];
         let results = vec![load_result(10, 10), load_result(10, 3)];
         let work_dir = scratch_dir("print-summary");
-        print_summary(&nodes, &results, true, &work_dir);
-        print_summary(&nodes, &results, false, &work_dir);
+        // Both loadgen arms too: a run with a client witness and one without
+        // are both ordinary shapes, and the summary formats each.
+        let loadgen_journal = work_dir.join("fleet-loadgen-0.ndjson");
+        print_summary(&nodes, &results, true, &work_dir, Some(&loadgen_journal));
+        print_summary(&nodes, &results, false, &work_dir, None);
         report_work_dir(&work_dir);
     }
 }

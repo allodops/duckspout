@@ -164,7 +164,7 @@ bench-card:
 hack-features:
     cargo hack check --workspace --each-feature
 
-# Distributed CTK run: fleet + judge + loadgen (Ⓜ v0.2)
+# Distributed CTK tier: fleet + loadgen + judge, judge exit code gates (nightly.yml:ctk-distributed)
 [group('nightly')]
 ctk-distributed:
     bun scripts/lib/proc.mjs staged ctk-distributed.mjs

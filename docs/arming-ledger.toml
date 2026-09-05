@@ -201,6 +201,28 @@ milestone = ""
 issue = 49
 spec = "§8 (ADR-0009)"
 
+# Armed by the #58 arming PR (v0.2): §8.4's distributed tier — real
+# multi-node duckspout-fleet runs against real MinIO + Postgres, each with a
+# journaling duckspout-loadgen member and one of five fault profiles covering
+# every fault family §8.4 lists, each graded afterwards by the separate
+# duckspout-judge BINARY. The gate is the judge's own exit code (0 Pass /
+# 2 Violation / 3 NoVerdict), and §8.4's "NoVerdict is never a pass" is what
+# makes exit 3 fail this row too. The seeded-violation replay runs through
+# the same binary first, so a judge that has stopped biting cannot certify
+# anything here. A red run auto-files a `blocked` issue
+# (nightly.yml:ctk-distributed-red-issue), same discipline as the two rows
+# above. Its v0.3 promotion to a release gate is the ctk-release-gate row,
+# still staged.
+[[gate]]
+id = "ctk-distributed"
+status = "armed"
+cadence = "nightly"
+recipe = "ctk-distributed"
+workflow_job = "nightly.yml:ctk-distributed"
+milestone = ""
+issue = 58
+spec = "§8.4"
+
 # --- staged, cadence = "pr" (future ci.yml jobs; s§6.1 lower table) ---
 
 [[gate]]
@@ -214,16 +236,6 @@ issue = 131
 spec = "§8.1"
 
 # --- staged, cadence = "nightly" (future nightly.yml jobs; s§6.3) ---
-
-[[gate]]
-id = "ctk-distributed"
-status = "staged"
-cadence = "nightly"
-recipe = "ctk-distributed"
-workflow_job = ""
-milestone = "v0.2"
-issue = 58
-spec = "§8.4"
 
 # Promotion of the distributed CTK run to a release gate (§12.4); same job,
 # second stage — multi-stage gates get one row per stage (s§6.5).
